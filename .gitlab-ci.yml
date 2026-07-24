@@ -49,6 +49,8 @@ build-macos-arm64:
 
 # On a tag: upload every built binary to the generic package registry, then cut
 # a Release linking them as downloadable assets.
+# Metal binaries are produced only by the manual macOS job. When it hasn't run
+# (no macOS runner), there is nothing to upload — no-op instead of failing.
 upload:
   stage: release
   image: curlimages/curl:latest
@@ -57,6 +59,10 @@ upload:
   before_script: []
   script:
     - |
+      if ! ls dist/* >/dev/null 2>&1; then
+        echo "no metal binaries (macOS build is manual/best-effort); skipping upload"
+        exit 0
+      fi
       for f in dist/*; do
         n=$(basename "$f")
         curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" \
@@ -73,6 +79,11 @@ release:
   script:
     - |
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
-      release-cli create --name "quip-miner-metal ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-        --assets-link "{\"name\":\"quip-metal-sa-arm64\",\"url\":\"${base}/quip-metal-sa-arm64\"}" \
-        --assets-link "{\"name\":\"quip-metal-gibbs-arm64\",\"url\":\"${base}/quip-metal-gibbs-arm64\"}"
+      if ls dist/* >/dev/null 2>&1; then
+        release-cli create --name "quip-miner-metal ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
+          --assets-link "{\"name\":\"quip-metal-sa-arm64\",\"url\":\"${base}/quip-metal-sa-arm64\"}" \
+          --assets-link "{\"name\":\"quip-metal-gibbs-arm64\",\"url\":\"${base}/quip-metal-gibbs-arm64\"}"
+      else
+        release-cli create --name "quip-miner-metal ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
+          --description "Source release. macOS arm64 binaries require a Mac build (run the manual build-macos-arm64 job on a macOS runner)."
+      fi
