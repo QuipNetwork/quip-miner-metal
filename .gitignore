@@ -12,3 +12,10 @@
 
 # Serena MCP server workspace metadata (per-machine, not project code)
 .serena/
+
+# Agent tooling config (per-machine / per-tool; AGENTS.md is the checked-in source)
+.beads/
+.agents/
+.claude/
+.codex/
+CLAUDE.md
