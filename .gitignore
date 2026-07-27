@@ -9,3 +9,6 @@
 
 # rustcheck working artifacts (audit reports)
 .rustcheck/
+
+# Serena MCP server workspace metadata (per-machine, not project code)
+.serena/
