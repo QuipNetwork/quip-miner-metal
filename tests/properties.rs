@@ -1,10 +1,7 @@
 //! Property-based tests for host CSR topology, coloring, and `fill_h_j`.
 //!
-//! Topology modules are macOS-gated in the library, so this file matches
-//! `tests/conformance.rs` / `tests/golden_parity.rs` and is empty on other OSes.
-//! Pure host math — no Metal device required.
-
-#![cfg(target_os = "macos")]
+//! Pure host math — no Metal device required, though the crate itself is
+//! macOS-only so these still only build there.
 
 use proptest::prelude::*;
 use quip_miner_metal::topology::{fill_h_j, ColorBlocks, SelfFeedingTopology};

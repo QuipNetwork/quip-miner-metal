@@ -9,8 +9,15 @@
 //! [`quip_protocol::scoring::energy_milli`] for consensus (host f64 — Metal
 //! has no fp64). The coordinator session loop lives in `quip-miner-core`.
 //!
-//! GPU modules (`metal_device`, `iokit_gov`) are macOS-only so Linux can still
-//! build the CLI stubs and host math.
+//! # Platform
+//!
+//! macOS only. Metal and IOKit have no implementation on any other OS, so this
+//! crate does not build elsewhere and deliberately offers no stub path — a
+//! binary that cannot mine is not worth the dead code needed to produce it.
+//! In practice a non-macOS build fails while compiling the Apple-only
+//! dependencies (`core-graphics-types`: "link kind `framework` is only
+//! supported on Apple targets") before reaching this crate at all; the
+//! `compile_error!` below states the contract for the case where it does.
 
 // Panic discipline for the *library* only. These cannot live in `Cargo.toml`'s
 // `[lints]` table: that applies to every target in the package, and the
@@ -28,20 +35,24 @@
 // full discipline.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, clippy::expect_used))]
 
+// States the platform contract in code. The Apple-only dependencies usually
+// fail first, so this is a backstop rather than the error you will actually
+// see; it still fires for any build that reaches this crate.
+#[cfg(not(target_os = "macos"))]
+compile_error!(
+    "quip-miner-metal is macOS-only: it depends on Metal and IOKit, which exist \
+     on no other platform. Build it on macOS (Apple Silicon)."
+);
+
 pub mod sampler;
 
-#[cfg(target_os = "macos")]
 pub mod iokit_gov;
-#[cfg(target_os = "macos")]
 pub mod metal_device;
-#[cfg(target_os = "macos")]
 pub mod streaming;
-#[cfg(target_os = "macos")]
 pub mod topology;
 
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 
-#[cfg(target_os = "macos")]
 pub use sampler::sample_ising;
 
 use quip_miner_core::{run, BackendIdentity, CommonArgs};
@@ -140,7 +151,6 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Ok(())
 /// # }
 /// ```
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub struct MetalSampler {
     device: crate::metal_device::MetalDevice,
@@ -151,7 +161,6 @@ pub struct MetalSampler {
 /// Metal backend config, parsed from the verbatim `config.toml` subsection in
 /// `Configure.backend_toml`. Unrecognized keys land in `unknown`;
 /// `warn_unknown_fields` filters session-level keys (e.g. `num_sweeps`).
-#[cfg(target_os = "macos")]
 #[derive(serde::Deserialize, Default)]
 struct MetalConfig {
     /// GPU utilization ceiling 1–100 (governor throttle threshold when yielding).
@@ -162,7 +171,6 @@ struct MetalConfig {
     unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
-#[cfg(target_os = "macos")]
 impl MetalSampler {
     /// Bind an opened [`crate::metal_device::MetalDevice`] and
     /// [`crate::iokit_gov::UtilGovernor`] to an algorithm.
@@ -196,7 +204,6 @@ impl MetalSampler {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl quip_miner_core::Sampler for MetalSampler {
     fn sample(
         &self,
@@ -272,7 +279,6 @@ impl quip_miner_core::Sampler for MetalSampler {
 /// `quip_miner_core::config::config_override`; unknown keys are warned via
 /// `warn_unknown_fields`. Out-of-range utilization is returned as-is —
 /// `UtilGovernor::reconfigure` clamps to `1..=100`.
-#[cfg(target_os = "macos")]
 fn resolve_governor_config(
     backend_toml: &str,
     current_ceiling: u32,
@@ -287,7 +293,67 @@ fn resolve_governor_config(
     (ceiling, yielding)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+/// Install the process-wide `tracing` subscriber for a miner binary.
+///
+/// Without this the crate's `tracing::error!`/`warn!` diagnostics are compiled
+/// in but discarded, which would be a regression against the `eprintln!` calls
+/// they replaced. Writes to stderr so it lands alongside `quip-miner-core`'s
+/// own stderr logging. `RUST_LOG` overrides the default `info` level.
+///
+/// `try_init` rather than `init`: both binaries call [`run_metal`] exactly
+/// once, but a test or embedder may already have installed a subscriber, and
+/// losing that race must not abort the miner.
+fn init_tracing() {
+    use std::io::IsTerminal;
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .try_init();
+}
+
+/// Run a Metal miner binary. macOS opens the GPU and governor; other platforms
+/// support `--capabilities`/`--version` but return `EnvIncompatible` for
+/// `--check` and session mode.
+///
+/// # Examples
+///
+/// ```no_run
+/// use quip_miner_core::{Algorithm, CommonArgs};
+/// use quip_miner_metal::{run_metal, METAL_SA_IDENTITY};
+///
+/// let common = CommonArgs {
+///     quip_coordinator: None,
+///     miner_id: None,
+///     capabilities: true,
+///     check: false,
+///     log_level: "info".into(),
+///     sweeps_per_beta: None,
+/// };
+/// let _code = run_metal(METAL_SA_IDENTITY, Algorithm::Sa, &common, 0, 100, false);
+/// ```
+pub fn run_metal(
+    id: BackendIdentity,
+    algorithm: Algorithm,
+    common: &CommonArgs,
+    device: usize,
+    utilization: u32,
+    yielding: bool,
+) -> ExitCode {
+    init_tracing();
+    use crate::iokit_gov::UtilGovernor;
+    use crate::metal_device::MetalDevice;
+    use quip_miner_core::OpenError;
+    run(id, common, || {
+        let dev =
+            MetalDevice::open(device).map_err(|e| OpenError(format!("device {device}: {e}")))?;
+        let gov = UtilGovernor::start(device as u32, utilization, yielding);
+        Ok(MetalSampler::new(dev, gov, algorithm))
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::resolve_governor_config;
 
@@ -364,87 +430,5 @@ mod tests {
         );
         assert_eq!(ceiling, CLI_CEILING);
         assert_eq!(yielding, CLI_YIELDING);
-    }
-}
-
-/// Install the process-wide `tracing` subscriber for a miner binary.
-///
-/// Without this the crate's `tracing::error!`/`warn!` diagnostics are compiled
-/// in but discarded, which would be a regression against the `eprintln!` calls
-/// they replaced. Writes to stderr so it lands alongside `quip-miner-core`'s
-/// own stderr logging. `RUST_LOG` overrides the default `info` level.
-///
-/// `try_init` rather than `init`: both binaries call [`run_metal`] exactly
-/// once, but a test or embedder may already have installed a subscriber, and
-/// losing that race must not abort the miner.
-fn init_tracing() {
-    use std::io::IsTerminal;
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .try_init();
-}
-
-/// Run a Metal miner binary. macOS opens the GPU and governor; other platforms
-/// support `--capabilities`/`--version` but return `EnvIncompatible` for
-/// `--check` and session mode.
-///
-/// # Examples
-///
-/// ```no_run
-/// use quip_miner_core::{Algorithm, CommonArgs};
-/// use quip_miner_metal::{run_metal, METAL_SA_IDENTITY};
-///
-/// let common = CommonArgs {
-///     quip_coordinator: None,
-///     miner_id: None,
-///     capabilities: true,
-///     check: false,
-///     log_level: "info".into(),
-///     sweeps_per_beta: None,
-/// };
-/// let _code = run_metal(METAL_SA_IDENTITY, Algorithm::Sa, &common, 0, 100, false);
-/// ```
-pub fn run_metal(
-    id: BackendIdentity,
-    algorithm: Algorithm,
-    common: &CommonArgs,
-    device: usize,
-    utilization: u32,
-    yielding: bool,
-) -> ExitCode {
-    init_tracing();
-    #[cfg(target_os = "macos")]
-    {
-        use crate::iokit_gov::UtilGovernor;
-        use crate::metal_device::MetalDevice;
-        use quip_miner_core::OpenError;
-        run(id, common, || {
-            let dev = MetalDevice::open(device)
-                .map_err(|e| OpenError(format!("device {device}: {e}")))?;
-            let gov = UtilGovernor::start(device as u32, utilization, yielding);
-            Ok(MetalSampler::new(dev, gov, algorithm))
-        })
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (algorithm, device, utilization, yielding);
-        struct Unsupported;
-        impl quip_miner_core::Sampler for Unsupported {
-            fn sample(
-                &self,
-                _graph: &IsingGraph,
-                _params: &SampleParams,
-            ) -> Result<Vec<SamplerResult>, quip_proto::v1::RejectReason> {
-                Err(quip_proto::v1::RejectReason::Overloaded)
-            }
-        }
-        run(id, common, || {
-            Err::<Unsupported, _>(quip_miner_core::OpenError(
-                "metal miners require macOS".into(),
-            ))
-        })
     }
 }

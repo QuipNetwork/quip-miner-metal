@@ -26,19 +26,14 @@
 use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
 
-#[cfg(target_os = "macos")]
 use crate::topology::{fill_h_j, SelfFeedingTopology};
-#[cfg(target_os = "macos")]
 use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-#[cfg(target_os = "macos")]
 use quip_protocol::scoring::energy_milli;
 
-/// Failure from a Metal sample attempt: capacity refusal, driver fault, or
-/// platform unavailability.
+/// Failure from a Metal sample attempt: capacity refusal or driver fault.
 #[derive(Debug, Error)]
 pub enum SampleError {
     /// Device open, kernel compile, or pipeline construction failed.
-    #[cfg(target_os = "macos")]
     #[error(transparent)]
     Metal(#[from] crate::metal_device::MetalError),
     /// Command buffer or buffer readback failed after a dispatch.
@@ -51,9 +46,6 @@ pub enum SampleError {
     /// invites a retry that would fail identically every time.
     #[error("job exceeds Metal backend capacity: {0}")]
     TooLarge(String),
-    /// Built without Metal support (non-macOS stub path).
-    #[error("Metal unavailable on this platform")]
-    Unavailable,
 }
 
 impl SampleError {
@@ -73,22 +65,19 @@ impl SampleError {
     /// let err = SampleError::TooLarge("nodes > SA cap".into());
     /// assert_eq!(err.reject_reason(), RejectReason::TooLarge);
     ///
-    /// let err = SampleError::Unavailable;
+    /// let err = SampleError::Driver("command buffer failed".into());
     /// assert_eq!(err.reject_reason(), RejectReason::Overloaded);
     /// ```
     pub fn reject_reason(&self) -> quip_proto::v1::RejectReason {
         match self {
             Self::TooLarge(_) => quip_proto::v1::RejectReason::TooLarge,
-            Self::Driver(_) | Self::Unavailable => quip_proto::v1::RejectReason::Overloaded,
-            #[cfg(target_os = "macos")]
-            Self::Metal(_) => quip_proto::v1::RejectReason::Overloaded,
+            Self::Driver(_) | Self::Metal(_) => quip_proto::v1::RejectReason::Overloaded,
         }
     }
 }
 
 /// Largest `num_reads` a dispatch allocates for (mirrors CUDA). Also the
 /// per-threadgroup thread count, well under `maxTotalThreadsPerThreadgroup`.
-#[cfg(target_os = "macos")]
 pub(crate) const MAX_READS: usize = 256;
 
 /// Apple GPU SIMD width (threads per simdgroup).
@@ -98,7 +87,6 @@ pub(crate) const MAX_READS: usize = 256;
 /// lanes of the final simdgroup permanently idle — they are issued either way.
 /// Measured at a constant total sample count, `reads = 16` (half a simdgroup)
 /// costs ~20% against `reads = 64`.
-#[cfg(target_os = "macos")]
 pub(crate) const SIMD_WIDTH: usize = 32;
 
 /// Round a job's `num_reads` up to a full simdgroup, capped at [`MAX_READS`].
@@ -110,7 +98,6 @@ pub(crate) const SIMD_WIDTH: usize = 32;
 /// It costs nothing: those lanes execute regardless of whether we use them.
 /// `MAX_READS` is itself a multiple of `SIMD_WIDTH`, so the cap cannot round
 /// back down below the request.
-#[cfg(target_os = "macos")]
 pub(crate) fn simd_rounded_reads(num_reads: usize) -> usize {
     num_reads
         .clamp(1, MAX_READS)
@@ -121,13 +108,13 @@ pub(crate) fn simd_rounded_reads(num_reads: usize) -> usize {
 
 /// SA kernel `N` cap: `thread int8_t delta_energy[4593]` in `kernels/sa.metal`.
 ///
-/// Not `cfg`-gated: `crate::METAL_SA_IDENTITY` advertises this same cap on
-/// every platform, so the identity const and the kernel array have one source.
+/// `crate::METAL_SA_IDENTITY` advertises this same cap, so the identity const
+/// and the kernel array have one source.
 pub(crate) const SA_MAX_NODES: usize = 4593;
 /// Gibbs kernel `N` cap: `thread int8_t packed_state[600]` (600*8) in
 /// `kernels/gibbs.metal`.
 ///
-/// Not `cfg`-gated, for the same reason as [`SA_MAX_NODES`].
+/// Single source of truth with the identity const, as for [`SA_MAX_NODES`].
 pub(crate) const GIBBS_MAX_NODES: usize = 4800;
 
 /// Largest `num_sweeps` a dispatch accepts.
@@ -147,8 +134,6 @@ pub(crate) const GIBBS_MAX_NODES: usize = 4800;
 /// 64Ki `f64` + 64Ki `f32` (~768 KiB). Raise this only together with
 /// `METAL_ADAPT.max_sweeps`; it must stay >= `2 * METAL_ADAPT.max_sweeps`,
 /// which a `const _: () = assert!(..)` in `lib.rs` enforces at compile time.
-///
-/// Not `cfg`-gated, so that assertion can reference it on every platform.
 pub(crate) const MAX_SWEEPS: usize = 65_536;
 
 /// Target GPU time for one command buffer, in milliseconds.
@@ -171,7 +156,6 @@ pub(crate) const MAX_SWEEPS: usize = 65_536;
 /// This is a *ceiling*, not a goal: [`estimated_updates_per_sec`] is
 /// deliberately pessimistic, so real chunks usually land well under it. Lower
 /// this if a machine still stutters; the cost is throughput, not correctness.
-#[cfg(target_os = "macos")]
 const TARGET_DISPATCH_MS: f64 = 500.0;
 
 /// Measured SA spin-update rate as a function of occupancy, in Gupd/s.
@@ -184,7 +168,6 @@ const TARGET_DISPATCH_MS: f64 = 500.0;
 /// Points are `(threadgroups per core, Gupd/s)` from the occupancy sweep on an
 /// M4 Max, full Advantage2 topology. SA only — chromatic Gibbs has a different
 /// shape and gets its own estimate ([`GIBBS_UPDATES_PER_SEC`]).
-#[cfg(target_os = "macos")]
 const OCCUPANCY_CURVE: [(f64, f64); 8] = [
     (0.2, 0.32),
     (0.5, 0.49),
@@ -202,7 +185,6 @@ const OCCUPANCY_CURVE: [(f64, f64); 8] = [
 /// costs a few extra command buffers at ~2.5 ms each.
 ///
 /// Measured at 0.7: SA adapt chunks peaked at 360 ms against a 500 ms ceiling.
-#[cfg(target_os = "macos")]
 const SA_THROUGHPUT_SAFETY: f64 = 0.7;
 
 /// Chromatic Gibbs spin-update rate, flat rather than a curve.
@@ -217,14 +199,12 @@ const SA_THROUGHPUT_SAFETY: f64 = 0.7;
 /// Kept separate from SA's curve deliberately: sharing one estimate meant
 /// tightening it for Gibbs also shrank SA's chunks, which were already well
 /// inside the ceiling, and paid for it in extra command buffers.
-#[cfg(target_os = "macos")]
 const GIBBS_UPDATES_PER_SEC: f64 = 1.2e9;
 
 /// See [`SA_THROUGHPUT_SAFETY`]. Gibbs carries its own margin because its
 /// per-chunk cost includes work SA's does not — rebuilding the threadgroup spin
 /// array from device memory on resume, and recomputing energies every chunk —
 /// which the aggregate rate above does not separate out.
-#[cfg(target_os = "macos")]
 const GIBBS_THROUGHPUT_SAFETY: f64 = 0.7;
 
 /// Expected spin-updates per second for a dispatch of `groups` threadgroups.
@@ -232,7 +212,6 @@ const GIBBS_THROUGHPUT_SAFETY: f64 = 0.7;
 /// Below the first measured point the curve is extrapolated linearly toward the
 /// origin (a nearly-empty GPU really is proportionally slow); above the last it
 /// is held flat, since throughput has saturated by then.
-#[cfg(target_os = "macos")]
 fn estimated_updates_per_sec(algorithm: Algorithm, groups: usize) -> f64 {
     if matches!(algorithm, Algorithm::Gibbs) {
         return GIBBS_UPDATES_PER_SEC * GIBBS_THROUGHPUT_SAFETY;
@@ -268,7 +247,6 @@ fn estimated_updates_per_sec(algorithm: Algorithm, groups: usize) -> f64 {
 ///
 /// Both kernels can resume mid-schedule: `beta_start == 0` initializes, any
 /// other value restores the carry-over state the previous chunk wrote.
-#[cfg(target_os = "macos")]
 fn chunk_plan(algorithm: Algorithm, dims: &BatchDims, groups: usize) -> Vec<(i32, i32)> {
     let num_betas = dims.num_betas.max(1);
     let per_beta =
@@ -304,7 +282,6 @@ fn chunk_plan(algorithm: Algorithm, dims: &BatchDims, groups: usize) -> Vec<(i32
 /// has more field exposure; `QUIP_METAL_GIBBS_SEQUENTIAL=1` forces it as an
 /// escape hatch. SA is unaffected — its incremental delta-energy chain is
 /// inherently serial, so it has no node-parallel variant.
-#[cfg(target_os = "macos")]
 pub(crate) fn gibbs_node_parallel() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -316,7 +293,6 @@ pub(crate) fn gibbs_node_parallel() -> bool {
     })
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn algo_max_nodes(algorithm: Algorithm) -> usize {
     match algorithm {
         Algorithm::Sa => SA_MAX_NODES,
@@ -324,7 +300,6 @@ pub(crate) fn algo_max_nodes(algorithm: Algorithm) -> usize {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     let energy = energy_milli(spins, &graph.h, &graph.j, &graph.edges);
     SamplerResult {
@@ -337,7 +312,6 @@ fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
 ///
 /// Uses the shared f64 schedule and casts each element to f32 — bit-identical
 /// to the prior in-crate f32 schedule.
-#[cfg(target_os = "macos")]
 fn build_beta_schedule(
     graph: &IsingGraph,
     num_sweeps: usize,
@@ -362,7 +336,6 @@ fn build_beta_schedule(
 /// zero past its end (i.e. `+1`, the initialized value) instead of panicking:
 /// the caller sizes both the allocation and the harvest count from the same
 /// `packed_size`, so a mismatch is a bug, not a reason to abort the miner.
-#[cfg(target_os = "macos")]
 fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
     let mut spins = vec![1i8; n];
     for (i, s) in spins.iter_mut().enumerate() {
@@ -376,7 +349,6 @@ fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
 /// One encoded-but-uncommitted batch of `num_problems` problems sharing a
 /// topology, plus the metadata and device buffers needed to harvest it.
 /// Input/scratch buffers are held in `_keep` so they outlive the GPU execution.
-#[cfg(target_os = "macos")]
 pub(crate) struct EncodedBatch {
     /// Command buffers in submission order. A long anneal is split across
     /// several so no single one trips the macOS GPU watchdog; the last carries
@@ -390,7 +362,6 @@ pub(crate) struct EncodedBatch {
     _keep: Vec<metal::Buffer>,
 }
 
-#[cfg(target_os = "macos")]
 impl EncodedBatch {
     /// Block until the last chunk retires. Earlier chunks are ordered ahead of
     /// it on the same queue, so waiting on the tail waits for all of them.
@@ -433,7 +404,6 @@ impl EncodedBatch {
 /// from `GPUEndTime - GPUStartTime` (`CFTimeInterval` seconds). metal-rs 0.33
 /// exposes no accessor, so read the properties via `objc`. Returns 0 if the
 /// timestamps are unavailable / non-positive.
-#[cfg(target_os = "macos")]
 #[expect(
     unexpected_cfgs,
     reason = "objc 0.2 msg_send! expands to cfg(cargo-clippy) the compiler no longer recognizes"
@@ -457,7 +427,6 @@ fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn set_bytes_i32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: i32) {
     enc.set_bytes(
         index as metal::NSUInteger,
@@ -466,7 +435,6 @@ fn set_bytes_i32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: i32) {
     );
 }
 
-#[cfg(target_os = "macos")]
 fn set_bytes_u32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: u32) {
     enc.set_bytes(
         index as metal::NSUInteger,
@@ -476,7 +444,6 @@ fn set_bytes_u32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: u32) {
 }
 
 /// Tile a slice `times` times into one contiguous `Vec`.
-#[cfg(target_os = "macos")]
 fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
     let mut out = Vec::with_capacity(src.len() * times);
     for _ in 0..times {
@@ -486,7 +453,6 @@ fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
 }
 
 /// A 1-D `MTLSize` — every dispatch here is one-dimensional.
-#[cfg(target_os = "macos")]
 fn mtl_size_1d(width: usize) -> metal::MTLSize {
     metal::MTLSize {
         width: width as metal::NSUInteger,
@@ -496,7 +462,6 @@ fn mtl_size_1d(width: usize) -> metal::MTLSize {
 }
 
 /// Scalar kernel arguments plus the sizes the algorithm-specific setup needs.
-#[cfg(target_os = "macos")]
 struct BatchDims {
     n: usize,
     num_betas: i32,
@@ -509,7 +474,6 @@ struct BatchDims {
 }
 
 /// Per-batch input buffers: shared CSR structure plus per-problem `J` / `h`.
-#[cfg(target_os = "macos")]
 struct InputBuffers {
     row: metal::Buffer,
     col: metal::Buffer,
@@ -519,7 +483,6 @@ struct InputBuffers {
     col_off: metal::Buffer,
 }
 
-#[cfg(target_os = "macos")]
 impl InputBuffers {
     /// Consume into an `EncodedBatch::_keep` list. These are bound to the
     /// encoder but never read back on the host; they only have to outlive the
@@ -537,7 +500,6 @@ impl InputBuffers {
 }
 
 /// Beta ladder plus the kernel's two output buffers.
-#[cfg(target_os = "macos")]
 struct DispatchBuffers {
     beta: metal::Buffer,
     samples: metal::Buffer,
@@ -548,7 +510,6 @@ struct DispatchBuffers {
 ///
 /// Split out of [`encode_batch`] so both rejections are reachable without a
 /// Metal device.
-#[cfg(target_os = "macos")]
 fn validate_batch<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
@@ -588,7 +549,6 @@ fn validate_batch<'a>(
 /// The CSR structure is shared by every problem in the batch (same topology),
 /// so it is tiled `num_problems` times; the offset arrays give the kernel each
 /// problem's slice.
-#[cfg(target_os = "macos")]
 fn upload_inputs(
     device: &crate::metal_device::MetalDevice,
     topo: &SelfFeedingTopology,
@@ -632,7 +592,6 @@ fn upload_inputs(
 }
 
 /// Bind the shared buffer layout (indices 0..15) — identical in both kernels.
-#[cfg(target_os = "macos")]
 fn bind_shared_args(
     enc: &metal::ComputeCommandEncoderRef,
     inputs: &InputBuffers,
@@ -661,7 +620,6 @@ fn bind_shared_args(
 ///
 /// Single-shot run: beta_start = 0, beta_count = num_betas, so these are
 /// written but never re-read — allocated as zeroed scratch.
-#[cfg(target_os = "macos")]
 fn new_sa_persistent(
     device: &crate::metal_device::MetalDevice,
     dims: &BatchDims,
@@ -686,7 +644,6 @@ fn new_sa_persistent(
 /// Unlike SA, Gibbs persists no `delta_energy` or running energy: it recomputes
 /// the effective field from the current spins on every node update, and its
 /// energy is a pure function of the spins it already carries.
-#[cfg(target_os = "macos")]
 fn new_gibbs_persistent(
     device: &crate::metal_device::MetalDevice,
     dims: &BatchDims,
@@ -714,7 +671,6 @@ fn new_gibbs_persistent(
 ///
 /// Indices start at 21 because the colour-block buffers already occupy 16..20 —
 /// the one place Gibbs's layout diverges from SA's.
-#[cfg(target_os = "macos")]
 fn bind_gibbs_chunk(
     enc: &metal::ComputeCommandEncoderRef,
     persist: &[metal::Buffer; 2],
@@ -733,7 +689,6 @@ fn bind_gibbs_chunk(
 /// resume from the persistent buffers, which it rewrites at the end of every
 /// chunk. The buffers are shared across a batch's chunks — that carry-over is
 /// what lets one anneal span several command buffers.
-#[cfg(target_os = "macos")]
 fn bind_sa_chunk(
     enc: &metal::ComputeCommandEncoderRef,
     persist: &[metal::Buffer; 4],
@@ -752,7 +707,6 @@ fn bind_sa_chunk(
 ///
 /// Color blocks are shared across the batch (same topology → same coloring);
 /// the kernel indexes them globally, not per problem.
-#[cfg(target_os = "macos")]
 fn encode_gibbs_buffers(
     device: &crate::metal_device::MetalDevice,
     enc: &metal::ComputeCommandEncoderRef,
@@ -780,7 +734,6 @@ fn encode_gibbs_buffers(
 /// built from `graphs[0]`. `params` (reads, sweeps, beta) is shared across the
 /// batch, matching v0.2 (`compute_beta_schedule(h[0], J[0], ...)`). Dispatches
 /// `dispatchThreadgroups(num_problems, num_reads)`.
-#[cfg(target_os = "macos")]
 pub(crate) fn encode_batch(
     device: &crate::metal_device::MetalDevice,
     graphs: &[&IsingGraph],
@@ -915,7 +868,6 @@ pub(crate) fn encode_batch(
     })
 }
 
-#[cfg(target_os = "macos")]
 fn pad_i32(v: &[i32]) -> Vec<i32> {
     if v.is_empty() {
         vec![0i32]
@@ -933,7 +885,6 @@ fn pad_i32(v: &[i32]) -> Vec<i32> {
 /// on a rayon pool (one task per problem) — this is the bulk of the per-batch
 /// host cost, overlapped with the next batch's GPU compute by the streaming
 /// pipeline.
-#[cfg(target_os = "macos")]
 pub(crate) fn harvest_batch(
     batch: &EncodedBatch,
     graphs: &[&IsingGraph],
@@ -992,7 +943,6 @@ pub(crate) fn harvest_batch(
 ///
 /// [`SampleError::Metal`] is not produced by this path — device and pipeline
 /// construction errors surface earlier, from [`crate::metal_device`].
-/// [`SampleError::Unavailable`] is returned only by the non-macOS stub.
 ///
 /// # Examples
 ///
@@ -1019,7 +969,6 @@ pub(crate) fn harvest_batch(
 /// # Ok(())
 /// # }
 /// ```
-#[cfg(target_os = "macos")]
 pub fn sample_ising(
     device: &crate::metal_device::MetalDevice,
     graph: &IsingGraph,
@@ -1059,7 +1008,6 @@ pub fn sample_ising(
     Ok(samples)
 }
 
-#[cfg(target_os = "macos")]
 fn read_i8_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i8>, SampleError> {
     if count == 0 {
         return Ok(Vec::new());
@@ -1091,22 +1039,10 @@ fn read_i8_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i8>, SampleEr
     Ok(out)
 }
 
-/// Stub for non-macOS: sample path is never reached by the harness (`open`
-/// fails first with `Unavailable`).
-#[cfg(not(target_os = "macos"))]
-pub fn sample_ising(
-    _device: &(),
-    _graph: &IsingGraph,
-    _params: &SampleParams,
-    _algorithm: Algorithm,
-) -> Result<Vec<SamplerResult>, SampleError> {
-    Err(SampleError::Unavailable)
-}
-
 // Host-side (GPU-free) logic only: everything under test here is `cfg(macos)`,
 // so the module carries the same gate. The dispatch itself is covered by
 // `tests/golden_parity.rs`, which needs a real device.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

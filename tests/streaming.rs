@@ -4,10 +4,7 @@
 //! keying, `scale_budget`). This file drives the composed loop through the
 //! public interface: jobs in → `form_and_commit` / `finish_batch` → results out.
 //!
-//! Requires a Metal device (Apple Silicon). Empty on other OSes, matching
-//! `tests/conformance.rs` / `tests/golden_parity.rs` / `tests/properties.rs`.
-
-#![cfg(target_os = "macos")]
+//! Requires a Metal device (Apple Silicon).
 
 use quip_miner_core::{CancelGuard, SampleParams, Sampler, StreamJob, StreamOutcome, StreamResult};
 use quip_miner_metal::iokit_gov::UtilGovernor;

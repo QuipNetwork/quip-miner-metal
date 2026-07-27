@@ -199,7 +199,7 @@ fn compile_pipeline(
         .map_err(|e| MetalError::Driver(format!("{entry} pipeline: {e}")))
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

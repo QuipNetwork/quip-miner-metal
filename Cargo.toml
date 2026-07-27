@@ -35,15 +35,13 @@ quip-miner-core = { git = "https://gitlab.com/quip.network/quip-protocol.git", r
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
-# Diagnostics. Pure-Rust and platform-independent, so it stays ungated even
-# though today's call sites are all macOS-only.
+# Diagnostics.
 tracing = "0.1"
 # Subscriber for the miner binaries: without one, every `tracing::` call
 # above is compiled in and discarded. Installed in `run_metal`.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Metal + IOKit are macOS-only; keep Linux CI green by gating the dependency.
-[target.'cfg(target_os = "macos")'.dependencies]
+# Metal + IOKit. Ungated: this crate is macOS-only (see the `compile_error!`
+# guard in `src/lib.rs`), so there is no target for a gate to select.
 metal = "0.33"
 io-kit-sys = "0.5"
 core-foundation-sys = "0.8"

@@ -5,8 +5,6 @@
 //!
 //! Run with `cargo test -p quip-miner-metal`.
 
-#![cfg(target_os = "macos")]
-
 use quip_miner_metal::metal_device::MetalDevice;
 use quip_miner_metal::sampler::sample_ising;
 use quip_miner_metal::{Algorithm, IsingGraph, SampleParams};

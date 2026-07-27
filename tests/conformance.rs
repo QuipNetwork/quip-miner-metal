@@ -1,8 +1,6 @@
 //! Protocol conformance: spawn SA and Gibbs miners against quip-mock-coordinator.
 //!
-//! Metal GPU tests — macOS only (file is empty on Linux CI).
-
-#![cfg(target_os = "macos")]
+//! Metal GPU tests: needs a real device (Apple Silicon).
 
 use quip_mock_coordinator::driver::{drive_miner, DriverReport};
 use quip_proto::v1::RejectReason;

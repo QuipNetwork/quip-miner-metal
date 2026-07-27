@@ -4,11 +4,10 @@ Metal Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-metal-sa`) and heat-bath Gibbs
 (`quip-metal-gibbs`), shipped as separate binaries.
 
-**macOS arm64 only (Apple Silicon).** The Metal/IOKit dependencies are gated
-behind `cfg(target_os = "macos")`, so the crate compiles on Linux (the gated
-code is simply excluded), but the binaries are non-functional off macOS —
-there is no CPU fallback. Build and run on Apple Silicon to get a working
-miner.
+**macOS arm64 only (Apple Silicon).** Metal and IOKit exist on no other
+platform, so this crate does not build anywhere else and offers no stub or CPU
+fallback. A non-macOS build fails while compiling the Apple-only dependencies.
+Build and run on Apple Silicon.
 
 Energies are scored on the host with the canonical
 `quip_protocol::scoring::energy_milli` so results match consensus; there is no
@@ -67,9 +66,9 @@ cargo test --release
 
 Conformance/golden and handshake tests drive the binary in isolation via
 `quip-mock-coordinator` and check energies against
-`conformance/golden_vectors.json`. The Metal-device golden-parity tests
-(`tests/golden_parity.rs`) are `cfg(target_os = "macos")`-gated and only run
-on a Mac with a Metal device.
+`conformance/golden_vectors.json`. The whole suite runs on a Mac with a Metal
+device; CI runs it on a macOS runner, which is the only configuration this
+crate builds in.
 
 ## License
 

@@ -5,25 +5,31 @@ variables:
   # Downloadable binaries live in the generic package registry under this name.
   PKG: quip-miner-metal
 
-default:
-  image: rust:1.97
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq protobuf-compiler
-
 cache:
   key: cargo-$CI_COMMIT_REF_SLUG
   paths: [.cargo/, target/]
 
-# Linux compile-check only: the Metal/IOKit dependencies are cfg-gated to
-# target_os = "macos", so this validates the crate builds and lints clean
-# with that code excluded. It does not exercise Metal-device tests.
+# Shared macOS runner setup. This crate depends on Metal and IOKit and does not
+# build on any other platform (`compile_error!` in `src/lib.rs`), so there is no
+# Linux job to fall back on — every stage that touches Rust runs here.
+.macos:
+  tags: [saas-macos-medium-m1]
+  image: macos-14-xcode-15
+  before_script:
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1
+    - source "$HOME/.cargo/env"
+    - brew install protobuf
+
+# Lint, format and the full test suite, including the tests that need a real
+# GPU. The runner is a Mac with Metal, so nothing is skipped.
 test:
+  extends: .macos
   stage: test
   script:
-    - rustup component add clippy
-    # clippy --all-targets compile-checks lib, bins and tests without linking
-    # binaries; producing binaries is the tagged-release job's business.
-    - cargo clippy --release --all-targets -- -D warnings
+    - rustup component add clippy rustfmt
+    - cargo fmt --check
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - cargo test
 
 .build:
   stage: build
@@ -33,30 +39,20 @@ test:
 
 # Binaries are cut for tagged releases only; branch and MR pipelines stop at
 # the `test` stage.
-#
-# Best-effort even on a tag: requires a GitLab macOS runner
-# (saas-macos-medium-m1 or equivalent). Not all GitLab plans/projects have one
-# available, so this stays `when: manual` rather than running automatically.
-# Drop `when: manual` once a macOS runner is confirmed.
 build-macos-arm64:
-  extends: .build
-  tags: [saas-macos-medium-m1]
-  image: macos-14-xcode-15
+  extends: [.build, .macos]
   rules:
     - if: $CI_COMMIT_TAG
-      when: manual
   script:
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1
-    - source "$HOME/.cargo/env"
     - cargo build --release --bins
     - mkdir -p dist
     - cp target/release/quip-metal-sa dist/quip-metal-sa-arm64
     - cp target/release/quip-metal-gibbs dist/quip-metal-gibbs-arm64
 
-# On a tag: upload every built binary to the generic package registry, then cut
-# a Release linking them as downloadable assets.
-# Metal binaries are produced only by the manual macOS job. When it hasn't run
-# (no macOS runner), there is nothing to upload — no-op instead of failing.
+# On a tag: upload the built binaries to the generic package registry, then cut
+# a Release linking them as downloadable assets. `build-macos-arm64` is not
+# optional, so a missing `dist/` means that job failed — fail loudly here rather
+# than quietly publishing a release with no binaries.
 upload:
   stage: release
   image: curlimages/curl:latest
@@ -66,8 +62,8 @@ upload:
   script:
     - |
       if ! ls dist/* >/dev/null 2>&1; then
-        echo "no metal binaries (macOS build is manual/best-effort); skipping upload"
-        exit 0
+        echo "no binaries in dist/ — build-macos-arm64 did not produce artifacts" >&2
+        exit 1
       fi
       for f in dist/*; do
         n=$(basename "$f")
@@ -85,11 +81,6 @@ release:
   script:
     - |
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
-      if ls dist/* >/dev/null 2>&1; then
-        release-cli create --name "quip-miner-metal ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-          --assets-link "{\"name\":\"quip-metal-sa-arm64\",\"url\":\"${base}/quip-metal-sa-arm64\"}" \
-          --assets-link "{\"name\":\"quip-metal-gibbs-arm64\",\"url\":\"${base}/quip-metal-gibbs-arm64\"}"
-      else
-        release-cli create --name "quip-miner-metal ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-          --description "Source release. macOS arm64 binaries require a Mac build (run the manual build-macos-arm64 job on a macOS runner)."
-      fi
+      release-cli create --name "quip-miner-metal ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
+        --assets-link "{\"name\":\"quip-metal-sa-arm64\",\"url\":\"${base}/quip-metal-sa-arm64\"}" \
+        --assets-link "{\"name\":\"quip-metal-gibbs-arm64\",\"url\":\"${base}/quip-metal-gibbs-arm64\"}"
