@@ -6,3 +6,6 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# rustcheck working artifacts (audit reports)
+.rustcheck/

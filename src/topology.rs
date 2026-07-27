@@ -21,6 +21,10 @@ use quip_miner_core::IsingGraph;
 /// `nodes` is grouped by color; `starts`/`counts` index into it per color.
 /// Same-color nodes are pairwise non-adjacent (independent set), which is
 /// all the kernel's per-color parallel update requires.
+///
+/// Fields are public because the color-block layout is this type's contract:
+/// integration tests (and kernel-side consumers) read `starts`/`counts`/
+/// `nodes`/`num_colors` directly to assert coloring invariants.
 #[derive(Clone, Debug)]
 pub struct ColorBlocks {
     pub starts: Vec<i32>,
@@ -99,6 +103,10 @@ fn greedy_color(n: usize, row_ptr: &[i32], col_ind: &[i32]) -> ColorBlocks {
 /// equality) to reuse it; `edge_pos` gives each edge's two CSR positions in
 /// that fixed order, so per-job `J` upload is a direct scatter with no
 /// per-job graph traversal.
+///
+/// Fields are public because the CSR layout is this type's contract:
+/// integration tests read `n`/`nnz`/`row_ptr`/`col_ind`/`edge_pos`/`colors`
+/// to check shape and coloring invariants. Do not narrow to `pub(crate)`.
 #[derive(Clone, Debug)]
 pub struct SelfFeedingTopology {
     pub n: usize,
@@ -115,6 +123,23 @@ impl SelfFeedingTopology {
     /// Build CSR + coloring from a graph. `graph.edges` fixes the canonical
     /// edge order used by `edge_pos` (and thus by [`fill_h_j`] for this and
     /// every later job sharing this topology).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use quip_miner_metal::IsingGraph;
+    /// use quip_miner_metal::topology::SelfFeedingTopology;
+    ///
+    /// let graph = IsingGraph::new(
+    ///     vec![1.0, -1.0, 0.0, 1.0],
+    ///     vec![1.0, -1.0, 1.0, -1.0],
+    ///     vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+    /// );
+    /// let t = SelfFeedingTopology::build(&graph);
+    /// assert_eq!(t.n, 4);
+    /// assert_eq!(t.nnz, 8); // 4 undirected edges × 2 directed halves
+    /// assert_eq!(t.row_ptr, vec![0, 2, 4, 6, 8]);
+    /// ```
     pub fn build(graph: &IsingGraph) -> Self {
         let n = graph.h.len();
         // Per-node list of (neighbor, edge_index, is_forward_half): carries
@@ -140,9 +165,11 @@ impl SelfFeedingTopology {
         // (0, 0) for an edge with an out-of-range endpoint: never read,
         // since `fill_h_j` skips those edges too (matches the guard above).
         let mut edge_pos = vec![(0u32, 0u32); graph.edges.len()];
-        for i in 0..n {
-            row_ptr[i] = col_ind.len() as i32;
-            for &(nbr, k, is_forward) in &adj[i] {
+        // `zip` stops at `adj` (length `n`), so the trailing `row_ptr[n]` is
+        // left for the explicit terminator write below.
+        for (row, nbrs) in row_ptr.iter_mut().zip(&adj) {
+            *row = col_ind.len() as i32;
+            for &(nbr, k, is_forward) in nbrs {
                 let pos = col_ind.len() as u32;
                 col_ind.push(nbr as i32);
                 if is_forward {
@@ -181,10 +208,45 @@ fn quantize_i8(v: f64) -> i8 {
 /// `j_csr` has length `topology.nnz`; `h_i8` has length `topology.n`.
 /// Positions not touched by any edge stay `0` (matches `j_csr` being
 /// allocated/cleared before this call).
+///
+/// # Precondition
+///
+/// `graph` must share `topology`'s establishing edge list. `topology.edge_pos`
+/// is sized from that graph's `edges`, and this walks `edge_pos` positionally,
+/// so entry `k` is only meaningful when `graph.edges[k]` is the same edge.
+/// Callers ([`crate::sampler::encode_batch`]) guarantee this by batching on an
+/// identical `(n, edges)` key.
+///
+/// # Panics
+///
+/// Does not panic on a short `graph.edges` or `graph.j`: both are read with
+/// `.get(k)` and a missing entry skips that edge (`edges`) or quantizes as
+/// `0.0` (`j`). A *mismatched* edge list is still a caller bug — it silently
+/// writes the wrong couplings — but it cannot crash the miner.
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::IsingGraph;
+/// use quip_miner_metal::topology::{fill_h_j, SelfFeedingTopology};
+///
+/// let graph = IsingGraph::new(
+///     vec![1.0, -1.0, 0.0, 1.0],
+///     vec![1.0, -1.0, 1.0, -1.0],
+///     vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+/// );
+/// let t = SelfFeedingTopology::build(&graph);
+/// let (j_csr, h_i8) = fill_h_j(&t, &graph);
+/// assert_eq!(h_i8, vec![1i8, -1, 0, 1]);
+/// // Each undirected edge writes both directed CSR halves.
+/// assert_eq!(j_csr.iter().filter(|&&v| v != 0).count(), 8);
+/// ```
 pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>, Vec<i8>) {
     let mut j_csr = vec![0i8; topology.nnz];
     for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
-        let (u, v) = graph.edges[k];
+        let Some(&(u, v)) = graph.edges.get(k) else {
+            continue;
+        };
         if u >= topology.n || v >= topology.n {
             continue;
         }
@@ -251,6 +313,18 @@ mod tests {
         assert_eq!(h, vec![1i8, -1, 0, 1]);
         // Each edge's J appears at both directed CSR positions.
         assert_eq!(j.iter().filter(|&&v| v != 0).count(), 8);
+    }
+
+    #[test]
+    fn fill_h_j_skips_edges_the_graph_does_not_have() {
+        // `edge_pos` is sized from the establishing graph; a graph with a
+        // shorter edge list must skip, not panic (the `j` read already did).
+        let t = SelfFeedingTopology::build(&g());
+        let short = IsingGraph::new(vec![1.0, -1.0, 0.0, 1.0], vec![1.0], vec![(0, 1)]);
+        let (j, h) = fill_h_j(&t, &short);
+        assert_eq!(h, vec![1i8, -1, 0, 1]);
+        // Only edge 0 is present: its two directed CSR slots are written.
+        assert_eq!(j.iter().filter(|&&v| v != 0).count(), 2);
     }
 
     #[test]

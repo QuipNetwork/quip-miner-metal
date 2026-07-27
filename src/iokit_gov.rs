@@ -40,6 +40,7 @@ use std::time::Duration;
 
 /// Reconfigurable governor knobs plus the latest util sample, shared with the
 /// poll thread.
+#[derive(Debug)]
 struct Knobs {
     /// Util ceiling 1–100; throttle fires above it when yielding.
     ceiling: AtomicU32,
@@ -50,6 +51,7 @@ struct Knobs {
 }
 
 /// Shared utilization sample and reconfigurable governor knobs.
+#[derive(Debug)]
 pub struct UtilGovernor {
     knobs: Arc<Knobs>,
     handle: Option<JoinHandle<()>>,
@@ -111,7 +113,27 @@ impl UtilGovernor {
     pub fn stop(&mut self) {
         self.knobs.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            // A panicking poll thread is not fatal: the governor's whole
+            // contract is to degrade to util 0 (see the module docs), which is
+            // what a dead thread produces anyway — `last_util` simply stops
+            // advancing and `should_throttle` goes quiet. But `poll_loop` has
+            // no fallible step (atomic loads, a sleep, and a sensor read that
+            // swallows every IOKit error), so a payload here means a real bug
+            // in code that is supposed to be panic-free. Report it instead of
+            // letting the miner silently mistake it for "no sensor available".
+            if let Err(payload) = h.join() {
+                // `Box<dyn Any>`'s own `Debug` only ever prints "Any", so dig
+                // the message out of the two types `panic!` actually boxes.
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic payload>");
+                tracing::warn!(
+                    panic = msg,
+                    "GPU util poll thread panicked; util stuck at 0"
+                );
+            }
         }
     }
 }
@@ -127,20 +149,49 @@ impl Drop for UtilGovernor {
 // has no per-index selector analogous to NVML's `device_by_index`.
 fn poll_loop(_device_index: u32, knobs: &Knobs) {
     while !knobs.stop.load(Ordering::Relaxed) {
-        if knobs.yielding.load(Ordering::Relaxed) {
-            knobs
-                .last_util
-                .store(query_iokit_gpu_utilization(), Ordering::Relaxed);
+        // Sample unconditionally: `utilization()` feeds `Status.utilization`,
+        // the miner's health report, which must be truthful whether or not
+        // yielding is on. Gating the sample on `yielding` (as this once did)
+        // made a fully-busy miner report 0% in the default configuration.
+        // `yielding` still gates `should_throttle` — reporting load and acting
+        // on it are separate concerns.
+        knobs
+            .last_util
+            .store(query_iokit_gpu_utilization(), Ordering::Relaxed);
+        // Yielding needs a fresh sample to act on: the throttle decides whether
+        // to hold back the next dispatch, so a 2 s-stale reading would let a
+        // whole batch through after pressure appeared, and hold back several
+        // after it cleared. Idle-time reporting has no such deadline.
+        let interval = if knobs.yielding.load(Ordering::Relaxed) {
+            YIELDING_POLL
         } else {
-            knobs.last_util.store(0, Ordering::Relaxed);
-        }
-        thread::sleep(Duration::from_secs(2));
+            REPORTING_POLL
+        };
+        thread::sleep(interval);
     }
 }
 
+/// Sensor poll interval while yielding — fast enough that the throttle acts on
+/// a current reading, slow enough that the IOKit walk stays negligible.
+const YIELDING_POLL: Duration = Duration::from_millis(250);
+/// Poll interval when only `Status.utilization` depends on the sample.
+const REPORTING_POLL: Duration = Duration::from_secs(2);
+
 /// Wrap a UTF-8 Rust string as a `CFStringRef`, or `None` on any failure.
+///
+/// Follows CoreFoundation's **Create Rule**: the returned reference is owned by
+/// the caller (+1 retain), who must `CFRelease` it. Every call site in this
+/// module does so immediately after the one `CFDictionaryGetValue` lookup it
+/// was created for.
 fn cfstr(s: &str) -> Option<CFStringRef> {
     let c = CString::new(s).ok()?;
+    // SAFETY: `c` is a live NUL-terminated buffer that outlives this call, and
+    // its contents are valid UTF-8 because `CString::new` was handed a `&str`,
+    // matching the `kCFStringEncodingUTF8` we declare. A null allocator selects
+    // the default allocator, which is the documented way to spell "no custom
+    // allocator". CoreFoundation only reads the buffer — it copies the bytes
+    // into the new CFString rather than borrowing them — so `c` is free to drop
+    // at the end of this function.
     let r =
         unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), kCFStringEncodingUTF8) };
     if r.is_null() {
@@ -150,6 +201,101 @@ fn cfstr(s: &str) -> Option<CFStringRef> {
     }
 }
 
+/// Walk every `IOAccelerator` service, handing each one's property dictionary
+/// to `visit`.
+///
+/// This is the shared half of [`query_iokit_gpu_utilization`] and
+/// [`gpu_core_count`]; they differ only in which property they pull out of the
+/// dictionary and how they fold the results. Both get their "degrade quietly on
+/// any failure" contract from this function returning early — a caller that
+/// starts from a neutral accumulator and never sees `visit` run reports exactly
+/// the same thing as one that found no matching service.
+///
+/// `visit` receives a **borrowed** `CFDictionaryRef` under the Get Rule: it is
+/// live only for the duration of the call, and is released as soon as `visit`
+/// returns. A callback must read what it needs and must not retain or stash the
+/// pointer without taking its own reference.
+fn for_each_accelerator_properties(mut visit: impl FnMut(CFDictionaryRef)) {
+    let Ok(service_name) = CString::new("IOAccelerator") else {
+        return;
+    };
+    // SAFETY: `service_name` is a live NUL-terminated buffer that outlives the
+    // call, and `IOServiceMatching` only reads it. The returned dictionary
+    // comes to us under the Create Rule (+1 owned), but we deliberately never
+    // release it — see the ownership note on `IOServiceGetMatchingServices`.
+    let matching = unsafe { IOServiceMatching(service_name.as_ptr()) };
+    if matching.is_null() {
+        return;
+    }
+
+    let mut iterator: io_iterator_t = 0;
+    // SAFETY: `matching` is a non-null dictionary we own (null-checked above)
+    // and `iterator` is a live, initialized out-param.
+    //
+    // This call *consumes* the `matching` reference: IOKitLib serializes the
+    // dictionary and then unconditionally `CFRelease`s it, on the success and
+    // the failure paths alike. Releasing `matching` ourselves — here or on the
+    // early return below — would therefore be an over-release. The one path
+    // that does not consume it is a null dictionary, which we already excluded.
+    //
+    // The iterator is the reference we *do* own; it is released at the end of
+    // the walk. On a non-zero return the out-param is left at its `0`
+    // initializer, so the early return below has nothing to clean up.
+    let ret = unsafe {
+        IOServiceGetMatchingServices(
+            kIOMasterPortDefault,
+            matching as CFDictionaryRef,
+            &mut iterator,
+        )
+    };
+    if ret != 0 {
+        return;
+    }
+
+    loop {
+        // SAFETY: `iterator` came from a successful `IOServiceGetMatchingServices`
+        // and is still live. Each non-zero `io_object_t` is returned +1 owned
+        // and is released below; 0 marks the end of the sequence.
+        let service = unsafe { IOIteratorNext(iterator) };
+        if service == 0 {
+            break;
+        }
+
+        let mut props: CFMutableDictionaryRef = std::ptr::null_mut();
+        // SAFETY: `service` is a live object from the iterator and `props` is a
+        // live out-param pre-initialized to null; a null allocator selects the
+        // default one.
+        //
+        // On success `props` is a +1 owned dictionary (Create Rule), released
+        // after `visit`. A non-zero return never leaves an owned dictionary
+        // behind: IOKitLib either returns before writing the out-param at all,
+        // or writes it and then returns an error *precisely* when what it wrote
+        // was null. So the `pret != 0 || props.is_null()` bail below cannot
+        // strand an allocation.
+        let pret =
+            unsafe { IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0) };
+        // SAFETY: balances the +1 from `IOIteratorNext`. Releasing the service
+        // this early is sound because the property dictionary is a freshly
+        // unserialized, independently-owned object rather than a view into the
+        // registry entry, so it stays valid after its service goes away.
+        unsafe { IOObjectRelease(service) };
+        if pret != 0 || props.is_null() {
+            continue;
+        }
+
+        visit(props as CFDictionaryRef);
+
+        // SAFETY: balances the +1 from `IORegistryEntryCreateCFProperties`.
+        // `visit` only borrows the dictionary (documented above), so this drops
+        // the last reference.
+        unsafe { CFRelease(props as CFTypeRef) };
+    }
+
+    // SAFETY: balances the iterator reference retained by
+    // `IOServiceGetMatchingServices`. Only reachable when that call succeeded.
+    unsafe { IOObjectRelease(iterator) };
+}
+
 /// GPU utilization percent (0-100) via IOKit, or 0 on any error.
 ///
 /// Walks the `IOAccelerator` service(s), reading
@@ -157,46 +303,16 @@ fn cfstr(s: &str) -> Option<CFStringRef> {
 /// Never panics; a query failure (missing service, unsupported key, ...)
 /// degrades to 0, matching the Python reference's `except Exception: return 0`.
 fn query_iokit_gpu_utilization() -> u32 {
-    unsafe {
-        let Ok(service_name) = CString::new("IOAccelerator") else {
-            return 0;
-        };
-        let matching = IOServiceMatching(service_name.as_ptr());
-        if matching.is_null() {
-            return 0;
+    let mut best: i64 = 0;
+    for_each_accelerator_properties(|props| {
+        // SAFETY: `props` is a live, borrowed property dictionary for the whole
+        // of this callback, which is exactly `read_device_utilization`'s
+        // precondition. It reads without taking ownership.
+        if let Some(util) = unsafe { read_device_utilization(props) } {
+            best = best.max(util);
         }
-
-        let mut iterator: io_iterator_t = 0;
-        let ret = IOServiceGetMatchingServices(
-            kIOMasterPortDefault,
-            matching as CFDictionaryRef,
-            &mut iterator,
-        );
-        if ret != 0 {
-            return 0;
-        }
-
-        let mut best: i64 = 0;
-        loop {
-            let service = IOIteratorNext(iterator);
-            if service == 0 {
-                break;
-            }
-            let mut props: CFMutableDictionaryRef = std::ptr::null_mut();
-            let pret = IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0);
-            IOObjectRelease(service);
-            if pret != 0 || props.is_null() {
-                continue;
-            }
-
-            if let Some(util) = read_device_utilization(props as CFDictionaryRef) {
-                best = best.max(util);
-            }
-            CFRelease(props as CFTypeRef);
-        }
-        IOObjectRelease(iterator);
-        best.clamp(0, 100) as u32
-    }
+    });
+    best.clamp(0, 100) as u32
 }
 
 /// Best-effort Apple GPU core count via IOKit, or `None` on any failure.
@@ -208,49 +324,30 @@ fn query_iokit_gpu_utilization() -> u32 {
 /// concurrency tuning, never correctness. Never panics — same "return nothing
 /// on any error" contract as [`query_iokit_gpu_utilization`].
 pub fn gpu_core_count() -> Option<usize> {
-    unsafe {
-        let service_name = CString::new("IOAccelerator").ok()?;
-        let matching = IOServiceMatching(service_name.as_ptr());
-        if matching.is_null() {
-            return None;
-        }
-
-        let mut iterator: io_iterator_t = 0;
-        let ret = IOServiceGetMatchingServices(
-            kIOMasterPortDefault,
-            matching as CFDictionaryRef,
-            &mut iterator,
-        );
-        if ret != 0 {
-            return None;
-        }
-
-        let mut cores: Option<usize> = None;
-        loop {
-            let service = IOIteratorNext(iterator);
-            if service == 0 {
-                break;
+    let mut cores: Option<usize> = None;
+    for_each_accelerator_properties(|props| {
+        // SAFETY: `props` is a live, borrowed property dictionary for the whole
+        // of this callback, which is exactly `read_int_property`'s
+        // precondition. It reads without taking ownership.
+        if let Some(v) = unsafe { read_int_property(props, "gpu-core-count") } {
+            if v > 0 {
+                cores = Some(cores.map_or(v as usize, |c| c.max(v as usize)));
             }
-            let mut props: CFMutableDictionaryRef = std::ptr::null_mut();
-            let pret = IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0);
-            IOObjectRelease(service);
-            if pret != 0 || props.is_null() {
-                continue;
-            }
-            if let Some(v) = read_int_property(props as CFDictionaryRef, "gpu-core-count") {
-                if v > 0 {
-                    cores = Some(cores.map_or(v as usize, |c| c.max(v as usize)));
-                }
-            }
-            CFRelease(props as CFTypeRef);
         }
-        IOObjectRelease(iterator);
-        cores
-    }
+    });
+    cores
 }
 
 /// Read a top-level signed-integer property from a service property dict,
 /// or `None` if the key is absent / not a `CFNumber`.
+///
+/// # Safety
+///
+/// `props` must be a non-null `CFDictionaryRef` that stays live for the whole
+/// call — the caller has to hold a reference to it, not merely have seen one.
+/// Only borrowed under the Get Rule: this function never releases `props`, and
+/// the value it looks up is likewise borrowed, so it must not outlive `props`
+/// (it does not — the value is decoded into an owned `i64` before returning).
 unsafe fn read_int_property(props: CFDictionaryRef, key: &str) -> Option<i64> {
     let k = cfstr(key)?;
     let val = CFDictionaryGetValue(props, k as *const c_void);
@@ -269,6 +366,17 @@ unsafe fn read_int_property(props: CFDictionaryRef, key: &str) -> Option<i64> {
 
 /// Read `PerformanceStatistics -> "Device Utilization %"` from one service's
 /// property dictionary, or `None` if either key is absent / not a number.
+///
+/// # Safety
+///
+/// `props` must be a non-null `CFDictionaryRef` that stays live for the whole
+/// call — the caller has to hold a reference to it, not merely have seen one.
+/// Only borrowed under the Get Rule: neither `props` nor the nested
+/// `PerformanceStatistics` dictionary is released here, and the nested one is
+/// only valid because its parent is held alive by the caller for the duration.
+/// The dynamic type of every borrowed value is checked before use, so a driver
+/// publishing an unexpected CF type yields `None` rather than undefined
+/// behavior.
 unsafe fn read_device_utilization(props: CFDictionaryRef) -> Option<i64> {
     let perf_key = cfstr("PerformanceStatistics")?;
     let perf_dict = CFDictionaryGetValue(props, perf_key as *const c_void);
@@ -312,7 +420,23 @@ mod tests {
     fn governor_without_yielding_never_throttles() {
         let mut gov = UtilGovernor::start(0, 100, false);
         assert!(!gov.should_throttle());
-        assert_eq!(gov.utilization(), 0.0);
+        gov.stop();
+    }
+
+    /// Utilization reporting must not depend on `yielding`: `Status.utilization`
+    /// is the miner's health report, and a busy non-yielding miner reporting 0%
+    /// is a lie the coordinator cannot detect. Only the range is asserted — the
+    /// value is a live sensor reading, and a host with no sensor reports 0.
+    #[test]
+    fn utilization_is_reported_with_yielding_off() {
+        let mut gov = UtilGovernor::start(0, 100, false);
+        // One poll interval plus slack, so the first sample has landed.
+        std::thread::sleep(REPORTING_POLL + Duration::from_millis(500));
+        let util = gov.utilization();
+        assert!(
+            (0.0..=100.0).contains(&util),
+            "util {util} out of 0..=100 range"
+        );
         gov.stop();
     }
 }

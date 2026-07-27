@@ -37,16 +37,27 @@ pub enum MetalError {
 ///
 /// Kept on one OS thread by convention, not by type constraint — see the
 /// module-level Send / Sync note above.
+///
+/// Fields are `pub(crate)`, not `pub`: the pipelines must belong to the
+/// device opened at `device_index`, which only [`MetalDevice::open`] can
+/// guarantee. Every reader is in-crate (`crate::sampler`, `crate::streaming`).
+#[derive(Debug)]
 pub struct MetalDevice {
-    pub device_index: usize,
-    pub device: Device,
-    pub queue: metal::CommandQueue,
-    pub sa: ComputePipelineState,
-    pub gibbs: ComputePipelineState,
+    /// Which `Device::all()` slot this came from (the `N` in miner id
+    /// `metal-N`). Nothing reads it yet — narrowing it from `pub` is what
+    /// made that visible. Kept because it is the device's identity and the
+    /// natural field for diagnostics to report; `expect` (not `allow`) so
+    /// this marker fires the moment a reader appears and can be deleted.
+    #[expect(dead_code, reason = "device identity retained for diagnostics")]
+    pub(crate) device_index: usize,
+    pub(crate) device: Device,
+    pub(crate) queue: metal::CommandQueue,
+    pub(crate) sa: ComputePipelineState,
+    pub(crate) gibbs: ComputePipelineState,
     /// Chromatic (node-parallel) Gibbs: one threadgroup per sample, threads
     /// split the nodes of each color, `threadgroup`-shared state. Same buffer
     /// layout as `gibbs`, different dispatch geometry.
-    pub gibbs_parallel: ComputePipelineState,
+    pub(crate) gibbs_parallel: ComputePipelineState,
 }
 
 impl MetalDevice {
@@ -55,6 +66,15 @@ impl MetalDevice {
     /// Indexing: `Device::all()` order. Index 0 is typically the system
     /// default (Apple Silicon integrated GPU). Higher indices map into
     /// `all()` when multiple Metal devices are present.
+    ///
+    /// # Errors
+    ///
+    /// - [`MetalError::NoDevice`] — no Metal devices are visible to this
+    ///   process, or `device_index` is past the end of `Device::all()`.
+    /// - [`MetalError::Compile`] — a kernel source in `kernels/` failed to
+    ///   compile, or the compiled library has no such entry point.
+    /// - [`MetalError::Driver`] — the driver refused to build a compute
+    ///   pipeline state for an entry point that did compile.
     pub fn open(device_index: usize) -> Result<Self, MetalError> {
         let devices = Device::all();
         if devices.is_empty() {
@@ -81,11 +101,24 @@ impl MetalDevice {
     }
 
     /// Number of Metal devices visible to this process.
-    pub fn device_count() -> Result<usize, MetalError> {
-        Ok(Device::all().len())
+    ///
+    /// Enumeration cannot fail — `Device::all()` yields an empty list rather
+    /// than an error when no device is present — so this returns a plain
+    /// count. Callers that need a *usable* device want [`Self::check`], which
+    /// also compiles the kernels.
+    #[must_use]
+    pub fn device_count() -> usize {
+        Device::all().len()
     }
 
     /// Probe that a device can open and compile kernels (`--check`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::open`] verbatim: [`MetalError::NoDevice`] when
+    /// `device_index` names no device, [`MetalError::Compile`] on a kernel
+    /// source or entry-point failure, and [`MetalError::Driver`] when
+    /// pipeline-state creation is refused.
     pub fn check(device_index: usize) -> Result<(), MetalError> {
         let _ = Self::open(device_index)?;
         Ok(())

@@ -12,6 +12,22 @@
 //! GPU modules (`metal_device`, `iokit_gov`) are macOS-only so Linux can still
 //! build the CLI stubs and host math.
 
+// Panic discipline for the *library* only. These cannot live in `Cargo.toml`'s
+// `[lints]` table: that applies to every target in the package, and the
+// integration tests in `tests/` use `unwrap`/`expect`/`panic!` freely and
+// legitimately (a panicking assertion is how a test reports failure). A
+// crate-root attribute scopes them to this crate, which is where a panic
+// would take down a running miner. Everything else lives in `[lints]`.
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::panic)]
+#![warn(clippy::expect_used)]
+// `#[cfg(test)] mod tests` blocks inside `src/` compile as part of *this*
+// crate, so the three denials above would land on the co-located unit tests
+// too. Relax them under the `test` cfg only: a panicking assertion is how a
+// unit test reports failure, exactly as in `tests/`. Non-test builds keep the
+// full discipline.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, clippy::expect_used))]
+
 pub mod sampler;
 
 #[cfg(target_os = "macos")]
@@ -31,14 +47,22 @@ pub use sampler::sample_ising;
 use quip_miner_core::{run, BackendIdentity, CommonArgs};
 use std::process::ExitCode;
 
-/// SA kernel `N` cap: `thread int8_t delta_energy[4593]` in `kernels/sa.metal`.
-/// A job over this would overrun kernel-local storage, so it must reject
-/// `TooLarge` rather than clamp.
-const SA_MAX_NODES: u32 = 4593;
-/// Gibbs kernel `N` cap: `thread int8_t packed_state[600]` (600*8) in
-/// `kernels/gibbs.metal`.
-const GIBBS_MAX_NODES: u32 = 4800;
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
+
+// Compile-time guard that the sampler's `num_sweeps` rejection threshold
+// still admits every job this backend advertises it will accept.
+//
+// `quip-miner-core` doubles the resolved sweeps for Gibbs
+// (`GIBBS_SWEEP_MULTIPLIER`), so an adapt-driven job can legitimately arrive
+// at `2 * max_sweeps`. Raising `METAL_ADAPT`'s `max_sweeps` past half of
+// `sampler::MAX_SWEEPS` would make the miner reject work it just told the
+// coordinator it could do; this turns that drift into a build failure rather
+// than a runtime reject. Anonymous `const _`: a named const is only evaluated
+// where it is used, so it would assert nothing.
+const _: () = assert!(
+    sampler::MAX_SWEEPS >= 2 * METAL_ADAPT.max_sweeps as usize,
+    "sampler::MAX_SWEEPS must admit the Gibbs-doubled METAL_ADAPT.max_sweeps"
+);
 
 /// Backend identity for `quip-metal-sa`.
 /// Metal adapt envelope (from `GPU/metal_miner.py`).
@@ -55,7 +79,12 @@ const METAL_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt:
 pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
     algorithm: "sa",
-    max_nodes: SA_MAX_NODES,
+    // Single source of truth with the sampler's runtime guard: the advertised
+    // cap and the guard cannot drift because this is the same constant. A job
+    // over it would overrun the SA kernel's `thread int8_t delta_energy[4593]`
+    // (`kernels/sa.metal`), so it must reject `TooLarge` rather than clamp.
+    // `const` context, so the narrowing cast is checked at compile time.
+    max_nodes: crate::sampler::SA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
     adapt: METAL_ADAPT,
 };
@@ -64,7 +93,9 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
 pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
     algorithm: "gibbs",
-    max_nodes: GIBBS_MAX_NODES,
+    // Same single-source-of-truth rule as SA above; the Gibbs cap comes from
+    // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
+    max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
     adapt: METAL_ADAPT,
 };
@@ -72,6 +103,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization
 /// governor. macOS-only.
 #[cfg(target_os = "macos")]
+#[derive(Debug)]
 pub struct MetalSampler {
     device: crate::metal_device::MetalDevice,
     gov: crate::iokit_gov::UtilGovernor,
@@ -115,8 +147,14 @@ impl quip_miner_core::Sampler for MetalSampler {
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, quip_proto::v1::RejectReason> {
         sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
-            eprintln!("metal sample failed: {e}");
-            quip_proto::v1::RejectReason::Overloaded
+            // `kind` carries the `SampleError` variant (Debug), so a kernel
+            // compile failure and a device reset stay distinguishable in the
+            // log even though both map to `OVERLOADED` — the protocol has no
+            // variant for "backend permanently broken". See the crate README /
+            // audit note. A capacity refusal is the one case that maps
+            // elsewhere (`TOO_LARGE`), via `reject_reason`.
+            tracing::error!(error = %e, kind = ?e, "metal sample failed");
+            e.reject_reason()
         })
     }
 
@@ -124,8 +162,25 @@ impl quip_miner_core::Sampler for MetalSampler {
         &self,
         jobs: tokio::sync::mpsc::Receiver<quip_miner_core::StreamJob>,
         out: tokio::sync::mpsc::Sender<quip_miner_core::StreamResult>,
+        cancel: quip_miner_core::CancelGuard,
     ) {
-        streaming::run_stream(&self.device, self.algorithm, jobs, out);
+        // `&out`: `run_stream` borrows the sender (it only ever clones/sends
+        // through it). Depends on the matching `streaming::run_stream`
+        // signature change landing in the same round.
+        //
+        // The governor is passed as a predicate rather than read inside
+        // `run_stream`: the streaming loop overrides `Sampler::sample_stream`,
+        // whose default implementation is the only place the harness consults
+        // `should_throttle`. Overriding it silently dropped all yielding
+        // behavior, so the dependency is made explicit in the signature.
+        streaming::run_stream(
+            &self.device,
+            self.algorithm,
+            jobs,
+            &out,
+            &|| self.gov.should_throttle(),
+            &cancel,
+        );
     }
 
     fn stream_width(&self) -> usize {
@@ -159,6 +214,26 @@ impl quip_miner_core::Sampler for MetalSampler {
     }
 }
 
+/// Install the process-wide `tracing` subscriber for a miner binary.
+///
+/// Without this the crate's `tracing::error!`/`warn!` diagnostics are compiled
+/// in but discarded, which would be a regression against the `eprintln!` calls
+/// they replaced. Writes to stderr so it lands alongside `quip-miner-core`'s
+/// own stderr logging. `RUST_LOG` overrides the default `info` level.
+///
+/// `try_init` rather than `init`: both binaries call [`run_metal`] exactly
+/// once, but a test or embedder may already have installed a subscriber, and
+/// losing that race must not abort the miner.
+fn init_tracing() {
+    use std::io::IsTerminal;
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .try_init();
+}
+
 /// Run a Metal miner binary. macOS opens the GPU and governor; other platforms
 /// support `--capabilities`/`--version` but return `EnvIncompatible` for
 /// `--check` and session mode.
@@ -170,6 +245,7 @@ pub fn run_metal(
     utilization: u32,
     yielding: bool,
 ) -> ExitCode {
+    init_tracing();
     #[cfg(target_os = "macos")]
     {
         use crate::iokit_gov::UtilGovernor;
