@@ -172,15 +172,10 @@ impl quip_miner_core::Sampler for MetalSampler {
         // `run_stream`: the streaming loop overrides `Sampler::sample_stream`,
         // whose default implementation is the only place the harness consults
         // `should_throttle`. Overriding it silently dropped all yielding
-        // behavior, so the dependency is made explicit in the signature.
-        streaming::run_stream(
-            &self.device,
-            self.algorithm,
-            jobs,
-            &out,
-            &|| self.gov.should_throttle(),
-            &cancel,
-        );
+        // behavior, so the dependency is made explicit in the signature. The
+        // governor is passed whole (not just a throttle closure) because sizing
+        // is a loop: the stream reports its GPU time back through it.
+        streaming::run_stream(&self.device, self.algorithm, jobs, &out, &self.gov, &cancel);
     }
 
     fn stream_width(&self) -> usize {

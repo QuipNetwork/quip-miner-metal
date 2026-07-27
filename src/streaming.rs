@@ -121,6 +121,24 @@ fn batch_size_for_reads(algorithm: Algorithm, num_reads: usize) -> usize {
     budget.div_ceil(per_problem).max(1)
 }
 
+/// Apply the governor's budget scale to a nominal problem count.
+///
+/// Never returns 0: one problem per dispatch is the floor, because a dispatch
+/// of nothing makes no progress and would never free the coordinator's credit.
+fn scale_budget(nominal: usize, scale: f64) -> usize {
+    if !scale.is_finite() || scale >= 1.0 {
+        return nominal.max(1);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "batch sizes are small positive counts; scale is clamped to 0..1"
+    )]
+    let scaled = (nominal as f64 * scale.max(0.0)).round() as usize;
+    scaled.max(1)
+}
+
 /// `Sampler::stream_width`: how many models the backend keeps in flight.
 ///
 /// Sized from [`NOMINAL_READS`] because it is fixed at startup, before any job
@@ -178,38 +196,32 @@ enum Seed {
     NonBlocking,
 }
 
-/// How the governor yields the GPU when utilization is over the ceiling.
+/// What the streaming loop needs from the GPU governor.
 ///
-/// Selected by `QUIP_METAL_YIELD_MODE`; both modes are inert unless
-/// `--yielding` is set. The trade is responsiveness against throughput, and it
-/// only matters while the ceiling is exceeded.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum YieldMode {
-    /// Pause only between dispatches. One batch always runs to completion, so
-    /// the GPU is released at batch granularity — at 4096 sweeps that is
-    /// seconds, during which a foreground app still contends with us.
-    Batch,
-    /// Pause between dispatches *and* shrink the batch while throttled, so each
-    /// dispatch is shorter and gaps appear sooner. Responsive at the cost of
-    /// throughput: a smaller batch leaves GPU cores idle within the dispatch.
-    Fine,
+/// A trait rather than the closure this used to take, because dispatch sizing
+/// is now a feedback loop: the loop reports how much device time it consumed,
+/// and reads back a budget scale derived from it. Those two halves have to see
+/// the same state.
+pub trait GpuGovernor {
+    /// True while the miner should hold off dispatching entirely.
+    fn should_throttle(&self) -> bool;
+    /// Fraction of the nominal threadgroup budget to dispatch (0 < s <= 1).
+    fn budget_scale(&self) -> f64;
+    /// Report a completed batch's GPU-busy microseconds (device time).
+    fn record_gpu_busy_us(&self, us: u64);
 }
 
-impl YieldMode {
-    /// Read the mode from the environment once. An unset or unrecognized value
-    /// selects [`Self::Batch`], the cheaper of the two.
-    fn from_env() -> Self {
-        match std::env::var("QUIP_METAL_YIELD_MODE").as_deref() {
-            Ok("fine") => Self::Fine,
-            _ => Self::Batch,
-        }
+impl GpuGovernor for crate::iokit_gov::UtilGovernor {
+    fn should_throttle(&self) -> bool {
+        Self::should_throttle(self)
+    }
+    fn budget_scale(&self) -> f64 {
+        Self::budget_scale(self)
+    }
+    fn record_gpu_busy_us(&self, us: u64) {
+        Self::record_gpu_busy_us(self, us);
     }
 }
-
-/// Divisor applied to the batch size while throttled in [`YieldMode::Fine`].
-/// Four was chosen to make the effect visible without collapsing the batch to a
-/// single problem, which would idle all but one GPU core.
-const FINE_YIELD_DIVISOR: usize = 4;
 
 /// How long to pause per throttle check. Shorter than the governor's 250 ms
 /// sensor poll, so a cleared ceiling is noticed within roughly one poll rather
@@ -229,10 +241,8 @@ struct StreamCtx<'a> {
     out: &'a Sender<StreamResult>,
     pending: &'a mut Option<StreamJob>,
     algorithm: Algorithm,
-    /// Governor backpressure: true while measured GPU utilization is over the
-    /// configured ceiling and `--yielding` is on.
-    throttle: &'a dyn Fn() -> bool,
-    yield_mode: YieldMode,
+    /// Utilization ceiling, external-load accounting, and dispatch backpressure.
+    gov: &'a dyn GpuGovernor,
     /// Reseed watermark: generations at or below it were abandoned by the
     /// coordinator and must not consume GPU time.
     cancel: &'a CancelGuard,
@@ -240,28 +250,24 @@ struct StreamCtx<'a> {
 
 impl StreamCtx<'_> {
     /// Hold off the next dispatch while the governor asks us to yield, bounded
-    /// by [`THROTTLE_MAX_PAUSE`]. Returns the divisor to apply to the next
-    /// dispatch's batch size — greater than 1 in [`YieldMode::Fine`] when we
-    /// left the gate still over the ceiling.
+    /// by [`THROTTLE_MAX_PAUSE`].
     ///
     /// Called only from the batch-forming path, which is the one point where no
     /// GPU work of ours is queued behind us, so pausing here actually leaves the
     /// device idle rather than merely delaying our own enqueue.
-    fn yield_gate(&self) -> usize {
-        tracing::debug!(throttle = (self.throttle)(), mode = ?self.yield_mode, "yield gate");
-        if !(self.throttle)() {
-            return 1;
+    ///
+    /// The pause is the coarse, immediate lever. Sustained sharing is
+    /// [`GpuGovernor::budget_scale`]'s job — it shrinks the dispatch itself, so
+    /// the miner keeps running at a smaller size instead of stopping and
+    /// starting.
+    fn yield_gate(&self) {
+        if !self.gov.should_throttle() {
+            return;
         }
+        tracing::debug!("yield gate: pausing");
         let deadline = Instant::now() + THROTTLE_MAX_PAUSE;
-        while Instant::now() < deadline && (self.throttle)() {
+        while Instant::now() < deadline && self.gov.should_throttle() {
             std::thread::sleep(THROTTLE_PAUSE);
-        }
-        // Still over the ceiling after a full pause: the load is sustained
-        // (often our own), so `Fine` additionally shortens the next dispatch.
-        if self.yield_mode == YieldMode::Fine && (self.throttle)() {
-            FINE_YIELD_DIVISOR
-        } else {
-            1
         }
     }
 }
@@ -415,7 +421,7 @@ pub fn run_stream(
     algorithm: Algorithm,
     mut jobs: Receiver<StreamJob>,
     out: &Sender<StreamResult>,
-    throttle: &dyn Fn() -> bool,
+    gov: &dyn GpuGovernor,
     cancel: &CancelGuard,
 ) {
     let mut pending: Option<StreamJob> = None;
@@ -424,8 +430,7 @@ pub fn run_stream(
         out,
         pending: &mut pending,
         algorithm,
-        throttle,
-        yield_mode: YieldMode::from_env(),
+        gov,
         cancel,
     };
 
@@ -443,14 +448,16 @@ pub fn run_stream(
         // yields nothing to anyone else. To actually release the device we have
         // to break the overlap: let `cur` finish, then pause with nothing in
         // flight (the gate in `form_and_commit` below), then commit again.
-        let next = if (ctx.throttle)() {
+        let next = if ctx.gov.should_throttle() {
             None
         } else {
             form_and_commit(device, &mut ctx, Seed::NonBlocking)
         };
         // Wait on `cur`, host-score (rayon), emit. Its GPU compute overlapped
         // the `next` form above and now overlaps `next`'s execution.
-        finish_batch(cur, ctx.out);
+        // Feed our own device time back to the governor: it is the term that
+        // turns whole-device utilization into external-only load.
+        ctx.gov.record_gpu_busy_us(finish_batch(cur, ctx.out));
         inflight = match next {
             Some(f) => Some(f),
             // Nothing was queued to overlap; now that `cur` freed credits, block
@@ -469,12 +476,18 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
     // Yield before taking a seed, not after: once a job is dequeued it is ours
     // to answer, and holding it through a pause would stall the coordinator's
     // credit for no benefit.
-    let shrink = ctx.yield_gate();
+    ctx.yield_gate();
     let seed_job = next_seed(ctx, seed)?;
     // Batch size follows the seed's read count: chromatic Gibbs spends
     // `num_reads` threadgroups per problem, so the same threadgroup budget is a
     // different number of problems at 64 reads than at 256.
-    let cap = (batch_size_for_reads(ctx.algorithm, seed_job.params.num_reads) / shrink).max(1);
+    //
+    // Scaled by the governor: the utilization ceiling, less any external load
+    // while yielding. Sizing the dispatch is what actually shares the GPU —
+    // a smaller grid leaves cores free for whoever else wants them, for the
+    // whole duration of the dispatch rather than only in the gaps.
+    let nominal = batch_size_for_reads(ctx.algorithm, seed_job.params.num_reads);
+    let cap = scale_budget(nominal, ctx.gov.budget_scale());
     // Keep `seed_job` live while `key` borrows its edge list; collect further
     // matches into a side vec, then assemble the full batch.
     let mut matches = Vec::with_capacity(cap.saturating_sub(1));
@@ -537,7 +550,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
 /// job. `device_access_time_us` is the true GPU execution time
 /// (`GPUEndTime - GPUStartTime`), not the wall clock — the wall includes this
 /// batch's overlap with host work on either side.
-fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
+fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) -> u64 {
     let InFlight { encoded, jobs } = inflight;
 
     encoded.wait_until_completed();
@@ -560,7 +573,9 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
         for job in jobs {
             send_reject(out, job, RejectReason::Overloaded);
         }
-        return;
+        // A failed batch still occupied the device; report it or the governor
+        // would read the failure as idle time and size the next batch up.
+        return device_access_time_us;
     }
 
     let per_problem = {
@@ -574,7 +589,7 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
             for job in jobs {
                 send_reject(out, job, RejectReason::Overloaded);
             }
-            return;
+            return device_access_time_us;
         }
     };
 
@@ -595,8 +610,8 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
             break; // consumer gone
         }
     }
+    device_access_time_us
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -629,8 +644,40 @@ mod tests {
     }
 
     /// Governor predicate for tests that are not about throttling.
-    fn no_throttle() -> bool {
-        false
+    /// A dispatch must never scale to zero problems: an empty batch makes no
+    /// progress and never frees the coordinator's credit, so the miner would
+    /// wedge instead of merely running slowly.
+    #[test]
+    fn scale_budget_never_reaches_zero() {
+        assert_eq!(scale_budget(4, 0.0), 1);
+        assert_eq!(scale_budget(1, 0.5), 1);
+        assert_eq!(scale_budget(0, 1.0), 1);
+    }
+
+    #[test]
+    fn scale_budget_halves_and_saturates() {
+        assert_eq!(scale_budget(240, 0.5), 120);
+        assert_eq!(scale_budget(240, 0.8), 192);
+        // At or above 1.0 the nominal budget passes through untouched.
+        assert_eq!(scale_budget(240, 1.0), 240);
+        assert_eq!(scale_budget(240, 2.0), 240);
+        // A NaN scale (impossible from the governor, but the cast would be UB)
+        // degrades to the nominal budget rather than poisoning the batch size.
+        assert_eq!(scale_budget(240, f64::NAN), 240);
+    }
+
+    /// Governor stub: never throttles, never scales. Keeps the batch-forming
+    /// tests measuring batching logic rather than governor state.
+    struct NoGovernor;
+
+    impl GpuGovernor for NoGovernor {
+        fn should_throttle(&self) -> bool {
+            false
+        }
+        fn budget_scale(&self) -> f64 {
+            1.0
+        }
+        fn record_gpu_busy_us(&self, _us: u64) {}
     }
 
     fn ring4() -> IsingGraph {
@@ -744,7 +791,10 @@ mod tests {
                 g_budget.div_ceil(256).max(1)
             );
         }
-        assert!(batch_size_for_reads(Algorithm::Gibbs, 4096) >= 1, "never zero");
+        assert!(
+            batch_size_for_reads(Algorithm::Gibbs, 4096) >= 1,
+            "never zero"
+        );
     }
 
     #[test]
@@ -755,7 +805,10 @@ mod tests {
         assert_eq!(sampler::simd_rounded_reads(33), 64);
         // Already aligned counts are untouched, and the cap is never exceeded.
         assert_eq!(sampler::simd_rounded_reads(64), 64);
-        assert_eq!(sampler::simd_rounded_reads(sampler::MAX_READS), sampler::MAX_READS);
+        assert_eq!(
+            sampler::simd_rounded_reads(sampler::MAX_READS),
+            sampler::MAX_READS
+        );
         assert_eq!(sampler::simd_rounded_reads(usize::MAX), sampler::MAX_READS);
     }
 
@@ -773,8 +826,7 @@ mod tests {
             out: &out_tx,
             pending: &mut pending,
             algorithm: Algorithm::Sa,
-            throttle: &no_throttle,
-            yield_mode: YieldMode::Batch,
+            gov: &NoGovernor,
             cancel: &CancelGuard::default(),
         };
         // Empty job is answered inline; channel then closes → None.
@@ -817,8 +869,7 @@ mod tests {
             out: &out_tx,
             pending: &mut pending,
             algorithm: Algorithm::Sa,
-            throttle: &no_throttle,
-            yield_mode: YieldMode::Batch,
+            gov: &NoGovernor,
             cancel: &CancelGuard::default(),
         };
         assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
@@ -845,8 +896,7 @@ mod tests {
             out: &out_tx,
             pending: &mut pending,
             algorithm: Algorithm::Sa,
-            throttle: &no_throttle,
-            yield_mode: YieldMode::Batch,
+            gov: &NoGovernor,
             cancel: &CancelGuard::default(),
         };
         assert!(next_seed(&mut ctx, Seed::NonBlocking).is_none());
@@ -866,8 +916,7 @@ mod tests {
             out: &out_tx,
             pending: &mut pending,
             algorithm: Algorithm::Sa,
-            throttle: &no_throttle,
-            yield_mode: YieldMode::Batch,
+            gov: &NoGovernor,
             cancel: &CancelGuard::default(),
         };
         let Some(got) = next_seed(&mut ctx, Seed::Blocking) else {
