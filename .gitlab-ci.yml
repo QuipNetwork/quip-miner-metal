@@ -21,7 +21,8 @@ test:
   stage: test
   script:
     - rustup component add clippy
-    - cargo build --release
+    # clippy --all-targets compile-checks lib, bins and tests without linking
+    # binaries; producing binaries is the tagged-release job's business.
     - cargo clippy --release --all-targets -- -D warnings
 
 .build:
@@ -30,15 +31,20 @@ test:
     paths: [dist/]
     expire_in: 1 week
 
-# Best-effort: requires a GitLab macOS runner (saas-macos-medium-m1 or
-# equivalent). Not all GitLab plans/projects have one available, so this is
-# `when: manual` rather than wired into the default pipeline. Enable it (or
-# switch to `when: manual` -> automatic) once a macOS runner is confirmed.
+# Binaries are cut for tagged releases only; branch and MR pipelines stop at
+# the `test` stage.
+#
+# Best-effort even on a tag: requires a GitLab macOS runner
+# (saas-macos-medium-m1 or equivalent). Not all GitLab plans/projects have one
+# available, so this stays `when: manual` rather than running automatically.
+# Drop `when: manual` once a macOS runner is confirmed.
 build-macos-arm64:
   extends: .build
   tags: [saas-macos-medium-m1]
   image: macos-14-xcode-15
-  when: manual
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: manual
   script:
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1
     - source "$HOME/.cargo/env"
