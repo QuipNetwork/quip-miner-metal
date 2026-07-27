@@ -64,7 +64,6 @@ const _: () = assert!(
     "sampler::MAX_SWEEPS must admit the Gibbs-doubled METAL_ADAPT.max_sweeps"
 );
 
-/// Backend identity for `quip-metal-sa`.
 /// Metal adapt envelope (from `GPU/metal_miner.py`).
 const METAL_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt::AdaptBounds {
     min_sweeps: 256,
@@ -76,6 +75,17 @@ const METAL_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt:
     reads_solution_floor_factor: 0,
 };
 
+/// Backend identity for `quip-metal-sa`.
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::METAL_SA_IDENTITY;
+///
+/// assert_eq!(METAL_SA_IDENTITY.backend, "metal");
+/// assert_eq!(METAL_SA_IDENTITY.algorithm, "sa");
+/// assert!(METAL_SA_IDENTITY.max_nodes > 0);
+/// ```
 pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
     algorithm: "sa",
@@ -90,6 +100,16 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
 };
 
 /// Backend identity for `quip-metal-gibbs`.
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::METAL_GIBBS_IDENTITY;
+///
+/// assert_eq!(METAL_GIBBS_IDENTITY.backend, "metal");
+/// assert_eq!(METAL_GIBBS_IDENTITY.algorithm, "gibbs");
+/// assert!(METAL_GIBBS_IDENTITY.max_nodes > 0);
+/// ```
 pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
     algorithm: "gibbs",
@@ -102,6 +122,24 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization
 /// governor. macOS-only.
+///
+/// # Examples
+///
+/// ```no_run
+/// use quip_miner_metal::{
+///     Algorithm, MetalSampler,
+///     iokit_gov::UtilGovernor,
+///     metal_device::MetalDevice,
+/// };
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let device = MetalDevice::open(0)?;
+/// let gov = UtilGovernor::start(0, 100, false);
+/// let sampler = MetalSampler::new(device, gov, Algorithm::Sa);
+/// let _ = sampler;
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub struct MetalSampler {
@@ -126,6 +164,25 @@ struct MetalConfig {
 
 #[cfg(target_os = "macos")]
 impl MetalSampler {
+    /// Bind an opened [`crate::metal_device::MetalDevice`] and
+    /// [`crate::iokit_gov::UtilGovernor`] to an algorithm.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use quip_miner_metal::{
+    ///     Algorithm, MetalSampler,
+    ///     iokit_gov::UtilGovernor,
+    ///     metal_device::MetalDevice,
+    /// };
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let device = MetalDevice::open(0)?;
+    /// let gov = UtilGovernor::start(0, 100, false);
+    /// let _sampler = MetalSampler::new(device, gov, Algorithm::Gibbs);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(
         device: crate::metal_device::MetalDevice,
         gov: crate::iokit_gov::UtilGovernor,
@@ -195,17 +252,118 @@ impl quip_miner_core::Sampler for MetalSampler {
     }
 
     fn apply_config(&self, backend_toml: &str) {
-        use quip_miner_core::config::{config_override, warn_unknown_fields};
-        let cfg: MetalConfig = toml::from_str(backend_toml).unwrap_or_default();
-        warn_unknown_fields("metal", cfg.unknown.keys());
-        // config over CLI (the governor holds the CLI-set values until now).
-        let ceiling = config_override(
-            "utilization",
+        // Pure parse/merge lives in `resolve_governor_config` so unit tests
+        // exercise the untrusted TOML path without opening a Metal device.
+        let (ceiling, yielding) = resolve_governor_config(
+            backend_toml,
             self.gov.utilization_ceiling(),
-            cfg.utilization,
+            self.gov.yielding(),
         );
-        let yielding = config_override("yielding", self.gov.yielding(), cfg.yielding);
         self.gov.reconfigure(ceiling, yielding);
+    }
+}
+
+/// Parse coordinator `backend_toml` and resolve the utilization ceiling and
+/// yielding flag against the values the governor already holds (CLI defaults
+/// until the first `Configure`).
+///
+/// Malformed TOML falls back to an empty config (`unwrap_or_default`), so the
+/// current values are kept. Present keys override via
+/// `quip_miner_core::config::config_override`; unknown keys are warned via
+/// `warn_unknown_fields`. Out-of-range utilization is returned as-is —
+/// `UtilGovernor::reconfigure` clamps to `1..=100`.
+#[cfg(target_os = "macos")]
+fn resolve_governor_config(
+    backend_toml: &str,
+    current_ceiling: u32,
+    current_yielding: bool,
+) -> (u32, bool) {
+    use quip_miner_core::config::{config_override, warn_unknown_fields};
+    let cfg: MetalConfig = toml::from_str(backend_toml).unwrap_or_default();
+    warn_unknown_fields("metal", cfg.unknown.keys());
+    // config over CLI (the governor holds the CLI-set values until now).
+    let ceiling = config_override("utilization", current_ceiling, cfg.utilization);
+    let yielding = config_override("yielding", current_yielding, cfg.yielding);
+    (ceiling, yielding)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::resolve_governor_config;
+
+    /// CLI defaults the pure resolver starts from in every case below.
+    const CLI_CEILING: u32 = 80;
+    const CLI_YIELDING: bool = false;
+
+    #[test]
+    fn empty_toml_keeps_current_values() {
+        let (ceiling, yielding) = resolve_governor_config("", CLI_CEILING, CLI_YIELDING);
+        assert_eq!(ceiling, CLI_CEILING);
+        assert_eq!(yielding, CLI_YIELDING);
+    }
+
+    #[test]
+    fn valid_utilization_overrides_ceiling() {
+        let (ceiling, yielding) =
+            resolve_governor_config("utilization = 60", CLI_CEILING, CLI_YIELDING);
+        assert_eq!(ceiling, 60);
+        assert_eq!(yielding, CLI_YIELDING);
+    }
+
+    #[test]
+    fn valid_yielding_overrides_flag() {
+        let (ceiling, yielding) =
+            resolve_governor_config("yielding = true", CLI_CEILING, CLI_YIELDING);
+        assert_eq!(ceiling, CLI_CEILING);
+        assert!(yielding);
+    }
+
+    #[test]
+    fn both_keys_override_together() {
+        let toml = "utilization = 50\nyielding = true\n";
+        let (ceiling, yielding) = resolve_governor_config(toml, CLI_CEILING, CLI_YIELDING);
+        assert_eq!(ceiling, 50);
+        assert!(yielding);
+    }
+
+    #[test]
+    fn malformed_toml_falls_back_to_current_values() {
+        // `unwrap_or_default` must swallow parse failure — no panic, no change.
+        let (ceiling, yielding) =
+            resolve_governor_config("not = [valid", CLI_CEILING, CLI_YIELDING);
+        assert_eq!(ceiling, CLI_CEILING);
+        assert_eq!(yielding, CLI_YIELDING);
+    }
+
+    #[test]
+    fn unknown_keys_do_not_block_valid_overrides() {
+        // Unknowns are warned (observable via tracing) but ignored for merge.
+        let toml = "utilization = 40\nnot_a_real_key = 1\nyielding = true\n";
+        let (ceiling, yielding) = resolve_governor_config(toml, CLI_CEILING, CLI_YIELDING);
+        assert_eq!(ceiling, 40);
+        assert!(yielding);
+    }
+
+    #[test]
+    fn out_of_range_utilization_passes_through_unclamped() {
+        // `config_override` returns the config value as-is; clamping to
+        // `1..=100` is `UtilGovernor::reconfigure`'s job, not the parser's.
+        let (zero, _) = resolve_governor_config("utilization = 0", CLI_CEILING, CLI_YIELDING);
+        assert_eq!(zero, 0);
+        let (high, _) = resolve_governor_config("utilization = 250", CLI_CEILING, CLI_YIELDING);
+        assert_eq!(high, 250);
+    }
+
+    #[test]
+    fn same_as_cli_is_a_silent_no_op() {
+        // config_override keeps the CLI value when the config restates it.
+        let (ceiling, yielding) = resolve_governor_config(
+            "utilization = 80\nyielding = false\n",
+            CLI_CEILING,
+            CLI_YIELDING,
+        );
+        assert_eq!(ceiling, CLI_CEILING);
+        assert_eq!(yielding, CLI_YIELDING);
     }
 }
 
@@ -232,6 +390,23 @@ fn init_tracing() {
 /// Run a Metal miner binary. macOS opens the GPU and governor; other platforms
 /// support `--capabilities`/`--version` but return `EnvIncompatible` for
 /// `--check` and session mode.
+///
+/// # Examples
+///
+/// ```no_run
+/// use quip_miner_core::{Algorithm, CommonArgs};
+/// use quip_miner_metal::{run_metal, METAL_SA_IDENTITY};
+///
+/// let common = CommonArgs {
+///     quip_coordinator: None,
+///     miner_id: None,
+///     capabilities: true,
+///     check: false,
+///     log_level: "info".into(),
+///     sweeps_per_beta: None,
+/// };
+/// let _code = run_metal(METAL_SA_IDENTITY, Algorithm::Sa, &common, 0, 100, false);
+/// ```
 pub fn run_metal(
     id: BackendIdentity,
     algorithm: Algorithm,

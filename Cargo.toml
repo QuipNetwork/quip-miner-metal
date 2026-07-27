@@ -88,6 +88,10 @@ await_holding_lock = "deny"
 large_futures = "deny"
 exit = "deny"
 mem_forget = "deny"
+# `assert!(r.is_ok())` / `assert!(r.is_err())` without inspecting the payload
+# is weaker than asserting the Ok value or Err kind. Prior pass fixed 5 sites;
+# measured clean under `-W clippy::assertions_on_result_states`.
+assertions_on_result_states = "warn"
 
 # --- diagnostics must go through `tracing`, not the console (measured: 0
 # `print_stdout`; the 3 `print_stderr` sites in `streaming.rs` are converted
@@ -109,12 +113,16 @@ allow_attributes = "deny"
 # --- deliberately off ---
 module_name_repetitions = "allow"
 similar_names = "allow"
-# TODO: 35 sites, almost all in `sampler.rs`/`streaming.rs` hot loops indexing
-# CSR buffers with host-computed offsets. Each needs individual review to
-# decide `get()` vs. a documented invariant; turning this on now would break
-# CI. Track separately before enabling.
+# TODO: 25 sites (`cargo clippy --lib --all-features -- -W
+# clippy::indexing_slicing`); almost all in `topology.rs` (18), remainder in
+# `sampler.rs`/`streaming.rs` hot loops indexing CSR buffers with
+# host-computed offsets. Each needs individual review to decide `get()` vs.
+# a documented invariant; turning this on now would break CI. Track
+# separately before enabling.
 indexing_slicing = "allow"
-# NOT enabled: `pedantic` produces 235 warnings (121 of them cast-related —
+# NOT enabled: `pedantic` produces 162 warnings under
+# `cargo clippy --all-targets --all-features -- -W clippy::pedantic`
+# (91 of them cast-related —
 # `cast_possible_truncation`/`cast_sign_loss`/`cast_possible_wrap` — which are
-# deliberate for GPU buffer packing, plus 29 `doc_markdown` and 26
+# deliberate for GPU buffer packing, plus 21 `doc_markdown` and 17
 # `must_use_candidate`). Adopting it needs its own triage pass.

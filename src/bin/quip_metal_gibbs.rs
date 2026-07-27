@@ -1,5 +1,10 @@
 //! Metal heat-bath Gibbs miner (`quip-metal-gibbs`). macOS-only at runtime.
 
+// Binary is a separate crate; lib.rs crate-root panic discipline does not apply here.
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::panic)]
+#![warn(clippy::expect_used)]
+
 use clap::Parser;
 use quip_miner_core::CommonArgs;
 use quip_miner_metal::{run_metal, Algorithm, METAL_GIBBS_IDENTITY};

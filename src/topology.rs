@@ -25,11 +25,33 @@ use quip_miner_core::IsingGraph;
 /// Fields are public because the color-block layout is this type's contract:
 /// integration tests (and kernel-side consumers) read `starts`/`counts`/
 /// `nodes`/`num_colors` directly to assert coloring invariants.
-#[derive(Clone, Debug)]
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::IsingGraph;
+/// use quip_miner_metal::topology::SelfFeedingTopology;
+///
+/// let graph = IsingGraph::new(
+///     vec![1.0, -1.0, 0.0, 1.0],
+///     vec![1.0, -1.0, 1.0, -1.0],
+///     vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+/// );
+/// let c = &SelfFeedingTopology::build(&graph).colors;
+/// assert_eq!(c.starts.len(), c.num_colors as usize);
+/// assert_eq!(c.counts.len(), c.num_colors as usize);
+/// assert_eq!(c.nodes.len(), 4);
+/// assert_eq!(c.counts.iter().sum::<i32>(), 4);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColorBlocks {
+    /// Offset into [`Self::nodes`] for each color (`starts.len() == num_colors`).
     pub starts: Vec<i32>,
+    /// Node count per color (`counts.len() == num_colors`).
     pub counts: Vec<i32>,
+    /// Dense node indices grouped by color.
     pub nodes: Vec<i32>,
+    /// Number of colors in the partition.
     pub num_colors: i32,
 }
 
@@ -107,15 +129,39 @@ fn greedy_color(n: usize, row_ptr: &[i32], col_ind: &[i32]) -> ColorBlocks {
 /// Fields are public because the CSR layout is this type's contract:
 /// integration tests read `n`/`nnz`/`row_ptr`/`col_ind`/`edge_pos`/`colors`
 /// to check shape and coloring invariants. Do not narrow to `pub(crate)`.
-#[derive(Clone, Debug)]
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::IsingGraph;
+/// use quip_miner_metal::topology::SelfFeedingTopology;
+///
+/// let graph = IsingGraph::new(
+///     vec![0.0, 0.0],
+///     vec![1.0],
+///     vec![(0, 1)],
+/// );
+/// let t = SelfFeedingTopology::build(&graph);
+/// assert_eq!(t.n, 2);
+/// assert_eq!(t.nnz, 2); // one undirected edge → two directed halves
+/// assert_eq!(t.row_ptr.len(), t.n + 1);
+/// assert_eq!(t.col_ind.len(), t.nnz);
+/// assert_eq!(t.edge_pos.len(), graph.edges.len());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelfFeedingTopology {
+    /// Number of nodes (`graph.h.len()` of the establishing graph).
     pub n: usize,
+    /// Number of directed CSR half-edges (`col_ind.len()`).
     pub nnz: usize,
+    /// CSR row pointer, length `n + 1`.
     pub row_ptr: Vec<i32>,
+    /// CSR column indices, length `nnz`.
     pub col_ind: Vec<i32>,
     /// Per-edge `(pos_ij, pos_ji)` into `col_ind`/`j` arrays, parallel to the
     /// establishing graph's `edges` order.
     pub edge_pos: Vec<(u32, u32)>,
+    /// Chromatic color-block partition of the dense node indices.
     pub colors: ColorBlocks,
 }
 

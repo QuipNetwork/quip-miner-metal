@@ -161,6 +161,23 @@ impl UtilGovernor {
     /// device, not to surrender it. Without a floor, sustained external load
     /// (a video call, a compile) would drive the budget toward zero and stall
     /// mining entirely for as long as the other app ran.
+    ///
+    /// # Examples
+    ///
+    /// Pure once a governor exists: no Metal device is opened. Ceiling alone
+    /// sets the scale while yielding is off.
+    ///
+    /// ```
+    /// use quip_miner_metal::iokit_gov::UtilGovernor;
+    ///
+    /// let mut gov = UtilGovernor::start(0, 80, false);
+    /// assert!((gov.budget_scale() - 0.8).abs() < 1e-9);
+    /// assert_eq!(gov.utilization_ceiling(), 80);
+    /// assert!(!gov.yielding());
+    /// gov.reconfigure(100, false);
+    /// assert!((gov.budget_scale() - 1.0).abs() < f64::EPSILON);
+    /// gov.stop();
+    /// ```
     pub fn budget_scale(&self) -> f64 {
         let ceiling = f64::from(self.knobs.ceiling.load(Ordering::Relaxed));
         let headroom = if self.knobs.yielding.load(Ordering::Relaxed) {

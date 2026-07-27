@@ -33,6 +33,15 @@ use tokio::sync::mpsc::{Receiver, Sender};
 const DEFAULT_GPU_CORES: usize = 10;
 
 /// Backend-facing read cap for [`crate::MetalSampler::max_reads`] (mirrors CUDA).
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::{streaming, Algorithm};
+///
+/// assert_eq!(streaming::max_reads(Algorithm::Sa), 256);
+/// assert_eq!(streaming::max_reads(Algorithm::Gibbs), 256);
+/// ```
 pub fn max_reads(_algorithm: Algorithm) -> u32 {
     sampler::MAX_READS as u32
 }
@@ -144,6 +153,23 @@ fn scale_budget(nominal: usize, scale: f64) -> usize {
 /// Sized from [`NOMINAL_READS`] because it is fixed at startup, before any job
 /// reveals its read count. Two batches' worth, so the harness buffers the next
 /// batch while one dispatches.
+///
+/// The `_device` parameter is unused today (width is core-count driven via
+/// IOKit), but kept so the signature matches the harness and stays ready for
+/// per-device overrides.
+///
+/// # Examples
+///
+/// ```no_run
+/// use quip_miner_metal::{streaming, Algorithm, metal_device::MetalDevice};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let device = MetalDevice::open(0)?;
+/// let width = streaming::stream_width(&device, Algorithm::Sa);
+/// assert!(width >= 1);
+/// # Ok(())
+/// # }
+/// ```
 pub fn stream_width(_device: &MetalDevice, algorithm: Algorithm) -> usize {
     (batch_size_for_reads(algorithm, NOMINAL_READS) * 2).max(1)
 }
@@ -616,6 +642,7 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use quip_miner_core::SampleParams;
 
     fn params(num_reads: usize, num_sweeps: usize, sweeps_per_beta: usize) -> SampleParams {
@@ -817,7 +844,7 @@ mod tests {
         let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(4);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
         let empty = job(b"empty", IsingGraph::new(vec![], vec![], vec![]), 3, 64, 1);
-        assert!(job_tx.blocking_send(empty).is_ok());
+        job_tx.blocking_send(empty).unwrap();
         drop(job_tx);
 
         let mut pending = None;
@@ -860,7 +887,7 @@ mod tests {
             64,
             1,
         );
-        assert!(job_tx.blocking_send(huge).is_ok());
+        job_tx.blocking_send(huge).unwrap();
         drop(job_tx);
 
         let mut pending = None;
@@ -907,7 +934,7 @@ mod tests {
         let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(4);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
         let j = job(b"ok", ring4(), 8, 32, 1);
-        assert!(job_tx.blocking_send(j).is_ok());
+        job_tx.blocking_send(j).unwrap();
         drop(job_tx);
 
         let mut pending = None;
@@ -927,5 +954,44 @@ mod tests {
         assert_eq!(got.graph.num_nodes(), 4);
         // No reject / empty answer emitted.
         assert!(out_rx.try_recv().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests (proptest is a dev-dep; private fns are reachable here)
+    // -----------------------------------------------------------------------
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            ..ProptestConfig::default()
+        })]
+
+        /// Floor of one problem: NaN, ±inf, 0, negatives, and all other scales.
+        #[test]
+        fn scale_budget_never_zero_for_any_f64(
+            nominal in any::<usize>(),
+            scale in proptest::num::f64::ANY
+        ) {
+            prop_assert!(
+                scale_budget(nominal, scale) >= 1,
+                "scale_budget({}, {:?}) returned 0",
+                nominal,
+                scale
+            );
+        }
+
+        /// Problem batch size is always at least one, for any read count.
+        #[test]
+        fn batch_size_for_reads_never_zero(
+            algo in prop_oneof![Just(Algorithm::Sa), Just(Algorithm::Gibbs)],
+            num_reads in any::<usize>()
+        ) {
+            prop_assert!(
+                batch_size_for_reads(algo, num_reads) >= 1,
+                "batch_size_for_reads({:?}, {}) returned 0",
+                algo,
+                num_reads
+            );
+        }
     }
 }

@@ -23,12 +23,16 @@ use thiserror::Error;
 const SA_SRC: &str = include_str!("../kernels/sa.metal");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.metal");
 
+/// Failure opening a Metal device or compiling its SA/Gibbs pipelines.
 #[derive(Debug, Error)]
 pub enum MetalError {
+    /// Driver refused pipeline-state creation for a compiled entry point.
     #[error("Metal driver: {0}")]
     Driver(String),
+    /// Kernel source or entry point failed to compile.
     #[error("Metal compile: {0}")]
     Compile(String),
+    /// No Metal device at the requested `Device::all()` index.
     #[error("no Metal device at index {0}")]
     NoDevice(usize),
 }
@@ -75,6 +79,18 @@ impl MetalDevice {
     ///   compile, or the compiled library has no such entry point.
     /// - [`MetalError::Driver`] — the driver refused to build a compute
     ///   pipeline state for an entry point that did compile.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use quip_miner_metal::metal_device::MetalDevice;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let device = MetalDevice::open(0)?;
+    /// let _ = device;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn open(device_index: usize) -> Result<Self, MetalError> {
         let devices = Device::all();
         if devices.is_empty() {
@@ -106,6 +122,16 @@ impl MetalDevice {
     /// than an error when no device is present — so this returns a plain
     /// count. Callers that need a *usable* device want [`Self::check`], which
     /// also compiles the kernels.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use quip_miner_metal::metal_device::MetalDevice;
+    ///
+    /// let a = MetalDevice::device_count();
+    /// let b = MetalDevice::device_count();
+    /// assert_eq!(a, b);
+    /// ```
     #[must_use]
     pub fn device_count() -> usize {
         Device::all().len()
@@ -119,6 +145,17 @@ impl MetalDevice {
     /// `device_index` names no device, [`MetalError::Compile`] on a kernel
     /// source or entry-point failure, and [`MetalError::Driver`] when
     /// pipeline-state creation is refused.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use quip_miner_metal::metal_device::MetalDevice;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// MetalDevice::check(0)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn check(device_index: usize) -> Result<(), MetalError> {
         let _ = Self::open(device_index)?;
         Ok(())
@@ -160,4 +197,43 @@ fn compile_pipeline(
     device
         .new_compute_pipeline_state_with_function(&function)
         .map_err(|e| MetalError::Driver(format!("{entry} pipeline: {e}")))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_count_is_consistent() {
+        // Enumeration cannot fail; two back-to-back reads must agree.
+        let a = MetalDevice::device_count();
+        let b = MetalDevice::device_count();
+        assert_eq!(a, b, "device_count drifted between calls");
+    }
+
+    #[test]
+    fn open_past_the_end_is_no_device() {
+        let n = MetalDevice::device_count();
+        let err = MetalDevice::open(n).unwrap_err();
+        match err {
+            MetalError::NoDevice(i) => assert_eq!(i, n),
+            other => panic!("expected NoDevice({n}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_succeeds_on_a_valid_index() {
+        // Apple Silicon always exposes at least one Metal device; if this
+        // host somehow has none, open(0) must still report NoDevice cleanly.
+        let n = MetalDevice::device_count();
+        if n == 0 {
+            let err = MetalDevice::check(0).unwrap_err();
+            assert!(
+                matches!(err, MetalError::NoDevice(0)),
+                "expected NoDevice(0), got {err:?}"
+            );
+            return;
+        }
+        MetalDevice::check(0).unwrap();
+    }
 }

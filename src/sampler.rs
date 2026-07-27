@@ -33,11 +33,15 @@ use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 #[cfg(target_os = "macos")]
 use quip_protocol::scoring::energy_milli;
 
+/// Failure from a Metal sample attempt: capacity refusal, driver fault, or
+/// platform unavailability.
 #[derive(Debug, Error)]
 pub enum SampleError {
+    /// Device open, kernel compile, or pipeline construction failed.
     #[cfg(target_os = "macos")]
     #[error(transparent)]
     Metal(#[from] crate::metal_device::MetalError),
+    /// Command buffer or buffer readback failed after a dispatch.
     #[error("Metal driver: {0}")]
     Driver(String),
     /// The job exceeds a fixed capacity of this backend (kernel node cap,
@@ -47,6 +51,7 @@ pub enum SampleError {
     /// invites a retry that would fail identically every time.
     #[error("job exceeds Metal backend capacity: {0}")]
     TooLarge(String),
+    /// Built without Metal support (non-macOS stub path).
     #[error("Metal unavailable on this platform")]
     Unavailable,
 }
@@ -56,11 +61,27 @@ impl SampleError {
     /// `MINER_PROTOCOL.md`). Everything that is not a capacity refusal is
     /// reported as `OVERLOADED`: the protocol has no reason code for
     /// "backend permanently broken", so a kernel compile failure and a device
-    /// reset share it.
+    /// reset share it. Arms are listed explicitly so a new variant forces a
+    /// decision rather than silently inheriting `Overloaded`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use quip_miner_metal::sampler::SampleError;
+    /// use quip_proto::v1::RejectReason;
+    ///
+    /// let err = SampleError::TooLarge("nodes > SA cap".into());
+    /// assert_eq!(err.reject_reason(), RejectReason::TooLarge);
+    ///
+    /// let err = SampleError::Unavailable;
+    /// assert_eq!(err.reject_reason(), RejectReason::Overloaded);
+    /// ```
     pub fn reject_reason(&self) -> quip_proto::v1::RejectReason {
         match self {
             Self::TooLarge(_) => quip_proto::v1::RejectReason::TooLarge,
-            _ => quip_proto::v1::RejectReason::Overloaded,
+            Self::Driver(_) | Self::Unavailable => quip_proto::v1::RejectReason::Overloaded,
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => quip_proto::v1::RejectReason::Overloaded,
         }
     }
 }
@@ -412,10 +433,11 @@ impl EncodedBatch {
 /// from `GPUEndTime - GPUStartTime` (`CFTimeInterval` seconds). metal-rs 0.33
 /// exposes no accessor, so read the properties via `objc`. Returns 0 if the
 /// timestamps are unavailable / non-positive.
-// `unexpected_cfgs`: objc 0.2's `msg_send!` expands to a `cfg(cargo-clippy)`
-// check the compiler no longer recognizes — a macro-internal quirk, not our cfg.
 #[cfg(target_os = "macos")]
-#[expect(unexpected_cfgs)]
+#[expect(
+    unexpected_cfgs,
+    reason = "objc 0.2 msg_send! expands to cfg(cargo-clippy) the compiler no longer recognizes"
+)]
 fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
     use objc::{msg_send, sel, sel_impl};
     // SAFETY: `GPUStartTime`/`GPUEndTime` are `CFTimeInterval` (f64) properties
@@ -918,7 +940,16 @@ pub(crate) fn harvest_batch(
 ) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
     use rayon::prelude::*;
 
-    debug_assert_eq!(graphs.len(), batch.num_problems);
+    // Was a `debug_assert_eq!`, which is compiled out in release — a length
+    // mismatch would index `packed` from `graphs` while sizing it from
+    // `batch.num_problems` and panic the miner.
+    if graphs.len() != batch.num_problems {
+        return Err(SampleError::Driver(format!(
+            "harvest_batch graphs.len()={} != batch.num_problems={}",
+            graphs.len(),
+            batch.num_problems
+        )));
+    }
     let count = batch.num_problems * batch.num_reads * batch.packed_size;
     let packed = read_i8_buffer(&batch.d_samples, count)?;
     let (num_reads, packed_size, n) = (batch.num_reads, batch.packed_size, batch.n);
@@ -962,6 +993,32 @@ pub(crate) fn harvest_batch(
 /// [`SampleError::Metal`] is not produced by this path — device and pipeline
 /// construction errors surface earlier, from [`crate::metal_device`].
 /// [`SampleError::Unavailable`] is returned only by the non-macOS stub.
+///
+/// # Examples
+///
+/// ```no_run
+/// use quip_miner_metal::{
+///     sample_ising, Algorithm, IsingGraph, SampleParams,
+///     metal_device::MetalDevice,
+/// };
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let device = MetalDevice::open(0)?;
+/// let graph = IsingGraph::new(
+///     vec![1.0, -1.0, 0.0, 1.0],
+///     vec![1.0, -1.0, 1.0, -1.0],
+///     vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+/// );
+/// let params = SampleParams {
+///     num_reads: 4,
+///     num_sweeps: 64,
+///     ..Default::default()
+/// };
+/// let samples = sample_ising(&device, &graph, &params, Algorithm::Sa)?;
+/// assert_eq!(samples.len(), 4);
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(target_os = "macos")]
 pub fn sample_ising(
     device: &crate::metal_device::MetalDevice,
@@ -1220,7 +1277,7 @@ mod tests {
     #[test]
     fn validate_batch_accepts_the_cap_exactly() {
         let g = ring();
-        assert!(validate_batch(&[&g], &params(MAX_SWEEPS), Algorithm::Sa).is_ok());
+        validate_batch(&[&g], &params(MAX_SWEEPS), Algorithm::Sa).unwrap();
     }
 
     #[test]
@@ -1232,7 +1289,7 @@ mod tests {
         assert!(MAX_SWEEPS >= 2 * adapt_max_sweeps);
         let g = ring();
         let sweeps = 2 * adapt_max_sweeps;
-        assert!(validate_batch(&[&g], &params(sweeps), Algorithm::Gibbs).is_ok());
+        validate_batch(&[&g], &params(sweeps), Algorithm::Gibbs).unwrap();
     }
 
     #[test]
@@ -1263,5 +1320,124 @@ mod tests {
         // single unread slot.
         assert_eq!(pad_i32(&[]), vec![0]);
         assert_eq!(pad_i32(&[4, 5]), vec![4, 5]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests (proptest is a dev-dep; private fns are reachable here)
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Reference packer for the kernel bit contract (LSB-first per byte;
+    /// bit set → spin -1, bit clear → +1). Inverse of [`unpack_spins`].
+    fn pack_spins(spins: &[i8]) -> Vec<i8> {
+        let nbytes = spins.len().div_ceil(8);
+        let mut packed = vec![0i8; nbytes];
+        for (i, &s) in spins.iter().enumerate() {
+            if s < 0 {
+                let byte_i = i >> 3;
+                let bit = (i & 7) as u8;
+                packed[byte_i] = (packed[byte_i] as u8 | (1u8 << bit)) as i8;
+            }
+        }
+        packed
+    }
+
+    /// ±1 spin vectors; n includes non-byte-aligned sizes (1, 7, 8, 9, 63, 65).
+    fn arb_spins() -> impl Strategy<Value = Vec<i8>> {
+        prop_oneof![
+            Just(1usize),
+            Just(7usize),
+            Just(8usize),
+            Just(9usize),
+            Just(63usize),
+            Just(65usize),
+            0usize..=96,
+        ]
+        .prop_flat_map(|n| prop::collection::vec(prop_oneof![Just(-1i8), Just(1i8)], n))
+    }
+
+    /// Small graphs with consensus-range h/J for scoring properties.
+    fn arb_score_input() -> impl Strategy<Value = (Vec<i8>, IsingGraph)> {
+        (1usize..=24).prop_flat_map(|n| {
+            let max_edges = 32.min(n.saturating_mul(2));
+            let spins = prop::collection::vec(prop_oneof![Just(-1i8), Just(1i8)], n);
+            let h = prop::collection::vec(prop_oneof![Just(-1.0f64), Just(0.0), Just(1.0)], n);
+            let edges = prop::collection::vec((0usize..n, 0usize..n), 0..=max_edges);
+            (spins, h, edges).prop_flat_map(move |(spins, h, edges)| {
+                let m = edges.len();
+                prop::collection::vec(prop_oneof![Just(-1.0f64), Just(1.0)], m).prop_map(move |j| {
+                    let graph = IsingGraph::new(h.clone(), j, edges.clone());
+                    (spins.clone(), graph)
+                })
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            ..ProptestConfig::default()
+        })]
+
+        /// unpack(pack(s)) == s for any ±1 configuration.
+        #[test]
+        fn unpack_spins_round_trips(spins in arb_spins()) {
+            let packed = pack_spins(&spins);
+            let got = unpack_spins(&packed, spins.len());
+            prop_assert_eq!(got, spins);
+        }
+
+        /// `score_spins` is bit-identical to consensus `energy_milli` and
+        /// copies the input spin vector into `SamplerResult::spins`.
+        #[test]
+        fn score_spins_matches_energy_milli((spins, graph) in arb_score_input()) {
+            let got = score_spins(&spins, &graph);
+            let want = energy_milli(&spins, &graph.h, &graph.j, &graph.edges);
+            prop_assert_eq!(got.energy_milli, want);
+            prop_assert_eq!(got.spins, spins);
+        }
+
+        /// `chunk_plan` covers `0..num_betas.max(1)` with positive counts and
+        /// no gaps; chunk sizes never under/overflow the schedule.
+        ///
+        /// Inputs are plain Debug scalars (BatchDims has no Debug derive; we
+        /// must not change non-test code).
+        #[test]
+        fn chunk_plan_covers_schedule_without_zero_counts(
+            algorithm in prop_oneof![Just(Algorithm::Sa), Just(Algorithm::Gibbs)],
+            num_betas in 0i32..=512,
+            n in 0usize..=64,
+            sweeps_per in 0usize..=256,
+            num_threads in 0usize..=1024,
+            groups in 1usize..=512,
+        ) {
+            let dims = BatchDims {
+                n,
+                num_betas,
+                sweeps_per,
+                base_seed: 0,
+                num_threads,
+                num_problems: 1,
+                num_reads: 1,
+                packed_size: 0,
+            };
+            let plan = chunk_plan(algorithm, &dims, groups);
+            let cover = dims.num_betas.max(1);
+            prop_assert!(!plan.is_empty());
+            let mut cursor = 0i32;
+            for &(start, count) in &plan {
+                prop_assert_eq!(start, cursor, "gap or overlap at start={}", start);
+                prop_assert!(count > 0, "zero-length chunk at start={}", start);
+                prop_assert!(
+                    start.checked_add(count).is_some(),
+                    "start+count overflows i32: start={} count={}",
+                    start,
+                    count
+                );
+                cursor = start + count;
+            }
+            prop_assert_eq!(cursor, cover, "plan does not cover full schedule");
+        }
     }
 }
