@@ -257,8 +257,8 @@ fn chunk_plan(algorithm: Algorithm, dims: &BatchDims, groups: usize) -> Vec<(i32
         clippy::cast_possible_truncation,
         reason = "clamped to 1..=num_betas immediately below"
     )]
-    let betas_per_chunk = ((budget / per_beta.max(1.0)).floor() as i64)
-        .clamp(1, i64::from(num_betas)) as i32;
+    let betas_per_chunk =
+        ((budget / per_beta.max(1.0)).floor() as i64).clamp(1, i64::from(num_betas)) as i32;
 
     let mut plan = Vec::new();
     let mut start = 0;
@@ -969,7 +969,6 @@ pub fn sample_ising(
     params: &SampleParams,
     algorithm: Algorithm,
 ) -> Result<Vec<SamplerResult>, SampleError> {
-
     let n = graph.num_nodes();
     if n == 0 {
         let reads = params.num_reads.max(1);

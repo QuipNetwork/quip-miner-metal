@@ -33,10 +33,10 @@ use io_kit_sys::{
     IOServiceGetMatchingServices, IOServiceMatching,
 };
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Reconfigurable governor knobs plus the latest util sample, shared with the
 /// poll thread.
@@ -47,6 +47,13 @@ struct Knobs {
     yielding: AtomicBool,
     /// Last GPU util percent 0–100 (0 while not yielding).
     last_util: AtomicU32,
+    /// GPU-busy microseconds reported since the last poll tick, accumulated by
+    /// the streaming loop and drained by [`poll_loop`].
+    busy_us: AtomicU64,
+    /// Our own share of the device, percent 0–100, over the last poll window.
+    self_util: AtomicU32,
+    /// `last_util - self_util`, floored at 0: load we did not cause.
+    external_util: AtomicU32,
     stop: AtomicBool,
 }
 
@@ -70,6 +77,9 @@ impl UtilGovernor {
             ceiling: AtomicU32::new(utilization_ceiling.clamp(1, 100)),
             yielding: AtomicBool::new(yielding),
             last_util: AtomicU32::new(0),
+            busy_us: AtomicU64::new(0),
+            self_util: AtomicU32::new(0),
+            external_util: AtomicU32::new(0),
             stop: AtomicBool::new(false),
         });
         let knobs_thread = Arc::clone(&knobs);
@@ -100,6 +110,68 @@ impl UtilGovernor {
     /// Last GPU util percent (0–100), or 0 if not yielding / unavailable.
     pub fn utilization(&self) -> f32 {
         self.knobs.last_util.load(Ordering::Relaxed) as f32
+    }
+
+    /// Our own share of the GPU (percent 0–100) over the last poll window.
+    ///
+    /// Computed from the GPU-busy microseconds the streaming loop reports via
+    /// [`record_gpu_busy_us`](Self::record_gpu_busy_us), not from any sensor.
+    pub fn self_utilization(&self) -> f32 {
+        self.knobs.self_util.load(Ordering::Relaxed) as f32
+    }
+
+    /// Device load we did not cause (percent 0–100): `utilization` minus
+    /// `self_utilization`, floored at 0.
+    ///
+    /// This is the contention signal. The raw sensor cannot provide it: it
+    /// reports whole-device load, and the miner is normally the dominant user,
+    /// so a high reading says nothing about whether anyone else wants the GPU.
+    /// Subtracting our own measured contribution is what makes the remainder
+    /// meaningful — and it needs no per-process data, which macOS does not
+    /// publish anyway (there is no per-client GPU-time or threadgroup count in
+    /// the IORegistry; `CommandQueueCount` counts queues every idle GUI app
+    /// holds open, and `AGCInfo -> fLastSubmissionPID` is a single scalar).
+    pub fn external_utilization(&self) -> f32 {
+        self.knobs.external_util.load(Ordering::Relaxed) as f32
+    }
+
+    /// Report GPU-busy microseconds from a completed batch.
+    ///
+    /// Accumulates until the next poll tick converts it into
+    /// [`self_utilization`](Self::self_utilization). Callers pass device time
+    /// (`GPUEndTime - GPUStartTime`), never wall clock.
+    pub fn record_gpu_busy_us(&self, us: u64) {
+        let _ = self.knobs.busy_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Fraction of the full threadgroup budget this miner should dispatch,
+    /// in `0.005..=1.0`.
+    ///
+    /// Two independent factors:
+    ///
+    /// 1. **The ceiling itself.** `--utilization 80` means "aim to occupy 80% of
+    ///    the GPU", so the budget is 80% of nominal. At the default 100 this is
+    ///    1.0 and costs nothing.
+    /// 2. **External pressure, only while yielding.** Each point of
+    ///    [`external_utilization`](Self::external_utilization) gives back a point
+    ///    of ceiling — but never more than half of it. A ceiling of 80 therefore
+    ///    ranges over 80% → 40% of nominal, and 100 over 100% → 50%.
+    ///
+    /// The half-ceiling floor is deliberate: yielding is meant to share the
+    /// device, not to surrender it. Without a floor, sustained external load
+    /// (a video call, a compile) would drive the budget toward zero and stall
+    /// mining entirely for as long as the other app ran.
+    pub fn budget_scale(&self) -> f64 {
+        let ceiling = f64::from(self.knobs.ceiling.load(Ordering::Relaxed));
+        let headroom = if self.knobs.yielding.load(Ordering::Relaxed) {
+            let external = f64::from(self.knobs.external_util.load(Ordering::Relaxed));
+            ((ceiling - external) / ceiling).clamp(0.5, 1.0)
+        } else {
+            1.0
+        };
+        // `ceiling` is clamped to 1..=100 on the way in, so the product bottoms
+        // out at 0.005 (ceiling 1, fully yielded) and never reaches 0.
+        ceiling / 100.0 * headroom
     }
 
     /// True when yielding and the last util sample exceeds the ceiling.
@@ -148,6 +220,7 @@ impl Drop for UtilGovernor {
 // service on the host (there is normally exactly one on Apple Silicon) and
 // has no per-index selector analogous to NVML's `device_by_index`.
 fn poll_loop(_device_index: u32, knobs: &Knobs) {
+    let mut window_start = Instant::now();
     while !knobs.stop.load(Ordering::Relaxed) {
         // Sample unconditionally: `utilization()` feeds `Status.utilization`,
         // the miner's health report, which must be truthful whether or not
@@ -155,9 +228,22 @@ fn poll_loop(_device_index: u32, knobs: &Knobs) {
         // made a fully-busy miner report 0% in the default configuration.
         // `yielding` still gates `should_throttle` — reporting load and acting
         // on it are separate concerns.
+        let util = query_iokit_gpu_utilization();
+        knobs.last_util.store(util, Ordering::Relaxed);
+
+        // Convert the batch-reported GPU-busy time into our share of the window.
+        // `swap` drains the accumulator so each window is independent; a batch
+        // that reports between the swap and the store lands in the next window,
+        // which is fine at these timescales.
+        let now = Instant::now();
+        let elapsed_us = now.duration_since(window_start).as_micros();
+        window_start = now;
+        let busy_us = u128::from(knobs.busy_us.swap(0, Ordering::Relaxed));
+        let ours = self_util_pct(busy_us, elapsed_us);
+        knobs.self_util.store(ours, Ordering::Relaxed);
         knobs
-            .last_util
-            .store(query_iokit_gpu_utilization(), Ordering::Relaxed);
+            .external_util
+            .store(util.saturating_sub(ours), Ordering::Relaxed);
         // Yielding needs a fresh sample to act on: the throttle decides whether
         // to hold back the next dispatch, so a 2 s-stale reading would let a
         // whole batch through after pressure appeared, and hold back several
@@ -169,6 +255,22 @@ fn poll_loop(_device_index: u32, knobs: &Knobs) {
         };
         thread::sleep(interval);
     }
+}
+
+/// Our share of a poll window, as a percentage clamped to 0..=100.
+///
+/// Double-buffering keeps several command buffers in flight at once, so summed
+/// device time legitimately exceeds the wall-clock window. Clamping (rather than
+/// letting it through) matters because the caller subtracts this from the sensor
+/// reading: an unclamped 300% would wrap the subtraction into a nonsense
+/// "external" figure and collapse the dispatch budget to its floor.
+fn self_util_pct(busy_us: u128, elapsed_us: u128) -> u32 {
+    if elapsed_us == 0 {
+        return 0;
+    }
+    u32::try_from(busy_us * 100 / elapsed_us)
+        .unwrap_or(100)
+        .min(100)
 }
 
 /// Sensor poll interval while yielding — fast enough that the throttle acts on
@@ -436,6 +538,96 @@ mod tests {
         assert!(
             (0.0..=100.0).contains(&util),
             "util {util} out of 0..=100 range"
+        );
+        gov.stop();
+    }
+
+    /// The ceiling alone sizes the budget, yielding or not: `--utilization 80`
+    /// means "aim for 80% of the device". The default 100 must cost nothing.
+    #[test]
+    fn budget_scale_follows_the_ceiling_without_yielding() {
+        let mut gov = UtilGovernor::start(0, 100, false);
+        assert!((gov.budget_scale() - 1.0).abs() < f64::EPSILON);
+        gov.reconfigure(80, false);
+        assert!((gov.budget_scale() - 0.8).abs() < 1e-9);
+        gov.stop();
+    }
+
+    /// External load gives back ceiling one-for-one while yielding, but only
+    /// down to half. Sustained contention must not stall mining outright.
+    #[test]
+    fn yielding_gives_back_ceiling_down_to_half() {
+        let mut gov = UtilGovernor::start(0, 80, true);
+
+        // No external load: full ceiling.
+        gov.knobs.external_util.store(0, Ordering::Relaxed);
+        assert!((gov.budget_scale() - 0.8).abs() < 1e-9);
+
+        // 20 points external out of an 80 ceiling: 75% of the ceiling left.
+        gov.knobs.external_util.store(20, Ordering::Relaxed);
+        assert!((gov.budget_scale() - 0.8 * 0.75).abs() < 1e-9);
+
+        // Saturating external load clamps at half the ceiling — 80% -> 40%,
+        // exactly the floor, and it stays there no matter how high external is.
+        gov.knobs.external_util.store(100, Ordering::Relaxed);
+        assert!((gov.budget_scale() - 0.4).abs() < 1e-9);
+        gov.stop();
+    }
+
+    /// Yielding is inert when off, whatever the external reading says.
+    #[test]
+    fn external_load_is_ignored_when_not_yielding() {
+        let mut gov = UtilGovernor::start(0, 100, false);
+        gov.knobs.external_util.store(100, Ordering::Relaxed);
+        assert!((gov.budget_scale() - 1.0).abs() < f64::EPSILON);
+        gov.stop();
+    }
+
+    /// Double-buffering keeps several command buffers in flight, so reported
+    /// device time legitimately exceeds the wall-clock window. That must clamp
+    /// to 100% rather than wrapping the `util - ours` subtraction into a huge
+    /// bogus "external" reading.
+    #[test]
+    fn self_util_clamps_when_batches_overlap() {
+        // Half a window busy.
+        assert_eq!(self_util_pct(500, 1_000), 50);
+        // Exactly saturated.
+        assert_eq!(self_util_pct(1_000, 1_000), 100);
+        // Three overlapping buffers: 300% of wall, clamped.
+        assert_eq!(self_util_pct(3_000, 1_000), 100);
+        // A zero-length window cannot produce a rate.
+        assert_eq!(self_util_pct(1_000, 0), 0);
+        // Idle.
+        assert_eq!(self_util_pct(0, 1_000), 0);
+    }
+
+    /// The subtraction that turns whole-device load into external-only load
+    /// must floor at 0, never wrap.
+    #[test]
+    fn external_util_floors_at_zero() {
+        // Sensor says 40%, we accounted for 90% of it: nobody else is waiting.
+        assert_eq!(40_u32.saturating_sub(90), 0);
+        // Sensor says 70%, we caused 30%: 40 points belong to someone else.
+        assert_eq!(70_u32.saturating_sub(30), 40);
+    }
+
+    /// End-to-end through the poll thread: a batch report must show up as
+    /// non-zero self-utilization within one window.
+    #[test]
+    fn reported_busy_time_becomes_self_utilization() {
+        let mut gov = UtilGovernor::start(0, 100, true);
+        // Saturate several consecutive windows so the assertion does not race
+        // the drain: each tick consumes what it finds and resets.
+        let deadline = Instant::now() + YIELDING_POLL * 4;
+        let mut seen: f32 = 0.0;
+        while Instant::now() < deadline {
+            gov.record_gpu_busy_us(50_000);
+            std::thread::sleep(Duration::from_millis(25));
+            seen = seen.max(gov.self_utilization());
+        }
+        assert!(
+            seen > 0.0,
+            "reported GPU time never became self utilization"
         );
         gov.stop();
     }
