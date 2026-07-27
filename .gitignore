@@ -1,2 +1,14 @@
 /target
 .cargo/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# rustcheck working artifacts (audit reports)
+.rustcheck/
+
+# Serena MCP server workspace metadata (per-machine, not project code)
+.serena/

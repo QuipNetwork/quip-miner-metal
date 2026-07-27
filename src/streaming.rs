@@ -19,7 +19,9 @@
 
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, algo_max_nodes};
-use quip_miner_core::{Algorithm, IsingGraph, SamplerResult, StreamJob, StreamResult};
+use quip_miner_core::{
+    Algorithm, CancelGuard, IsingGraph, SamplerResult, StreamJob, StreamOutcome, StreamResult,
+};
 use quip_proto::v1::RejectReason;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -35,57 +37,121 @@ pub fn max_reads(_algorithm: Algorithm) -> u32 {
     sampler::MAX_READS as u32
 }
 
-/// Threadgroups co-resident per GPU core. One threadgroup per problem, so
-/// `gpu_core_count` problems covers every core exactly once — but a single
-/// threadgroup does not saturate a core: SA runs only `num_reads` (64) threads
-/// there, each carrying ~5.2 KiB of thread-private state, so the core stalls on
-/// memory. Oversubscribing hides that latency.
+/// Threadgroup budget per GPU core, per algorithm — the measured definition of
+/// "fully loaded" for this backend.
 ///
-/// Measured on an M4 Max (40 cores), full Advantage2 topology, 120 jobs at 64
-/// reads — 1x / 2x / 4x cores:
-///   SA               14.2 / 27.5 / 27.4 jobs/s  (2x = 1.93x, then saturated)
-///   Gibbs chromatic  29.4 / 36.3 / 33.6 jobs/s  (2x best, 4x regresses)
-/// `QUIP_METAL_BATCH_MULT` overrides it for GPUs where the optimum differs.
-const BATCH_CORE_MULT: usize = 2;
+/// The two kernels map to hardware differently, so a single problems-per-core
+/// constant means two different occupancies:
+///
+/// ```text
+/// SA / sequential Gibbs:  threadgroups = P       (one per problem, R threads each)
+/// chromatic Gibbs:        threadgroups = P * R   (one per SAMPLE, 256 threads each)
+/// ```
+///
+/// Budgeting in threadgroups instead makes one constant mean one thing. Both
+/// values are from the occupancy sweep on an M4 Max (40 cores), full Advantage2
+/// topology, 64 reads / 128 sweeps, measured in spin-updates/s from per-dispatch
+/// GPU time:
+///
+/// ```text
+/// SA      tg/core:  0.2   0.5   1     2     3     4     6     8
+///         Gupd/s:   0.32  0.49  0.83  1.40  1.54  1.83  2.03  2.10
+///         dispatch: 1.11  1.46  1.75  2.16  2.57  2.90  4.17  5.33 s
+///
+/// Gibbs   tg/core:  16    32    64    128   182   256   384   512
+///         Gupd/s:   2.06  2.05  2.12  2.09  2.05  2.00  1.98  1.98
+///         dispatch: 0.36  0.73  1.43  2.82  4.10  5.95  8.88  11.87 s
+/// ```
+///
+/// SA climbs to 8 and is still gaining; 6 is the knee (+45% over the old
+/// 2-problems-per-core default) and is chosen over 8 because dispatch length —
+/// the GPU lock-up a foreground app feels, and the latency a `Cancel` waits on —
+/// grows faster than throughput past it.
+///
+/// Chromatic Gibbs is flat from 16 upward: it is saturated at the *bottom* of
+/// the range, and everything above merely lengthens dispatches. The old default
+/// put it at 128 tg/core, paying 8x the dispatch length for nothing.
+///
+/// Run-to-run variance is ~13%, so treat neighbouring points as ties.
+/// `QUIP_METAL_TG_PER_CORE` overrides for GPUs where the optimum differs.
+const SA_TG_PER_CORE: f64 = 6.0;
+/// See [`SA_TG_PER_CORE`]. Chromatic Gibbs saturates here; higher only costs
+/// dispatch length.
+const GIBBS_TG_PER_CORE: f64 = 16.0;
 
-/// Problems per dispatch: `gpu_core_count * BATCH_CORE_MULT`. Advertised
-/// (doubled) to the harness as `stream_width` so it keeps roughly a batch's
-/// worth of jobs queued while another dispatches.
-fn batch_size(_algorithm: Algorithm) -> usize {
+/// Nominal reads used to size [`stream_width`] before any job has arrived.
+/// Matches `METAL_ADAPT.min_reads`, the smallest count the adapt path issues.
+const NOMINAL_READS: usize = 64;
+
+/// Threadgroups this dispatch aims to have in flight.
+fn tg_budget(algorithm: Algorithm) -> usize {
     let cores = crate::iokit_gov::gpu_core_count()
         .unwrap_or(DEFAULT_GPU_CORES)
         .max(1);
-    let mult = std::env::var("QUIP_METAL_BATCH_MULT")
+    let default = match algorithm {
+        Algorithm::Sa => SA_TG_PER_CORE,
+        Algorithm::Gibbs => GIBBS_TG_PER_CORE,
+    };
+    let per_core = std::env::var("QUIP_METAL_TG_PER_CORE")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(BATCH_CORE_MULT)
-        .max(1);
-    cores.saturating_mul(mult).max(1)
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|m| m.is_finite() && *m > 0.0)
+        .unwrap_or(default);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "core count times a small positive multiplier is far below usize::MAX"
+    )]
+    let budget = (cores as f64 * per_core).round() as usize;
+    budget.max(1)
 }
 
-/// `Sampler::stream_width`: how many models the backend keeps in flight. Two
-/// batches' worth, so the harness buffers the next batch while one dispatches.
+/// Problems per dispatch for a job with `num_reads` reads.
+///
+/// Converts the threadgroup budget into a problem count using the kernel's own
+/// mapping: chromatic Gibbs spends `num_reads` threadgroups per problem, so its
+/// batch shrinks as reads grow; SA spends one.
+fn batch_size_for_reads(algorithm: Algorithm, num_reads: usize) -> usize {
+    let budget = tg_budget(algorithm);
+    let per_problem = if algorithm == Algorithm::Gibbs && sampler::gibbs_node_parallel() {
+        sampler::simd_rounded_reads(num_reads).max(1)
+    } else {
+        1
+    };
+    budget.div_ceil(per_problem).max(1)
+}
+
+/// `Sampler::stream_width`: how many models the backend keeps in flight.
+///
+/// Sized from [`NOMINAL_READS`] because it is fixed at startup, before any job
+/// reveals its read count. Two batches' worth, so the harness buffers the next
+/// batch while one dispatches.
 pub fn stream_width(_device: &MetalDevice, algorithm: Algorithm) -> usize {
-    (batch_size(algorithm) * 2).max(1)
+    (batch_size_for_reads(algorithm, NOMINAL_READS) * 2).max(1)
 }
 
 /// Structural + sampling identity a single dispatch batches over: same topology
 /// (so the shared CSR/coloring stay valid) and same reads/beta shape (one
 /// `num_reads`, `num_betas`, `beta_schedule` per dispatch).
-struct BatchKey {
+///
+/// `edges` is borrowed from the seed job rather than cloned: at Advantage2
+/// scale that list is ~40k pairs (~640 KB), and an owned copy existed only to
+/// free the seed for `batch.push` while `fill_batch` still needed the key.
+/// Callers keep the seed live across `fill_batch`, then assemble `batch`.
+struct BatchKey<'a> {
     n: usize,
-    edges: Vec<(usize, usize)>,
+    edges: &'a [(usize, usize)],
     num_reads: usize,
     num_sweeps: usize,
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
 }
 
-impl BatchKey {
-    fn from_job(job: &StreamJob) -> Self {
+impl<'a> BatchKey<'a> {
+    fn from_job(job: &'a StreamJob) -> Self {
         Self {
             n: job.graph.h.len(),
-            edges: job.graph.edges.clone(),
+            edges: &job.graph.edges,
             num_reads: job.params.num_reads.clamp(1, sampler::MAX_READS),
             num_sweeps: job.params.num_sweeps,
             sweeps_per_beta: job.params.sweeps_per_beta.max(1),
@@ -99,76 +165,203 @@ impl BatchKey {
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.beta_range == job.params.beta_range
-            && self.edges == job.graph.edges
+            && self.edges == job.graph.edges.as_slice()
+    }
+}
+
+/// Whether [`next_seed`] / [`form_and_commit`] may block waiting for a job.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seed {
+    /// Wait for a job; returns `None` only on channel close.
+    Blocking,
+    /// Return `None` immediately if nothing is queued (overlap path).
+    NonBlocking,
+}
+
+/// How the governor yields the GPU when utilization is over the ceiling.
+///
+/// Selected by `QUIP_METAL_YIELD_MODE`; both modes are inert unless
+/// `--yielding` is set. The trade is responsiveness against throughput, and it
+/// only matters while the ceiling is exceeded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum YieldMode {
+    /// Pause only between dispatches. One batch always runs to completion, so
+    /// the GPU is released at batch granularity — at 4096 sweeps that is
+    /// seconds, during which a foreground app still contends with us.
+    Batch,
+    /// Pause between dispatches *and* shrink the batch while throttled, so each
+    /// dispatch is shorter and gaps appear sooner. Responsive at the cost of
+    /// throughput: a smaller batch leaves GPU cores idle within the dispatch.
+    Fine,
+}
+
+impl YieldMode {
+    /// Read the mode from the environment once. An unset or unrecognized value
+    /// selects [`Self::Batch`], the cheaper of the two.
+    fn from_env() -> Self {
+        match std::env::var("QUIP_METAL_YIELD_MODE").as_deref() {
+            Ok("fine") => Self::Fine,
+            _ => Self::Batch,
+        }
+    }
+}
+
+/// Divisor applied to the batch size while throttled in [`YieldMode::Fine`].
+/// Four was chosen to make the effect visible without collapsing the batch to a
+/// single problem, which would idle all but one GPU core.
+const FINE_YIELD_DIVISOR: usize = 4;
+
+/// How long to pause per throttle check. Shorter than the governor's 250 ms
+/// sensor poll, so a cleared ceiling is noticed within roughly one poll rather
+/// than one sleep.
+const THROTTLE_PAUSE: Duration = Duration::from_millis(50);
+
+/// Upper bound on one throttle gate. The miner is itself the main GPU load, so
+/// `should_throttle` stays true until *we* stop — without a cap, a ceiling
+/// below the miner's own steady-state utilization would stall it forever
+/// instead of duty-cycling it. Capping the pause turns the ceiling into a duty
+/// cycle: work, yield, re-measure.
+const THROTTLE_MAX_PAUSE: Duration = Duration::from_millis(500);
+
+/// Shared borrow cluster threaded through the streaming helpers.
+struct StreamCtx<'a> {
+    jobs: &'a mut Receiver<StreamJob>,
+    out: &'a Sender<StreamResult>,
+    pending: &'a mut Option<StreamJob>,
+    algorithm: Algorithm,
+    /// Governor backpressure: true while measured GPU utilization is over the
+    /// configured ceiling and `--yielding` is on.
+    throttle: &'a dyn Fn() -> bool,
+    yield_mode: YieldMode,
+    /// Reseed watermark: generations at or below it were abandoned by the
+    /// coordinator and must not consume GPU time.
+    cancel: &'a CancelGuard,
+}
+
+impl StreamCtx<'_> {
+    /// Hold off the next dispatch while the governor asks us to yield, bounded
+    /// by [`THROTTLE_MAX_PAUSE`]. Returns the divisor to apply to the next
+    /// dispatch's batch size — greater than 1 in [`YieldMode::Fine`] when we
+    /// left the gate still over the ceiling.
+    ///
+    /// Called only from the batch-forming path, which is the one point where no
+    /// GPU work of ours is queued behind us, so pausing here actually leaves the
+    /// device idle rather than merely delaying our own enqueue.
+    fn yield_gate(&self) -> usize {
+        tracing::debug!(throttle = (self.throttle)(), mode = ?self.yield_mode, "yield gate");
+        if !(self.throttle)() {
+            return 1;
+        }
+        let deadline = Instant::now() + THROTTLE_MAX_PAUSE;
+        while Instant::now() < deadline && (self.throttle)() {
+            std::thread::sleep(THROTTLE_PAUSE);
+        }
+        // Still over the ceiling after a full pause: the load is sustained
+        // (often our own), so `Fine` additionally shortens the next dispatch.
+        if self.yield_mode == YieldMode::Fine && (self.throttle)() {
+            FINE_YIELD_DIVISOR
+        } else {
+            1
+        }
     }
 }
 
 /// Emit an empty-graph job's answer directly (no GPU work needed).
 fn answer_empty(out: &Sender<StreamResult>, job: StreamJob) {
     let reads = job.params.num_reads.max(1);
-    let _ = out.blocking_send(StreamResult {
-        job_id: job.job_id,
-        result: Ok((0..reads)
-            .map(|_| SamplerResult {
-                spins: vec![],
-                energy_milli: 0,
-            })
-            .collect()),
-        device_access_time_us: 0,
-    });
+    if out
+        .blocking_send(StreamResult {
+            job_id: job.job_id,
+            outcome: StreamOutcome::Completed(Ok((0..reads)
+                .map(|_| SamplerResult {
+                    spins: vec![],
+                    energy_milli: 0,
+                })
+                .collect())),
+            device_access_time_us: 0,
+        })
+        .is_err()
+    {
+        // consumer gone — nobody to tell
+    }
+}
+
+/// Report a job abandoned because its generation was cancelled. Produces no
+/// `Result` upstream — the harness only refunds its credit — so the pipeline
+/// keeps its depth for the live round.
+fn send_cancelled(out: &Sender<StreamResult>, job: StreamJob) {
+    if out
+        .blocking_send(StreamResult {
+            job_id: job.job_id,
+            outcome: StreamOutcome::Cancelled,
+            device_access_time_us: 0,
+        })
+        .is_err()
+    {
+        // consumer gone — nobody to tell
+    }
 }
 
 fn send_reject(out: &Sender<StreamResult>, job: StreamJob, reason: RejectReason) {
-    let _ = out.blocking_send(StreamResult {
-        job_id: job.job_id,
-        result: Err(reason),
-        device_access_time_us: 0,
-    });
+    if out
+        .blocking_send(StreamResult {
+            job_id: job.job_id,
+            outcome: StreamOutcome::Completed(Err(reason)),
+            device_access_time_us: 0,
+        })
+        .is_err()
+    {
+        // consumer gone — nobody to tell
+    }
 }
 
 /// Pull the next non-empty, in-range job to seed a batch. Empty-graph jobs are
 /// answered inline and oversized jobs rejected without occupying a batch slot.
 ///
-/// `blocking` waits for a job (returns `None` only on channel close); otherwise
-/// returns `None` the moment no job is immediately queued — the overlap path
-/// uses this so it never blocks while an in-flight batch is un-harvested.
-fn next_seed(
-    jobs: &mut Receiver<StreamJob>,
-    out: &Sender<StreamResult>,
-    pending: &mut Option<StreamJob>,
-    algorithm: Algorithm,
-    blocking: bool,
-) -> Option<StreamJob> {
+/// [`Seed::Blocking`] waits for a job (returns `None` only on channel close);
+/// [`Seed::NonBlocking`] returns `None` the moment no job is immediately
+/// queued — the overlap path uses this so it never blocks while an in-flight
+/// batch is un-harvested.
+fn next_seed(ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<StreamJob> {
     loop {
-        let job = match pending.take() {
+        let job = match ctx.pending.take() {
             Some(j) => j,
-            None if blocking => jobs.blocking_recv()?,
-            None => jobs.try_recv().ok()?,
+            None if seed == Seed::Blocking => ctx.jobs.blocking_recv()?,
+            None => ctx.jobs.try_recv().ok()?,
         };
-        if job.graph.num_nodes() == 0 {
-            answer_empty(out, job);
+        // Drop abandoned generations before they reach the GPU: a reseed can
+        // leave a full prefetch window of stale nonces queued, and computing
+        // them would burn a dispatch on work the coordinator has moved past.
+        if ctx.cancel.is_cancelled(job.generation) {
+            send_cancelled(ctx.out, job);
             continue;
         }
-        if job.graph.num_nodes() > algo_max_nodes(algorithm) {
-            send_reject(out, job, RejectReason::TooLarge);
+        if job.graph.num_nodes() == 0 {
+            answer_empty(ctx.out, job);
+            continue;
+        }
+        if job.graph.num_nodes() > algo_max_nodes(ctx.algorithm) {
+            send_reject(ctx.out, job, RejectReason::TooLarge);
             continue;
         }
         return Some(job);
     }
 }
 
-/// Collect jobs matching `key` into `batch` (already seeded) up to `cap`,
-/// draining what's queued and briefly waiting for a fuller batch. A
-/// topology/param mismatch is stashed in `pending` to seed the next batch.
-/// Returns `false` once the channel has closed.
+/// Collect jobs matching `key` into `matches` up to `cap - already` more
+/// slots (the seed already occupies `already` of the batch). Drains what's
+/// queued and briefly waits for a fuller batch. A topology/param mismatch is
+/// stashed in `pending` to seed the next batch. Returns `false` once the
+/// channel has closed.
+///
+/// `matches` does not include the seed: the seed stays borrowed by `key`
+/// (edge list) for the duration of this call, then is prepended by the caller.
 fn fill_batch(
-    jobs: &mut Receiver<StreamJob>,
-    out: &Sender<StreamResult>,
-    key: &BatchKey,
-    batch: &mut Vec<StreamJob>,
-    pending: &mut Option<StreamJob>,
+    ctx: &mut StreamCtx<'_>,
+    key: &BatchKey<'_>,
+    matches: &mut Vec<StreamJob>,
+    already: usize,
     cap: usize,
-    algorithm: Algorithm,
 ) -> bool {
     // Steady state: the previous batch's GPU time already filled the channel,
     // so try_recv drains a near-full batch immediately. The short idle wait
@@ -176,18 +369,19 @@ fn fill_batch(
     let hard_cap = Instant::now() + Duration::from_secs(2);
     let idle_timeout = Duration::from_millis(50);
     let mut last_arrival = Instant::now();
-    while batch.len() < cap && Instant::now() < hard_cap {
-        match jobs.try_recv() {
-            Ok(job) if job.graph.num_nodes() == 0 => answer_empty(out, job),
-            Ok(job) if job.graph.num_nodes() > algo_max_nodes(algorithm) => {
-                send_reject(out, job, RejectReason::TooLarge)
+    while matches.len() + already < cap && Instant::now() < hard_cap {
+        match ctx.jobs.try_recv() {
+            Ok(job) if ctx.cancel.is_cancelled(job.generation) => send_cancelled(ctx.out, job),
+            Ok(job) if job.graph.num_nodes() == 0 => answer_empty(ctx.out, job),
+            Ok(job) if job.graph.num_nodes() > algo_max_nodes(ctx.algorithm) => {
+                send_reject(ctx.out, job, RejectReason::TooLarge)
             }
             Ok(job) if key.matches(&job) => {
-                batch.push(job);
+                matches.push(job);
                 last_arrival = Instant::now();
             }
             Ok(job) => {
-                *pending = Some(job); // different topology/params → next batch
+                *ctx.pending = Some(job); // different topology/params → next batch
                 return true;
             }
             Err(TryRecvError::Empty) => {
@@ -220,66 +414,119 @@ pub fn run_stream(
     device: &MetalDevice,
     algorithm: Algorithm,
     mut jobs: Receiver<StreamJob>,
-    out: Sender<StreamResult>,
+    out: &Sender<StreamResult>,
+    throttle: &dyn Fn() -> bool,
+    cancel: &CancelGuard,
 ) {
-    let cap = batch_size(algorithm);
     let mut pending: Option<StreamJob> = None;
+    let mut ctx = StreamCtx {
+        jobs: &mut jobs,
+        out,
+        pending: &mut pending,
+        algorithm,
+        throttle,
+        yield_mode: YieldMode::from_env(),
+        cancel,
+    };
 
     // Prime the pipeline with the first batch (blocking for its seed).
-    let mut inflight = form_and_commit(device, algorithm, &mut jobs, &out, &mut pending, cap, true);
+    let mut inflight = form_and_commit(device, &mut ctx, Seed::Blocking);
 
     while let Some(cur) = inflight.take() {
         // Form + commit the next batch WITHOUT blocking, so it overlaps `cur`'s
         // GPU compute. Never block here: `cur` is still un-harvested, and its
         // results must flow (freeing coordinator credits) before more jobs come.
-        let next = form_and_commit(device, algorithm, &mut jobs, &out, &mut pending, cap, false);
+        //
+        // Except while yielding. Double-buffering deliberately keeps a command
+        // buffer committed at all times, so the GPU is never idle — which means
+        // a pause taken *here* hides entirely behind `cur`'s execution and
+        // yields nothing to anyone else. To actually release the device we have
+        // to break the overlap: let `cur` finish, then pause with nothing in
+        // flight (the gate in `form_and_commit` below), then commit again.
+        let next = if (ctx.throttle)() {
+            None
+        } else {
+            form_and_commit(device, &mut ctx, Seed::NonBlocking)
+        };
         // Wait on `cur`, host-score (rayon), emit. Its GPU compute overlapped
         // the `next` form above and now overlaps `next`'s execution.
-        finish_batch(cur, &out);
+        finish_batch(cur, ctx.out);
         inflight = match next {
             Some(f) => Some(f),
             // Nothing was queued to overlap; now that `cur` freed credits, block
             // for the next batch (or exit when the channel closes).
-            None => form_and_commit(device, algorithm, &mut jobs, &out, &mut pending, cap, true),
+            None => form_and_commit(device, &mut ctx, Seed::Blocking),
         };
     }
 }
 
 /// Collect the next batch and commit it to the GPU without waiting. With
-/// `blocking`, waits for the seed (returns `None` only on channel close); the
-/// non-blocking overlap path returns `None` if no job is immediately queued or
-/// on an encode failure (the caller finishes the in-flight batch, then retries).
-fn form_and_commit(
-    device: &MetalDevice,
-    algorithm: Algorithm,
-    jobs: &mut Receiver<StreamJob>,
-    out: &Sender<StreamResult>,
-    pending: &mut Option<StreamJob>,
-    cap: usize,
-    blocking: bool,
-) -> Option<InFlight> {
-    let seed = next_seed(jobs, out, pending, algorithm, blocking)?;
-    let key = BatchKey::from_job(&seed);
-    let mut batch = vec![seed];
-    fill_batch(jobs, out, &key, &mut batch, pending, cap, algorithm);
+/// [`Seed::Blocking`], waits for the seed (returns `None` only on channel
+/// close); the non-blocking overlap path returns `None` if no job is
+/// immediately queued or on an encode failure (the caller finishes the
+/// in-flight batch, then retries).
+fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<InFlight> {
+    // Yield before taking a seed, not after: once a job is dequeued it is ours
+    // to answer, and holding it through a pause would stall the coordinator's
+    // credit for no benefit.
+    let shrink = ctx.yield_gate();
+    let seed_job = next_seed(ctx, seed)?;
+    // Batch size follows the seed's read count: chromatic Gibbs spends
+    // `num_reads` threadgroups per problem, so the same threadgroup budget is a
+    // different number of problems at 64 reads than at 256.
+    let cap = (batch_size_for_reads(ctx.algorithm, seed_job.params.num_reads) / shrink).max(1);
+    // Keep `seed_job` live while `key` borrows its edge list; collect further
+    // matches into a side vec, then assemble the full batch.
+    let mut matches = Vec::with_capacity(cap.saturating_sub(1));
+    {
+        let key = BatchKey::from_job(&seed_job);
+        fill_batch(ctx, &key, &mut matches, 1, cap);
+    }
+    let mut batch = Vec::with_capacity(matches.len() + 1);
+    batch.push(seed_job);
+    batch.append(&mut matches);
+
+    // Last checkpoint before the GPU commits: filling a batch can take up to
+    // `hard_cap`, and a `Cancel` arriving in that window would otherwise buy a
+    // full dispatch of abandoned work. Re-check every job now that the batch is
+    // final; once committed, the dispatch runs to completion (Metal offers no
+    // mid-kernel abort).
+    if batch.iter().any(|j| ctx.cancel.is_cancelled(j.generation)) {
+        let (live, stale): (Vec<StreamJob>, Vec<StreamJob>) = batch
+            .into_iter()
+            .partition(|j| !ctx.cancel.is_cancelled(j.generation));
+        for job in stale {
+            send_cancelled(ctx.out, job);
+        }
+        batch = live;
+        if batch.is_empty() {
+            return None;
+        }
+    }
 
     // Scope `graphs` so its borrow of `batch` ends before `batch` moves.
     let encoded = {
         let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
-        sampler::encode_batch(device, &graphs, &batch[0].params, algorithm)
+        sampler::encode_batch(device, &graphs, &batch[0].params, ctx.algorithm)
     };
     match encoded {
         Ok(enc) => {
-            enc.cmd.commit();
+            tracing::debug!(batch = batch.len(), cap, chunks = enc.chunk_count(), seed = ?seed, "committed batch");
             Some(InFlight {
                 encoded: enc,
                 jobs: batch,
             })
         }
         Err(e) => {
-            eprintln!("metal batch encode failed: {e}");
+            // Every job in a batch shares the encode inputs that can be
+            // refused for size (`num_sweeps` is part of the batch key, and `N`
+            // is pre-filtered by `next_seed`), so a capacity refusal applies to
+            // all of them alike — reject the batch with the reason the failure
+            // actually carries rather than a blanket `OVERLOADED`.
+            let reason = e.reject_reason();
+            tracing::error!(error = %e, ?reason, "metal batch encode failed");
             for job in batch {
-                send_reject(out, job, RejectReason::Overloaded);
+                send_reject(ctx.out, job, reason);
             }
             None
         }
@@ -291,16 +538,24 @@ fn form_and_commit(
 /// (`GPUEndTime - GPUStartTime`), not the wall clock — the wall includes this
 /// batch's overlap with host work on either side.
 fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
-    use metal::MTLCommandBufferStatus;
     let InFlight { encoded, jobs } = inflight;
 
-    encoded.cmd.wait_until_completed();
-    let device_access_time_us = gpu_time_us(&encoded.cmd);
+    encoded.wait_until_completed();
+    let device_access_time_us = encoded.gpu_time_us();
+    // The watchdog judges a single command buffer, not the batch, so the max is
+    // the number that matters for staying alive.
+    tracing::debug!(
+        chunks = encoded.chunk_count(),
+        max_chunk_ms = encoded.max_chunk_us() / 1000,
+        total_ms = device_access_time_us / 1000,
+        "batch complete"
+    );
 
-    if encoded.cmd.status() != MTLCommandBufferStatus::Completed {
-        eprintln!(
-            "metal batch command buffer did not complete: status {:?}",
-            encoded.cmd.status()
+    if let Some(status) = encoded.failed_status() {
+        tracing::error!(
+            ?status,
+            chunks = encoded.chunk_count(),
+            "metal batch command buffer did not complete"
         );
         for job in jobs {
             send_reject(out, job, RejectReason::Overloaded);
@@ -315,7 +570,7 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
     let per_problem = match per_problem {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("metal batch harvest failed: {e}");
+            tracing::error!(error = %e, "metal batch harvest failed");
             for job in jobs {
                 send_reject(out, job, RejectReason::Overloaded);
             }
@@ -325,14 +580,14 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
 
     for (job, results) in jobs.into_iter().zip(per_problem) {
         let take = job.params.num_reads.max(1);
-        let result = Ok(results
+        let outcome = StreamOutcome::Completed(Ok(results
             .into_iter()
             .take(take)
-            .collect::<Vec<SamplerResult>>());
+            .collect::<Vec<SamplerResult>>()));
         if out
             .blocking_send(StreamResult {
                 job_id: job.job_id,
-                result,
+                outcome,
                 device_access_time_us,
             })
             .is_err()
@@ -342,23 +597,286 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
     }
 }
 
-/// True GPU execution time of a completed command buffer, in microseconds,
-/// from `GPUEndTime - GPUStartTime` (`CFTimeInterval` seconds). metal-rs 0.33
-/// exposes no accessor, so read the properties via `objc`. Returns 0 if the
-/// timestamps are unavailable / non-positive.
-// `unexpected_cfgs`: objc 0.2's `msg_send!` expands to a `cfg(cargo-clippy)`
-// check the compiler no longer recognizes — a macro-internal quirk, not our cfg.
-#[allow(unexpected_cfgs)]
-fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
-    use objc::{msg_send, sel, sel_impl};
-    // SAFETY: `GPUStartTime`/`GPUEndTime` are `CFTimeInterval` (f64) properties
-    // on a completed `MTLCommandBuffer`; `cmd` implements `objc::Message`.
-    let (start, end): (f64, f64) =
-        unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
-    let dur = end - start;
-    if dur.is_finite() && dur > 0.0 {
-        (dur * 1_000_000.0) as u64
-    } else {
-        0
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quip_miner_core::SampleParams;
+
+    fn params(num_reads: usize, num_sweeps: usize, sweeps_per_beta: usize) -> SampleParams {
+        SampleParams {
+            num_reads,
+            num_sweeps,
+            sweeps_per_beta,
+            beta_range: None,
+            seed: 0,
+        }
+    }
+
+    fn job(
+        job_id: &[u8],
+        graph: IsingGraph,
+        num_reads: usize,
+        num_sweeps: usize,
+        sweeps_per_beta: usize,
+    ) -> StreamJob {
+        StreamJob {
+            job_id: job_id.to_vec(),
+            graph,
+            params: params(num_reads, num_sweeps, sweeps_per_beta),
+            generation: 0,
+        }
+    }
+
+    /// Governor predicate for tests that are not about throttling.
+    fn no_throttle() -> bool {
+        false
+    }
+
+    fn ring4() -> IsingGraph {
+        IsingGraph::new(
+            vec![1.0, -1.0, 0.0, 1.0],
+            vec![1.0, -1.0, 1.0, -1.0],
+            vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+        )
+    }
+
+    #[test]
+    fn batch_key_matches_identical_job() {
+        let j = job(b"a", ring4(), 16, 64, 1);
+        let key = BatchKey::from_job(&j);
+        assert!(key.matches(&j));
+    }
+
+    #[test]
+    fn batch_key_rejects_different_edges() {
+        let j = job(b"a", ring4(), 16, 64, 1);
+        let key = BatchKey::from_job(&j);
+        let mut other = job(b"b", ring4(), 16, 64, 1);
+        other.graph.edges = vec![(0, 1), (1, 2), (2, 3)]; // drop one edge
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn batch_key_rejects_different_n() {
+        let j = job(b"a", ring4(), 16, 64, 1);
+        let key = BatchKey::from_job(&j);
+        let other = job(
+            b"b",
+            IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]),
+            16,
+            64,
+            1,
+        );
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn batch_key_rejects_different_num_sweeps() {
+        let j = job(b"a", ring4(), 16, 64, 1);
+        let key = BatchKey::from_job(&j);
+        let other = job(b"b", ring4(), 16, 128, 1);
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn batch_key_matches_out_of_range_num_reads_via_clamp() {
+        // Both clamp to MAX_READS, so they share a batch key.
+        let over = sampler::MAX_READS + 10;
+        let more = sampler::MAX_READS + 50;
+        let j = job(b"a", ring4(), over, 64, 1);
+        let key = BatchKey::from_job(&j);
+        assert_eq!(key.num_reads, sampler::MAX_READS);
+        let other = job(b"b", ring4(), more, 64, 1);
+        assert!(key.matches(&other));
+    }
+
+    #[test]
+    fn batch_key_matches_zero_num_reads_via_clamp() {
+        // 0 and 1 both clamp to 1.
+        let j = job(b"a", ring4(), 0, 64, 1);
+        let key = BatchKey::from_job(&j);
+        assert_eq!(key.num_reads, 1);
+        let other = job(b"b", ring4(), 1, 64, 1);
+        assert!(key.matches(&other));
+    }
+
+    #[test]
+    fn batch_key_matches_zero_sweeps_per_beta_via_max() {
+        // 0 and 1 both become 1 via max(1).
+        let j = job(b"a", ring4(), 16, 64, 0);
+        let key = BatchKey::from_job(&j);
+        assert_eq!(key.sweeps_per_beta, 1);
+        let other = job(b"b", ring4(), 16, 64, 1);
+        assert!(key.matches(&other));
+    }
+
+    #[test]
+    fn threadgroup_budget_converts_to_problems_per_algorithm() {
+        // Recompute the formula in-process rather than mutating the
+        // environment (avoids cross-test races under `cargo test`).
+        let cores = crate::iokit_gov::gpu_core_count()
+            .unwrap_or(DEFAULT_GPU_CORES)
+            .max(1);
+        let env = std::env::var("QUIP_METAL_TG_PER_CORE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|m| m.is_finite() && *m > 0.0);
+
+        // SA spends one threadgroup per problem, so problems == budget and the
+        // batch does not shrink as reads grow.
+        let sa_budget = ((cores as f64 * env.unwrap_or(SA_TG_PER_CORE)).round() as usize).max(1);
+        assert_eq!(batch_size_for_reads(Algorithm::Sa, 64), sa_budget);
+        assert_eq!(batch_size_for_reads(Algorithm::Sa, 256), sa_budget);
+
+        // Chromatic Gibbs spends `num_reads` threadgroups per problem, so the
+        // same budget buys 4x fewer problems at 4x the reads. This is the whole
+        // point of budgeting in threadgroups: one constant, one meaning.
+        if sampler::gibbs_node_parallel() {
+            let g_budget =
+                ((cores as f64 * env.unwrap_or(GIBBS_TG_PER_CORE)).round() as usize).max(1);
+            assert_eq!(
+                batch_size_for_reads(Algorithm::Gibbs, 64),
+                g_budget.div_ceil(64).max(1)
+            );
+            assert_eq!(
+                batch_size_for_reads(Algorithm::Gibbs, 256),
+                g_budget.div_ceil(256).max(1)
+            );
+        }
+        assert!(batch_size_for_reads(Algorithm::Gibbs, 4096) >= 1, "never zero");
+    }
+
+    #[test]
+    fn reads_round_up_to_a_full_simdgroup() {
+        // Partial simdgroups leave lanes idle that are issued anyway.
+        assert_eq!(sampler::simd_rounded_reads(1), 32);
+        assert_eq!(sampler::simd_rounded_reads(16), 32);
+        assert_eq!(sampler::simd_rounded_reads(33), 64);
+        // Already aligned counts are untouched, and the cap is never exceeded.
+        assert_eq!(sampler::simd_rounded_reads(64), 64);
+        assert_eq!(sampler::simd_rounded_reads(sampler::MAX_READS), sampler::MAX_READS);
+        assert_eq!(sampler::simd_rounded_reads(usize::MAX), sampler::MAX_READS);
+    }
+
+    #[test]
+    fn next_seed_answers_empty_graph() {
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(4);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
+        let empty = job(b"empty", IsingGraph::new(vec![], vec![], vec![]), 3, 64, 1);
+        assert!(job_tx.blocking_send(empty).is_ok());
+        drop(job_tx);
+
+        let mut pending = None;
+        let mut ctx = StreamCtx {
+            jobs: &mut job_rx,
+            out: &out_tx,
+            pending: &mut pending,
+            algorithm: Algorithm::Sa,
+            throttle: &no_throttle,
+            yield_mode: YieldMode::Batch,
+            cancel: &CancelGuard::default(),
+        };
+        // Empty job is answered inline; channel then closes → None.
+        assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
+
+        let Some(r) = out_rx.blocking_recv() else {
+            assert_eq!("got", "empty-graph answer on out channel");
+            return;
+        };
+        assert_eq!(r.job_id, b"empty");
+        let StreamOutcome::Completed(Ok(reads)) = r.outcome else {
+            assert_eq!("got", "Ok empty reads");
+            return;
+        };
+        assert_eq!(reads.len(), 3);
+        assert!(reads
+            .iter()
+            .all(|s| s.spins.is_empty() && s.energy_milli == 0));
+        assert_eq!(r.device_access_time_us, 0);
+    }
+
+    #[test]
+    fn next_seed_rejects_too_large() {
+        let n = algo_max_nodes(Algorithm::Sa) + 1;
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(4);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
+        let huge = job(
+            b"huge",
+            IsingGraph::new(vec![0.0; n], vec![], vec![]),
+            1,
+            64,
+            1,
+        );
+        assert!(job_tx.blocking_send(huge).is_ok());
+        drop(job_tx);
+
+        let mut pending = None;
+        let mut ctx = StreamCtx {
+            jobs: &mut job_rx,
+            out: &out_tx,
+            pending: &mut pending,
+            algorithm: Algorithm::Sa,
+            throttle: &no_throttle,
+            yield_mode: YieldMode::Batch,
+            cancel: &CancelGuard::default(),
+        };
+        assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
+
+        let Some(r) = out_rx.blocking_recv() else {
+            assert_eq!("got", "TooLarge reject on out channel");
+            return;
+        };
+        assert_eq!(r.job_id, b"huge");
+        let is_too_large = matches!(
+            r.outcome,
+            StreamOutcome::Completed(Err(RejectReason::TooLarge))
+        );
+        assert!(is_too_large, "expected TooLarge, got unexpected reject/ok");
+    }
+
+    #[test]
+    fn next_seed_nonblocking_empty_channel() {
+        let (_job_tx, mut job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+        let mut pending = None;
+        let mut ctx = StreamCtx {
+            jobs: &mut job_rx,
+            out: &out_tx,
+            pending: &mut pending,
+            algorithm: Algorithm::Sa,
+            throttle: &no_throttle,
+            yield_mode: YieldMode::Batch,
+            cancel: &CancelGuard::default(),
+        };
+        assert!(next_seed(&mut ctx, Seed::NonBlocking).is_none());
+    }
+
+    #[test]
+    fn next_seed_returns_in_range_job() {
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(4);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
+        let j = job(b"ok", ring4(), 8, 32, 1);
+        assert!(job_tx.blocking_send(j).is_ok());
+        drop(job_tx);
+
+        let mut pending = None;
+        let mut ctx = StreamCtx {
+            jobs: &mut job_rx,
+            out: &out_tx,
+            pending: &mut pending,
+            algorithm: Algorithm::Sa,
+            throttle: &no_throttle,
+            yield_mode: YieldMode::Batch,
+            cancel: &CancelGuard::default(),
+        };
+        let Some(got) = next_seed(&mut ctx, Seed::Blocking) else {
+            assert_eq!("got", "in-range seed job");
+            return;
+        };
+        assert_eq!(got.job_id, b"ok");
+        assert_eq!(got.graph.num_nodes(), 4);
+        // No reject / empty answer emitted.
+        assert!(out_rx.try_recv().is_err());
     }
 }

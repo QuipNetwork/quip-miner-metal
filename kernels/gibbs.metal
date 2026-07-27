@@ -251,6 +251,14 @@ kernel void block_gibbs_sampler(
     constant int& update_mode [[buffer(19)]],              // 0=Gibbs, 1=Metropolis
     constant int& num_colors [[buffer(20)]],               // typically 4 for Zephyr
 
+    // Chunked dispatch parameters for GPU yielding (see kernels/sa.metal).
+    // 16..20 are taken by the color-block bindings above, so chunking
+    // starts at 21 here instead of SA's 16.
+    constant int& beta_start [[buffer(21)]],               // first beta index this chunk (0 = init)
+    constant int& beta_count [[buffer(22)]],               // betas to process this chunk
+    device int8_t* persistent_state [[buffer(23)]],        // [num_threads * packed_size] packed spins
+    device uint* persistent_rng [[buffer(24)]],            // [num_threads * 4] xoshiro128** state
+
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
     uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
@@ -285,21 +293,42 @@ kernel void block_gibbs_sampler(
     // Support up to ~4800 nodes (600 bytes packed)
     thread int8_t packed_state[600];
 
-    // Initialize RNG with unique seed per thread (xoshiro128** with splitmix32 seeding)
-    RngState rng_state = seed_rng((base_seed ? base_seed : 1u) ^ (thread_id * 2654435761u));
+    RngState rng_state;
 
-    // Generate random initial state (bit-packed)
-    for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
-        packed_state[byte_idx] = 0;
-    }
-    for (int var = 0; var < n; var++) {
-        uint rand_val = xoshiro128starstar(rng_state);
-        int8_t spin = (rand_val & 1) ? -1 : 1;
-        set_spin_packed(var, spin, packed_state);
+    if (beta_start == 0) {
+        // ── First chunk: random initialization ──────────────
+        // Initialize RNG with unique seed per thread (xoshiro128** with splitmix32 seeding)
+        rng_state = seed_rng((base_seed ? base_seed : 1u) ^ (thread_id * 2654435761u));
+
+        // Generate random initial state (bit-packed)
+        for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+            packed_state[byte_idx] = 0;
+        }
+        for (int var = 0; var < n; var++) {
+            uint rand_val = xoshiro128starstar(rng_state);
+            int8_t spin = (rand_val & 1) ? -1 : 1;
+            set_spin_packed(var, spin, packed_state);
+        }
+    } else {
+        // ── Continuation chunk: load from persistent buffers ──
+        // Gibbs recomputes h_eff on every update, so only the spins and
+        // the RNG stream need to survive between chunks (no delta_energy
+        // array like SA carries).
+        device const int8_t* src_state = &persistent_state[thread_id * packed_size];
+        for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+            packed_state[byte_idx] = src_state[byte_idx];
+        }
+
+        device const uint* src_rng = &persistent_rng[thread_id * 4];
+        rng_state.s0 = src_rng[0];
+        rng_state.s1 = src_rng[1];
+        rng_state.s2 = src_rng[2];
+        rng_state.s3 = src_rng[3];
     }
 
-    // Block Gibbs annealing
-    for (int beta_idx = 0; beta_idx < num_beta_values; beta_idx++) {
+    // Block Gibbs annealing over this chunk's beta range
+    int chunk_end = min(beta_start + beta_count, num_beta_values);
+    for (int beta_idx = beta_start; beta_idx < chunk_end; beta_idx++) {
         float beta = beta_schedule[beta_idx];
 
         for (int sweep = 0; sweep < sweeps_per_beta_val; sweep++) {
@@ -356,6 +385,21 @@ kernel void block_gibbs_sampler(
                 current_energy += Jij * spin_i * spin_j;
             }
         }
+    }
+
+    // Persist state for next chunk (always write — the host decides
+    // whether there will be a next chunk or not)
+    {
+        device int8_t* dst_state = &persistent_state[thread_id * packed_size];
+        for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+            dst_state[byte_idx] = packed_state[byte_idx];
+        }
+
+        device uint* dst_rng = &persistent_rng[thread_id * 4];
+        dst_rng[0] = rng_state.s0;
+        dst_rng[1] = rng_state.s1;
+        dst_rng[2] = rng_state.s2;
+        dst_rng[3] = rng_state.s3;
     }
 
     // Write final state to output (bit-packed)
@@ -458,6 +502,15 @@ kernel void block_gibbs_parallel(
     constant int& update_mode [[buffer(19)]],
     constant int& num_colors [[buffer(20)]],
 
+    // Chunked dispatch parameters for GPU yielding (same indices as the
+    // sequential kernel above). State is per-sample here, RNG per-thread:
+    // each thread owns an independent xoshiro stream, so the host must
+    // dispatch the same threads-per-group for every chunk of an anneal.
+    constant int& beta_start [[buffer(21)]],               // first beta index this chunk (0 = init)
+    constant int& beta_count [[buffer(22)]],               // betas to process this chunk
+    device int8_t* persistent_state [[buffer(23)]],        // [num_threadgroups * N] unpacked spins
+    device uint* persistent_rng [[buffer(24)]],            // [num_threadgroups * group_size * 4]
+
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
     uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
@@ -491,20 +544,40 @@ kernel void block_gibbs_parallel(
     // Support up to ~4800 nodes
     threadgroup int8_t shared_state[4800];
 
-    // Initialize RNG with unique seed per thread (xoshiro128** with splitmix32 seeding)
-    RngState rng_state = seed_rng(
-        (base_seed ? base_seed : 1u) ^ (sample_id * 2654435761u) ^ (thread_in_group * 2246822519u)
-    );
+    RngState rng_state;
 
-    // Collaboratively generate random initial state (unpacked)
-    for (uint var = thread_in_group; var < n; var += group_size) {
-        uint rand_val = xoshiro128starstar(rng_state);
-        shared_state[var] = (rand_val & 1) ? -1 : 1;
+    if (beta_start == 0) {
+        // ── First chunk: random initialization ──────────────
+        // Initialize RNG with unique seed per thread (xoshiro128** with splitmix32 seeding)
+        rng_state = seed_rng(
+            (base_seed ? base_seed : 1u) ^ (sample_id * 2654435761u) ^ (thread_in_group * 2246822519u)
+        );
+
+        // Collaboratively generate random initial state (unpacked)
+        for (uint var = thread_in_group; var < n; var += group_size) {
+            uint rand_val = xoshiro128starstar(rng_state);
+            shared_state[var] = (rand_val & 1) ? -1 : 1;
+        }
+    } else {
+        // ── Continuation chunk: load from persistent buffers ──
+        // Threadgroup memory does not survive dispatches, so the shared
+        // spin state is rebuilt here from device memory every chunk.
+        device const uint* src_rng = &persistent_rng[(sample_id * group_size + thread_in_group) * 4];
+        rng_state.s0 = src_rng[0];
+        rng_state.s1 = src_rng[1];
+        rng_state.s2 = src_rng[2];
+        rng_state.s3 = src_rng[3];
+
+        device const int8_t* src_state = &persistent_state[sample_id * uint(n)];
+        for (uint var = thread_in_group; var < n; var += group_size) {
+            shared_state[var] = src_state[var];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Block Gibbs annealing with TRUE parallel updates
-    for (int beta_idx = 0; beta_idx < num_betas; beta_idx++) {
+    // Block Gibbs annealing with TRUE parallel updates over this chunk
+    int chunk_end = min(beta_start + beta_count, num_betas);
+    for (int beta_idx = beta_start; beta_idx < chunk_end; beta_idx++) {
         float beta = beta_schedule[beta_idx];
 
         for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
@@ -553,6 +626,23 @@ kernel void block_gibbs_parallel(
                 // before next color reads the state
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
+        }
+    }
+
+    // Persist state for next chunk (always write — the host decides
+    // whether there will be a next chunk or not). The barrier closing the
+    // last color block already synchronized shared_state, and each thread
+    // writes a disjoint stride, so no further barrier is needed here.
+    {
+        device uint* dst_rng = &persistent_rng[(sample_id * group_size + thread_in_group) * 4];
+        dst_rng[0] = rng_state.s0;
+        dst_rng[1] = rng_state.s1;
+        dst_rng[2] = rng_state.s2;
+        dst_rng[3] = rng_state.s3;
+
+        device int8_t* dst_state = &persistent_state[sample_id * uint(n)];
+        for (uint var = thread_in_group; var < n; var += group_size) {
+            dst_state[var] = shared_state[var];
         }
     }
 

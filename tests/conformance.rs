@@ -4,8 +4,78 @@
 
 #![cfg(target_os = "macos")]
 
-use quip_mock_coordinator::driver::drive_miner;
+use quip_mock_coordinator::driver::{drive_miner, DriverReport};
+use quip_proto::v1::RejectReason;
 use std::process::Command;
+
+/// Grade one driven session against every axis of the miner protocol.
+///
+/// `is_conformant()` is the mock coordinator's own composite verdict, so this
+/// tracks the reference automatically as the contract grows. The per-axis
+/// assertions run first purely for diagnosis: a bare composite failure says
+/// "not conformant" without saying which rule broke.
+fn assert_conformant(bin: &str, report: &DriverReport) {
+    // Handshake: Hello -> Welcome -> Configure -> Ready (MINER_PROTOCOL.md
+    // "Handshake"). Dispatch stays blocked until `Ready`.
+    assert!(report.handshake_ok, "{bin}: handshake failed");
+    assert!(report.ready_received, "{bin}: no Ready after Configure");
+
+    // Credits: the miner grants a first batch, then returns one per terminal
+    // outcome. A zero grant would deadlock dispatch ("Credits").
+    assert!(
+        !report.job_request_credits.is_empty(),
+        "{bin}: miner granted no credits"
+    );
+    assert!(
+        report.job_request_credits.iter().all(|&c| c > 0),
+        "{bin}: zero-credit JobRequest: {:?}",
+        report.job_request_credits
+    );
+
+    // Results: one per solvable job, each carrying solutions and a SamplerMeta
+    // ("Servicing a job").
+    assert_eq!(
+        report.result_job_ids().len(),
+        3,
+        "{bin}: expected 3 results (job-1, job-2, job-hash), got {:?}",
+        report.result_job_ids()
+    );
+    for r in &report.results {
+        assert!(
+            !r.solution_energies_milli.is_empty(),
+            "{bin}: result {:?} carried no solutions",
+            r.job_id
+        );
+        assert!(r.meta_present, "{bin}: result {:?} had no meta", r.job_id);
+    }
+
+    // Reject reasons: each drives a different coordinator response, so the
+    // reason must be right, not merely present ("Servicing a job" table).
+    for (job_id, reason) in [
+        (&b"job-bad-h"[..], RejectReason::Malformed),
+        (&b"job-bad-j"[..], RejectReason::Malformed),
+        (&b"job-gate"[..], RejectReason::UnsupportedKind),
+        (&b"job-old"[..], RejectReason::Expired),
+    ] {
+        assert!(
+            report.has_reject(job_id, reason),
+            "{bin}: missing {reason:?} reject for {}: {:?}",
+            String::from_utf8_lossy(job_id),
+            report.rejects
+        );
+    }
+
+    // Cancel is acknowledged with a Status ("Control-plane pushes").
+    assert!(report.cancel_acked, "{bin}: Cancel not acked with Status");
+
+    // Shutdown drains in-flight results, then exits 0 ("Exit codes").
+    assert_eq!(report.exit_code, 0, "{bin}: clean shutdown expected");
+
+    assert!(
+        report.is_conformant(),
+        "{bin}: not conformant per the reference verdict: {report:?}"
+    );
+}
 
 /// Cross-package binary path (deps/ → profile/ → bin).
 fn profile_bin(name: &str) -> String {
@@ -49,23 +119,7 @@ async fn quip_metal_sa_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    assert!(report.handshake_ok, "SA handshake failed");
-    assert_eq!(
-        report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
-    );
-    assert!(
-        report.has_reject(b"job-bad-h", quip_proto::v1::RejectReason::Malformed),
-        "missing MALFORMED reject: {:?}",
-        report.rejects
-    );
-    assert!(
-        report.has_reject(b"job-old", quip_proto::v1::RejectReason::Expired),
-        "missing EXPIRED reject: {:?}",
-        report.rejects
-    );
-    assert_eq!(report.exit_code, 0, "clean shutdown expected");
+    assert_conformant("quip-metal-sa", &report);
 }
 
 #[tokio::test]
@@ -81,15 +135,7 @@ async fn quip_metal_gibbs_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    assert!(report.handshake_ok, "Gibbs handshake failed");
-    assert_eq!(
-        report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
-    );
-    assert!(report.has_reject(b"job-bad-h", quip_proto::v1::RejectReason::Malformed));
-    assert!(report.has_reject(b"job-old", quip_proto::v1::RejectReason::Expired));
-    assert_eq!(report.exit_code, 0, "clean shutdown expected");
+    assert_conformant("quip-metal-gibbs", &report);
 }
 
 #[test]

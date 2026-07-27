@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "quip_miner_metal",
+  "project_id": "d7c2f526-6d71-43ef-993b-31cca1c4ec6f"
+}
