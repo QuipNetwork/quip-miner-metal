@@ -12,9 +12,11 @@ cache:
 # Shared macOS runner setup. This crate depends on Metal and IOKit and does not
 # build on any other platform (`compile_error!` in `src/lib.rs`), so there is no
 # Linux job to fall back on — every stage that touches Rust runs here.
+#
+# Targets the group's own Apple Silicon runners (`cray`, `tesla-arm`). These are
+# shell executors with a real GPU, so no `image:` applies.
 .macos:
-  tags: [saas-macos-medium-m1]
-  image: macos-14-xcode-15
+  tags: [macos, arm64]
   before_script:
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1
     - source "$HOME/.cargo/env"
