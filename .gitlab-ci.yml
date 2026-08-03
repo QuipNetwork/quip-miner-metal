@@ -18,8 +18,11 @@ cache:
 .macos:
   tags: [macos, arm64]
   before_script:
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1
-    - source "$HOME/.cargo/env"
+    # `--no-modify-path` keeps rustup-init from appending `source $CARGO_HOME/env`
+    # to the runner's shell profile. `CARGO_HOME` is inside the build directory,
+    # so that line breaks every later login shell once the job is cleaned up.
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
+    - source "$CARGO_HOME/env"
     - brew install protobuf
 
 # Lint, format and the full test suite, including the tests that need a real
