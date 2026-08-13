@@ -293,26 +293,6 @@ fn resolve_governor_config(
     (ceiling, yielding)
 }
 
-/// Install the process-wide `tracing` subscriber for a miner binary.
-///
-/// Without this the crate's `tracing::error!`/`warn!` diagnostics are compiled
-/// in but discarded, which would be a regression against the `eprintln!` calls
-/// they replaced. Writes to stderr so it lands alongside `quip-miner-core`'s
-/// own stderr logging. `RUST_LOG` overrides the default `info` level.
-///
-/// `try_init` rather than `init`: both binaries call [`run_metal`] exactly
-/// once, but a test or embedder may already have installed a subscriber, and
-/// losing that race must not abort the miner.
-fn init_tracing() {
-    use std::io::IsTerminal;
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .try_init();
-}
-
 /// Run a Metal miner binary. macOS opens the GPU and governor; other platforms
 /// support `--capabilities`/`--version` but return `EnvIncompatible` for
 /// `--check` and session mode.
@@ -341,7 +321,6 @@ pub fn run_metal(
     utilization: u32,
     yielding: bool,
 ) -> ExitCode {
-    init_tracing();
     use crate::iokit_gov::UtilGovernor;
     use crate::metal_device::MetalDevice;
     use quip_miner_core::OpenError;

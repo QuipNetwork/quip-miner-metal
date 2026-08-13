@@ -21,25 +21,18 @@ path = "src/bin/quip_metal_sa.rs"
 name = "quip-metal-gibbs"
 path = "src/bin/quip_metal_gibbs.rs"
 
-# Shared protocol crates live in the quip-protocol repo; pinned until they are
-# published to a registry (crates.io / GitLab).
-#
-# Pinned by `rev` rather than `tag` for now: this miner needs the session
-# flow-control fix and the CancelGuard/StreamOutcome API on `v0.3`, which no
-# `shared-v0.3.x` tag contains yet (`shared-v0.3.0` predates both). Switch back
-# to `tag = "shared-v0.3.1"` or later once one is cut from `v0.3`.
+# Shared protocol crates live in the quip-protocol repo; tracked on its v0.3
+# branch until they are published to a registry (crates.io / GitLab). The other
+# miner repositories track the same branch, so all backends resolve one core.
 [dependencies]
-quip-proto = { git = "https://gitlab.com/quip.network/quip-protocol.git", rev = "623af0700d36359687b1e69d866ae782d932a0e9" }
-quip-protocol = { git = "https://gitlab.com/quip.network/quip-protocol.git", rev = "623af0700d36359687b1e69d866ae782d932a0e9" }
-quip-miner-core = { git = "https://gitlab.com/quip.network/quip-protocol.git", rev = "623af0700d36359687b1e69d866ae782d932a0e9" }
+quip-proto = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
+quip-protocol = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
+quip-miner-core = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
 # Diagnostics.
 tracing = "0.1"
-# Subscriber for the miner binaries: without one, every `tracing::` call
-# above is compiled in and discarded. Installed in `run_metal`.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Metal + IOKit. Ungated: this crate is macOS-only (see the `compile_error!`
 # guard in `src/lib.rs`), so there is no target for a gate to select.
 metal = "0.33"
@@ -54,7 +47,7 @@ rayon = "1.10"
 objc = "0.2"
 
 [dev-dependencies]
-quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", rev = "623af0700d36359687b1e69d866ae782d932a0e9" }
+quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }
 # Property tests over the host-side encoders/scorers (`tests/properties.rs`).
