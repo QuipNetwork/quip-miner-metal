@@ -484,19 +484,8 @@ checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
  "libc",
- "r-efi 5.3.0",
+ "r-efi",
  "wasip2",
-]
-
-[[package]]
-name = "getrandom"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi 6.0.0",
 ]
 
 [[package]]
@@ -983,7 +972,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 [[package]]
 name = "quip-miner-core"
 version = "0.3.0"
-source = "git+https://gitlab.com/quip.network/quip-protocol.git?rev=623af0700d36359687b1e69d866ae782d932a0e9#623af0700d36359687b1e69d866ae782d932a0e9"
+source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#5c0ca9024bc9574b1f9b13b11f216e1de2c61c80"
 dependencies = [
  "clap",
  "getrandom 0.2.17",
@@ -996,11 +985,12 @@ dependencies = [
  "tonic",
  "tower 0.5.3",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "quip-miner-metal"
-version = "0.3.0-rc2"
+version = "0.3.0-rc3"
 dependencies = [
  "clap",
  "core-foundation-sys",
@@ -1019,13 +1009,12 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "quip-mock-coordinator"
 version = "0.3.0"
-source = "git+https://gitlab.com/quip.network/quip-protocol.git?rev=623af0700d36359687b1e69d866ae782d932a0e9#623af0700d36359687b1e69d866ae782d932a0e9"
+source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#5c0ca9024bc9574b1f9b13b11f216e1de2c61c80"
 dependencies = [
  "hyper-util",
  "prost",
@@ -1040,7 +1029,7 @@ dependencies = [
 [[package]]
 name = "quip-proto"
 version = "0.3.0"
-source = "git+https://gitlab.com/quip.network/quip-protocol.git?rev=623af0700d36359687b1e69d866ae782d932a0e9#623af0700d36359687b1e69d866ae782d932a0e9"
+source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#5c0ca9024bc9574b1f9b13b11f216e1de2c61c80"
 dependencies = [
  "prost",
  "tonic",
@@ -1050,7 +1039,7 @@ dependencies = [
 [[package]]
 name = "quip-protocol"
 version = "0.3.0"
-source = "git+https://gitlab.com/quip.network/quip-protocol.git?rev=623af0700d36359687b1e69d866ae782d932a0e9#623af0700d36359687b1e69d866ae782d932a0e9"
+source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#5c0ca9024bc9574b1f9b13b11f216e1de2c61c80"
 dependencies = [
  "blake3",
  "prost",
@@ -1073,12 +1062,6 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
-
-[[package]]
-name = "r-efi"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
@@ -1378,7 +1361,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
