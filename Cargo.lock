@@ -972,7 +972,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 [[package]]
 name = "quip-miner-core"
 version = "0.3.0"
-source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#5c0ca9024bc9574b1f9b13b11f216e1de2c61c80"
+source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#b13ac8f723ef38049b83e6390659f381ddfbeb17"
 dependencies = [
  "clap",
  "getrandom 0.2.17",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "quip-miner-metal"
-version = "0.3.0-rc3"
+version = "0.3.0"
 dependencies = [
  "clap",
  "core-foundation-sys",
@@ -1014,7 +1014,7 @@ dependencies = [
 [[package]]
 name = "quip-mock-coordinator"
 version = "0.3.0"
-source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#5c0ca9024bc9574b1f9b13b11f216e1de2c61c80"
+source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#b13ac8f723ef38049b83e6390659f381ddfbeb17"
 dependencies = [
  "hyper-util",
  "prost",
@@ -1029,7 +1029,7 @@ dependencies = [
 [[package]]
 name = "quip-proto"
 version = "0.3.0"
-source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#5c0ca9024bc9574b1f9b13b11f216e1de2c61c80"
+source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#b13ac8f723ef38049b83e6390659f381ddfbeb17"
 dependencies = [
  "prost",
  "tonic",
@@ -1039,7 +1039,7 @@ dependencies = [
 [[package]]
 name = "quip-protocol"
 version = "0.3.0"
-source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#5c0ca9024bc9574b1f9b13b11f216e1de2c61c80"
+source = "git+https://gitlab.com/quip.network/quip-protocol.git?branch=v0.3#b13ac8f723ef38049b83e6390659f381ddfbeb17"
 dependencies = [
  "blake3",
  "prost",
