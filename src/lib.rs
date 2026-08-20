@@ -6,8 +6,9 @@
 //!
 //! Kernels take **explicit per-job** CSR buffers from the host (no kernel-side
 //! nonce economy / rotating slots). Solution energies are always scored with
-//! [`quip_protocol::scoring::energy_milli`] for consensus (host f64 — Metal
-//! has no fp64). The coordinator session loop lives in `quip-miner-core`.
+//! [`quip_solver_core::quip_protocol::scoring::energy_milli`] for consensus
+//! (host f64 — Metal has no fp64). The coordinator session loop lives in
+//! `quip-solver-core`.
 //!
 //! # Platform
 //!
@@ -51,11 +52,11 @@ pub mod metal_device;
 pub mod streaming;
 pub mod topology;
 
-pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 
 pub use sampler::sample_ising;
 
-use quip_miner_core::{run, BackendIdentity, CommonArgs};
+use quip_solver_core::{run, BackendIdentity, CommonArgs};
 use std::process::ExitCode;
 
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
@@ -63,7 +64,7 @@ const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 // Compile-time guard that the sampler's `num_sweeps` rejection threshold
 // still admits every job this backend advertises it will accept.
 //
-// `quip-miner-core` doubles the resolved sweeps for Gibbs
+// `quip-solver-core` doubles the resolved sweeps for Gibbs
 // (`GIBBS_SWEEP_MULTIPLIER`), so an adapt-driven job can legitimately arrive
 // at `2 * max_sweeps`. Raising `METAL_ADAPT`'s `max_sweeps` past half of
 // `sampler::MAX_SWEEPS` would make the miner reject work it just told the
@@ -76,7 +77,7 @@ const _: () = assert!(
 );
 
 /// Metal adapt envelope (from `GPU/metal_miner.py`).
-const METAL_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt::AdaptBounds {
+const METAL_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adapt::AdaptBounds {
     min_sweeps: 256,
     max_sweeps: 2048,
     min_reads: 64,
@@ -107,6 +108,9 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     // `const` context, so the narrowing cast is checked at compile time.
     max_nodes: crate::sampler::SA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
+    // A real `sample_stream` override and the IOKit governor — the two
+    // capability names `BackendIdentity::features` documents.
+    features: &["streaming", "governor"],
     adapt: METAL_ADAPT,
 };
 
@@ -128,6 +132,8 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
     max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
+    // Same capability set as `METAL_SA_IDENTITY`: streaming + governor.
+    features: &["streaming", "governor"],
     adapt: METAL_ADAPT,
 };
 
@@ -204,29 +210,29 @@ impl MetalSampler {
     }
 }
 
-impl quip_miner_core::Sampler for MetalSampler {
+impl quip_solver_core::Sampler for MetalSampler {
     fn sample(
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-    ) -> Result<Vec<SamplerResult>, quip_proto::v1::RejectReason> {
+    ) -> Result<Vec<SamplerResult>, quip_solver_core::SampleError> {
         sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
-            // `kind` carries the `SampleError` variant (Debug), so a kernel
-            // compile failure and a device reset stay distinguishable in the
-            // log even though both map to `OVERLOADED` — the protocol has no
-            // variant for "backend permanently broken". See the crate README /
-            // audit note. A capacity refusal is the one case that maps
-            // elsewhere (`TOO_LARGE`), via `reject_reason`.
+            // `kind` carries the local `sampler::SampleError` variant (Debug),
+            // so a kernel compile failure and a device reset stay
+            // distinguishable in the log even though both map to
+            // `DeviceFault` below — see `sampler::SampleError::to_sample_error`.
+            // A capacity refusal is the one case that maps elsewhere
+            // (`Capacity`).
             tracing::error!(error = %e, kind = ?e, "metal sample failed");
-            e.reject_reason()
+            e.to_sample_error()
         })
     }
 
     fn sample_stream(
         &self,
-        jobs: tokio::sync::mpsc::Receiver<quip_miner_core::StreamJob>,
-        out: tokio::sync::mpsc::Sender<quip_miner_core::StreamResult>,
-        cancel: quip_miner_core::CancelGuard,
+        jobs: tokio::sync::mpsc::Receiver<quip_solver_core::StreamJob>,
+        out: tokio::sync::mpsc::Sender<quip_solver_core::StreamResult>,
+        cancel: quip_solver_core::CancelToken,
     ) {
         // `&out`: `run_stream` borrows the sender (it only ever clones/sends
         // through it). Depends on the matching `streaming::run_stream`
@@ -276,7 +282,7 @@ impl quip_miner_core::Sampler for MetalSampler {
 ///
 /// Malformed TOML falls back to an empty config (`unwrap_or_default`), so the
 /// current values are kept. Present keys override via
-/// `quip_miner_core::config::config_override`; unknown keys are warned via
+/// `quip_solver_core::config::config_override`; unknown keys are warned via
 /// `warn_unknown_fields`. Out-of-range utilization is returned as-is —
 /// `UtilGovernor::reconfigure` clamps to `1..=100`.
 fn resolve_governor_config(
@@ -284,13 +290,96 @@ fn resolve_governor_config(
     current_ceiling: u32,
     current_yielding: bool,
 ) -> (u32, bool) {
-    use quip_miner_core::config::{config_override, warn_unknown_fields};
+    use quip_solver_core::config::{config_override, warn_unknown_fields};
     let cfg: MetalConfig = toml::from_str(backend_toml).unwrap_or_default();
     warn_unknown_fields("metal", cfg.unknown.keys());
     // config over CLI (the governor holds the CLI-set values until now).
     let ceiling = config_override("utilization", current_ceiling, cfg.utilization);
     let yielding = config_override("yielding", current_yielding, cfg.yielding);
     (ceiling, yielding)
+}
+
+/// Algorithm selection at the type level, one tag per Metal binary.
+///
+/// [`quip_solver_core::Sampler::declared_stream_width`] is associated —
+/// `--capabilities` answers it with no device — so a width that differs per
+/// algorithm needs a `Sampler` type per binary. [`run_metal`] takes the tag
+/// and builds the matching [`TaggedSampler`].
+///
+/// `Send + Sync + 'static` because `Sampler` requires them of the whole
+/// sampler type; a zero-sized tag satisfies all three trivially.
+pub trait AlgorithmTag: Send + Sync + 'static {
+    /// The algorithm this tag selects.
+    const ALGORITHM: Algorithm;
+}
+
+/// Tag for `quip-metal-sa`.
+pub struct SaTag;
+
+impl AlgorithmTag for SaTag {
+    const ALGORITHM: Algorithm = Algorithm::Sa;
+}
+
+/// Tag for `quip-metal-gibbs`.
+pub struct GibbsTag;
+
+impl AlgorithmTag for GibbsTag {
+    const ALGORITHM: Algorithm = Algorithm::Gibbs;
+}
+
+/// [`MetalSampler`] bound to its binary's algorithm at the type level, so the
+/// associated `declared_stream_width` answers per algorithm. [`run_metal`]
+/// constructs the inner sampler from `A::ALGORITHM`, keeping the tag and the
+/// runtime algorithm equal by construction.
+pub struct TaggedSampler<A: AlgorithmTag> {
+    inner: MetalSampler,
+    _algorithm: std::marker::PhantomData<A>,
+}
+
+impl<A: AlgorithmTag> quip_solver_core::Sampler for TaggedSampler<A> {
+    fn sample(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+    ) -> Result<Vec<SamplerResult>, quip_solver_core::SampleError> {
+        self.inner.sample(graph, params)
+    }
+
+    fn sample_stream(
+        &self,
+        jobs: tokio::sync::mpsc::Receiver<quip_solver_core::StreamJob>,
+        out: tokio::sync::mpsc::Sender<quip_solver_core::StreamResult>,
+        cancel: quip_solver_core::CancelToken,
+    ) {
+        self.inner.sample_stream(jobs, out, cancel);
+    }
+
+    fn stream_width(&self) -> usize {
+        self.inner.stream_width()
+    }
+
+    /// What the live [`MetalSampler::stream_width`] resolves to for this
+    /// tag's algorithm — the device does not participate in the Metal width,
+    /// so the advertised and live numbers agree by construction.
+    fn declared_stream_width() -> u32 {
+        u32::try_from(streaming::declared_stream_width(A::ALGORITHM)).unwrap_or(u32::MAX)
+    }
+
+    fn utilization(&self) -> f64 {
+        self.inner.utilization()
+    }
+
+    fn should_throttle(&self) -> bool {
+        self.inner.should_throttle()
+    }
+
+    fn max_reads(&self) -> u32 {
+        self.inner.max_reads()
+    }
+
+    fn apply_config(&self, backend_toml: &str) {
+        self.inner.apply_config(backend_toml);
+    }
 }
 
 /// Run a Metal miner binary. macOS opens the GPU and governor; other platforms
@@ -300,22 +389,22 @@ fn resolve_governor_config(
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_core::{Algorithm, CommonArgs};
-/// use quip_miner_metal::{run_metal, METAL_SA_IDENTITY};
+/// use quip_solver_core::CommonArgs;
+/// use quip_miner_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
 ///
 /// let common = CommonArgs {
 ///     quip_coordinator: None,
 ///     miner_id: None,
 ///     capabilities: true,
+///     solve: false,
 ///     check: false,
 ///     log_level: "info".into(),
 ///     sweeps_per_beta: None,
 /// };
-/// let _code = run_metal(METAL_SA_IDENTITY, Algorithm::Sa, &common, 0, 100, false);
+/// let _code = run_metal::<SaTag>(METAL_SA_IDENTITY, &common, 0, 100, false);
 /// ```
-pub fn run_metal(
+pub fn run_metal<A: AlgorithmTag>(
     id: BackendIdentity,
-    algorithm: Algorithm,
     common: &CommonArgs,
     device: usize,
     utilization: u32,
@@ -323,18 +412,40 @@ pub fn run_metal(
 ) -> ExitCode {
     use crate::iokit_gov::UtilGovernor;
     use crate::metal_device::MetalDevice;
-    use quip_miner_core::OpenError;
+    use quip_solver_core::OpenError;
     run(id, common, || {
         let dev =
             MetalDevice::open(device).map_err(|e| OpenError(format!("device {device}: {e}")))?;
         let gov = UtilGovernor::start(device as u32, utilization, yielding);
-        Ok(MetalSampler::new(dev, gov, algorithm))
+        Ok(TaggedSampler::<A> {
+            inner: MetalSampler::new(dev, gov, A::ALGORITHM),
+            _algorithm: std::marker::PhantomData,
+        })
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::resolve_governor_config;
+
+    /// A swapped tag constant would silently advertise the other algorithm's
+    /// width; pin the tag → algorithm binding. Device-free on purpose: the
+    /// declared width must be answerable without a GPU.
+    #[test]
+    fn tagged_declared_widths_follow_their_algorithms() {
+        use super::{GibbsTag, SaTag, TaggedSampler};
+        use quip_solver_core::{Algorithm, Sampler};
+        assert_eq!(
+            TaggedSampler::<SaTag>::declared_stream_width(),
+            u32::try_from(crate::streaming::declared_stream_width(Algorithm::Sa))
+                .unwrap_or(u32::MAX)
+        );
+        assert_eq!(
+            TaggedSampler::<GibbsTag>::declared_stream_width(),
+            u32::try_from(crate::streaming::declared_stream_width(Algorithm::Gibbs))
+                .unwrap_or(u32::MAX)
+        );
+    }
 
     /// CLI defaults the pure resolver starts from in every case below.
     const CLI_CEILING: u32 = 80;

@@ -14,7 +14,7 @@
 //! units; see `shared/quantum_proof_of_work.py`), so the int8 cast the
 //! original kernel relies on is lossless for real jobs.
 
-use quip_miner_core::IsingGraph;
+use quip_solver_core::IsingGraph;
 
 /// Chromatic color-block partition of a CSR graph's dense node indices.
 ///

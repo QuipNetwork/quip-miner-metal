@@ -21,13 +21,13 @@ path = "src/bin/quip_metal_sa.rs"
 name = "quip-metal-gibbs"
 path = "src/bin/quip_metal_gibbs.rs"
 
-# Shared protocol crates live in the quip-protocol repo; tracked on its v0.3
-# branch until they are published to a registry (crates.io / GitLab). The other
-# miner repositories track the same branch, so all backends resolve one core.
+# The solver contract (quip-proto, quip-protocol, quip-solver-core) is
+# published to crates.io, from quip.network/quip-solver-core. The other miner
+# repositories consume the same published versions, so all backends resolve
+# one core. `quip-solver-core` re-exports `quip_proto` and `quip_protocol`, so
+# this one line covers all three.
 [dependencies]
-quip-proto = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
-quip-protocol = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
-quip-miner-core = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
+quip-solver-core = "0.0.0"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
@@ -47,7 +47,7 @@ rayon = "1.10"
 objc = "0.2"
 
 [dev-dependencies]
-quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
+quip-solver-conformance = "0.0.0"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }
 # Property tests over the host-side encoders/scorers (`tests/properties.rs`).

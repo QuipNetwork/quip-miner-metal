@@ -19,10 +19,10 @@
 
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, algo_max_nodes};
-use quip_miner_core::{
-    Algorithm, CancelGuard, IsingGraph, SamplerResult, StreamJob, StreamOutcome, StreamResult,
+use quip_solver_core::{
+    Algorithm, CancelToken, IsingGraph, SampleError, SamplerResult, StreamJob, StreamOutcome,
+    StreamResult,
 };
-use quip_proto::v1::RejectReason;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -148,6 +148,24 @@ fn scale_budget(nominal: usize, scale: f64) -> usize {
     scaled.max(1)
 }
 
+/// The width [`stream_width`] resolves to for `algorithm`, with no device.
+///
+/// A pure function of the algorithm — the device does not participate in the
+/// Metal width — split out so `Sampler::declared_stream_width` can advertise
+/// the same number without opening a device (`--capabilities` must not).
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::{streaming, Algorithm};
+///
+/// assert!(streaming::declared_stream_width(Algorithm::Sa) >= 1);
+/// ```
+#[must_use]
+pub fn declared_stream_width(algorithm: Algorithm) -> usize {
+    (batch_size_for_reads(algorithm, NOMINAL_READS) * 2).max(1)
+}
+
 /// `Sampler::stream_width`: how many models the backend keeps in flight.
 ///
 /// Sized from [`NOMINAL_READS`] because it is fixed at startup, before any job
@@ -156,7 +174,8 @@ fn scale_budget(nominal: usize, scale: f64) -> usize {
 ///
 /// The `_device` parameter is unused today (width is core-count driven via
 /// IOKit), but kept so the signature matches the harness and stays ready for
-/// per-device overrides.
+/// per-device overrides. Until such an override exists, this and
+/// [`declared_stream_width`] are the same number by construction.
 ///
 /// # Examples
 ///
@@ -171,7 +190,7 @@ fn scale_budget(nominal: usize, scale: f64) -> usize {
 /// # }
 /// ```
 pub fn stream_width(_device: &MetalDevice, algorithm: Algorithm) -> usize {
-    (batch_size_for_reads(algorithm, NOMINAL_READS) * 2).max(1)
+    declared_stream_width(algorithm)
 }
 
 /// Structural + sampling identity a single dispatch batches over: same topology
@@ -269,9 +288,9 @@ struct StreamCtx<'a> {
     algorithm: Algorithm,
     /// Utilization ceiling, external-load accounting, and dispatch backpressure.
     gov: &'a dyn GpuGovernor,
-    /// Reseed watermark: generations at or below it were abandoned by the
+    /// Reseed watermark: job watermarks at or below it were abandoned by the
     /// coordinator and must not consume GPU time.
-    cancel: &'a CancelGuard,
+    cancel: &'a CancelToken,
 }
 
 impl StreamCtx<'_> {
@@ -318,7 +337,7 @@ fn answer_empty(out: &Sender<StreamResult>, job: StreamJob) {
     }
 }
 
-/// Report a job abandoned because its generation was cancelled. Produces no
+/// Report a job abandoned because its watermark was cancelled. Produces no
 /// `Result` upstream — the harness only refunds its credit — so the pipeline
 /// keeps its depth for the live round.
 fn send_cancelled(out: &Sender<StreamResult>, job: StreamJob) {
@@ -334,11 +353,11 @@ fn send_cancelled(out: &Sender<StreamResult>, job: StreamJob) {
     }
 }
 
-fn send_reject(out: &Sender<StreamResult>, job: StreamJob, reason: RejectReason) {
+fn send_reject(out: &Sender<StreamResult>, job: StreamJob, err: SampleError) {
     if out
         .blocking_send(StreamResult {
             job_id: job.job_id,
-            outcome: StreamOutcome::Completed(Err(reason)),
+            outcome: StreamOutcome::Completed(Err(err)),
             device_access_time_us: 0,
         })
         .is_err()
@@ -361,10 +380,10 @@ fn next_seed(ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<StreamJob> {
             None if seed == Seed::Blocking => ctx.jobs.blocking_recv()?,
             None => ctx.jobs.try_recv().ok()?,
         };
-        // Drop abandoned generations before they reach the GPU: a reseed can
+        // Drop abandoned watermarks before they reach the GPU: a reseed can
         // leave a full prefetch window of stale nonces queued, and computing
         // them would burn a dispatch on work the coordinator has moved past.
-        if ctx.cancel.is_cancelled(job.generation) {
+        if ctx.cancel.is_cancelled(job.watermark) {
             send_cancelled(ctx.out, job);
             continue;
         }
@@ -373,7 +392,7 @@ fn next_seed(ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<StreamJob> {
             continue;
         }
         if job.graph.num_nodes() > algo_max_nodes(ctx.algorithm) {
-            send_reject(ctx.out, job, RejectReason::TooLarge);
+            send_reject(ctx.out, job, SampleError::Capacity);
             continue;
         }
         return Some(job);
@@ -403,10 +422,10 @@ fn fill_batch(
     let mut last_arrival = Instant::now();
     while matches.len() + already < cap && Instant::now() < hard_cap {
         match ctx.jobs.try_recv() {
-            Ok(job) if ctx.cancel.is_cancelled(job.generation) => send_cancelled(ctx.out, job),
+            Ok(job) if ctx.cancel.is_cancelled(job.watermark) => send_cancelled(ctx.out, job),
             Ok(job) if job.graph.num_nodes() == 0 => answer_empty(ctx.out, job),
             Ok(job) if job.graph.num_nodes() > algo_max_nodes(ctx.algorithm) => {
-                send_reject(ctx.out, job, RejectReason::TooLarge)
+                send_reject(ctx.out, job, SampleError::Capacity)
             }
             Ok(job) if key.matches(&job) => {
                 matches.push(job);
@@ -448,7 +467,7 @@ pub fn run_stream(
     mut jobs: Receiver<StreamJob>,
     out: &Sender<StreamResult>,
     gov: &dyn GpuGovernor,
-    cancel: &CancelGuard,
+    cancel: &CancelToken,
 ) {
     let mut pending: Option<StreamJob> = None;
     let mut ctx = StreamCtx {
@@ -530,10 +549,10 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
     // full dispatch of abandoned work. Re-check every job now that the batch is
     // final; once committed, the dispatch runs to completion (Metal offers no
     // mid-kernel abort).
-    if batch.iter().any(|j| ctx.cancel.is_cancelled(j.generation)) {
+    if batch.iter().any(|j| ctx.cancel.is_cancelled(j.watermark)) {
         let (live, stale): (Vec<StreamJob>, Vec<StreamJob>) = batch
             .into_iter()
-            .partition(|j| !ctx.cancel.is_cancelled(j.generation));
+            .partition(|j| !ctx.cancel.is_cancelled(j.watermark));
         for job in stale {
             send_cancelled(ctx.out, job);
         }
@@ -560,12 +579,12 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
             // Every job in a batch shares the encode inputs that can be
             // refused for size (`num_sweeps` is part of the batch key, and `N`
             // is pre-filtered by `next_seed`), so a capacity refusal applies to
-            // all of them alike — reject the batch with the reason the failure
-            // actually carries rather than a blanket `OVERLOADED`.
-            let reason = e.reject_reason();
-            tracing::error!(error = %e, ?reason, "metal batch encode failed");
+            // all of them alike — reject the batch with the condition the
+            // failure actually carries rather than a blanket `DeviceFault`.
+            let err = e.to_sample_error();
+            tracing::error!(error = %e, ?err, "metal batch encode failed");
             for job in batch {
-                send_reject(ctx.out, job, reason);
+                send_reject(ctx.out, job, err.clone());
             }
             None
         }
@@ -596,8 +615,16 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) -> u64 {
             chunks = encoded.chunk_count(),
             "metal batch command buffer did not complete"
         );
+        // A command buffer that did not complete (device reset, kernel fault,
+        // GPU watchdog timeout) is a state this backend will not recover from
+        // on its own — `DeviceFault`, not a transient per-job reject, so the
+        // session ends for a supervisor restart. Mirrors `sample_ising`'s
+        // identical check on the synchronous path.
+        let err = SampleError::DeviceFault(format!(
+            "metal command buffer did not complete: status {status:?}"
+        ));
         for job in jobs {
-            send_reject(out, job, RejectReason::Overloaded);
+            send_reject(out, job, err.clone());
         }
         // A failed batch still occupied the device; report it or the governor
         // would read the failure as idle time and size the next batch up.
@@ -612,8 +639,9 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) -> u64 {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "metal batch harvest failed");
+            let err = e.to_sample_error();
             for job in jobs {
-                send_reject(out, job, RejectReason::Overloaded);
+                send_reject(out, job, err.clone());
             }
             return device_access_time_us;
         }
@@ -643,7 +671,7 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) -> u64 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use quip_miner_core::SampleParams;
+    use quip_solver_core::SampleParams;
 
     fn params(num_reads: usize, num_sweeps: usize, sweeps_per_beta: usize) -> SampleParams {
         SampleParams {
@@ -666,7 +694,9 @@ mod tests {
             job_id: job_id.to_vec(),
             graph,
             params: params(num_reads, num_sweeps, sweeps_per_beta),
-            generation: 0,
+            // generation 0 maps to watermark None (never cancelled), the same
+            // rule `quip-solver-core`'s `prepare_job` applies on the real path.
+            watermark: None,
         }
     }
 
@@ -854,7 +884,7 @@ mod tests {
             pending: &mut pending,
             algorithm: Algorithm::Sa,
             gov: &NoGovernor,
-            cancel: &CancelGuard::default(),
+            cancel: &CancelToken::default(),
         };
         // Empty job is answered inline; channel then closes → None.
         assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
@@ -897,7 +927,7 @@ mod tests {
             pending: &mut pending,
             algorithm: Algorithm::Sa,
             gov: &NoGovernor,
-            cancel: &CancelGuard::default(),
+            cancel: &CancelToken::default(),
         };
         assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
 
@@ -908,9 +938,9 @@ mod tests {
         assert_eq!(r.job_id, b"huge");
         let is_too_large = matches!(
             r.outcome,
-            StreamOutcome::Completed(Err(RejectReason::TooLarge))
+            StreamOutcome::Completed(Err(SampleError::Capacity))
         );
-        assert!(is_too_large, "expected TooLarge, got unexpected reject/ok");
+        assert!(is_too_large, "expected Capacity, got unexpected reject/ok");
     }
 
     #[test]
@@ -924,7 +954,7 @@ mod tests {
             pending: &mut pending,
             algorithm: Algorithm::Sa,
             gov: &NoGovernor,
-            cancel: &CancelGuard::default(),
+            cancel: &CancelToken::default(),
         };
         assert!(next_seed(&mut ctx, Seed::NonBlocking).is_none());
     }
@@ -944,7 +974,7 @@ mod tests {
             pending: &mut pending,
             algorithm: Algorithm::Sa,
             gov: &NoGovernor,
-            cancel: &CancelGuard::default(),
+            cancel: &CancelToken::default(),
         };
         let Some(got) = next_seed(&mut ctx, Seed::Blocking) else {
             assert_eq!("got", "in-range seed job");

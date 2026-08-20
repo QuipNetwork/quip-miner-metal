@@ -6,11 +6,13 @@
 //!
 //! Requires a Metal device (Apple Silicon).
 
-use quip_miner_core::{CancelGuard, SampleParams, Sampler, StreamJob, StreamOutcome, StreamResult};
 use quip_miner_metal::iokit_gov::UtilGovernor;
 use quip_miner_metal::metal_device::MetalDevice;
 use quip_miner_metal::streaming::{run_stream, GpuGovernor};
 use quip_miner_metal::{Algorithm, IsingGraph, MetalSampler};
+use quip_solver_core::{
+    CancelToken, SampleParams, Sampler, StreamJob, StreamOutcome, StreamResult,
+};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
@@ -60,12 +62,17 @@ fn light_params(seed: u64) -> SampleParams {
     }
 }
 
+/// `generation` follows the coordinator's own vocabulary; it is converted to
+/// the harness's `watermark: Option<u64>` here with the same rule
+/// `quip-solver-core`'s `prepare_job` applies on the real path: `0` means the
+/// job can never be cancelled (`None`), any other value is a cancellable
+/// watermark (`Some`).
 fn make_job(job_id: &[u8], generation: u64, seed: u64) -> StreamJob {
     StreamJob {
         job_id: job_id.to_vec(),
         graph: ring4(),
         params: light_params(seed),
-        generation,
+        watermark: (generation != 0).then_some(generation),
     }
 }
 
@@ -95,7 +102,7 @@ fn spawn_stream(
     algorithm: Algorithm,
     jobs: Receiver<StreamJob>,
     out: Sender<StreamResult>,
-    cancel: CancelGuard,
+    cancel: CancelToken,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let device = open_device();
@@ -190,7 +197,7 @@ fn run_stream_batch_round_trip() {
     with_timeout(60, "run_stream_batch_round_trip", || {
         let (job_tx, job_rx) = tokio::sync::mpsc::channel(8);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(8);
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
 
         let worker = spawn_stream(Algorithm::Sa, job_rx, out_tx, cancel);
 
@@ -236,14 +243,14 @@ fn run_stream_batch_round_trip() {
     });
 }
 
-/// CancelGuard mid-stream: after a live job completes, cancel stale generations
+/// CancelToken mid-stream: after a live job completes, cancel stale generations
 /// and assert Cancelled vs Completed for subsequent jobs.
 #[test]
 fn run_stream_cancel_mid_stream() {
     with_timeout(60, "run_stream_cancel_mid_stream", || {
         let (job_tx, job_rx) = tokio::sync::mpsc::channel(8);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
         let cancel_worker = cancel.clone();
 
         let worker = spawn_stream(Algorithm::Sa, job_rx, out_tx, cancel_worker);
@@ -336,7 +343,7 @@ fn run_stream_exits_on_closed_empty_channel() {
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
         drop(job_tx); // close before any job arrives
 
-        let worker = spawn_stream(Algorithm::Sa, job_rx, out_tx, CancelGuard::default());
+        let worker = spawn_stream(Algorithm::Sa, job_rx, out_tx, CancelToken::default());
 
         let results = drain_results(out_rx, 20, "run_stream_exits_on_closed_empty_channel");
         join_with_timeout(worker, 10, "run_stream_exits_on_closed_empty_channel");

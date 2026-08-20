@@ -10,8 +10,9 @@ fallback. A non-macOS build fails while compiling the Apple-only dependencies.
 Build and run on Apple Silicon.
 
 Energies are scored on the host with the canonical
-`quip_protocol::scoring::energy_milli` so results match consensus; there is no
-GPU energy kernel (Metal Shading Language has no `double`).
+`quip_solver_core::quip_protocol::scoring::energy_milli` so results match
+consensus; there is no GPU energy kernel (Metal Shading Language has no
+`double`).
 
 ## Binaries
 
@@ -27,11 +28,12 @@ Prebuilt `arm64` binaries are attached to each
 ## Build
 
 ```sh
-cargo build --release        # needs protoc on PATH (protobuf-compiler)
+cargo build --release
 ```
 
-Shared protocol crates (`quip-proto`, `quip-protocol`, `quip-miner-core`) are
-git dependencies pinned to a `shared-vX.Y.Z` tag of `quip-protocol`.
+The solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) comes
+from crates.io at a pinned version, published from
+[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core).
 
 ## Running
 
@@ -65,7 +67,7 @@ cargo test --release
 ```
 
 Conformance/golden and handshake tests drive the binary in isolation via
-`quip-mock-coordinator` and check energies against
+`quip-solver-conformance`'s scripted driver and check energies against
 `conformance/golden_vectors.json`. The whole suite runs on a Mac with a Metal
 device; CI runs it on a macOS runner, which is the only configuration this
 crate builds in.
