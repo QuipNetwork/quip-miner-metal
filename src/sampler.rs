@@ -4,7 +4,8 @@
 //! `GPU/metal_gibbs.metal`, copied verbatim into `kernels/`): int8-quantized
 //! CSR, D-Wave incremental delta-energy SA / color-block Gibbs, bit-packed
 //! thread-local state, one thread per read. Solution energies are always
-//! scored on the host with [`quip_protocol::scoring::energy_milli`] (f64
+//! scored on the host with
+//! [`quip_solver_core::quip_protocol::scoring::energy_milli`] (f64
 //! consensus). There is no GPU energy kernel (MSL has no `double`).
 //!
 //! # Batched dispatch (throughput)
@@ -23,12 +24,12 @@
 //! committing; [`harvest_batch`] reads the bit-packed samples per problem. The
 //! synchronous [`sample_ising`] runs a single-problem batch and waits.
 
-use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
 
 use crate::topology::{fill_h_j, SelfFeedingTopology};
-use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-use quip_protocol::scoring::energy_milli;
+use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::quip_protocol::scoring::energy_milli;
 
 /// Failure from a Metal sample attempt: capacity refusal or driver fault.
 #[derive(Debug, Error)]
@@ -41,37 +42,44 @@ pub enum SampleError {
     Driver(String),
     /// The job exceeds a fixed capacity of this backend (kernel node cap,
     /// [`MAX_SWEEPS`]). Distinct from [`Self::Driver`] because it maps to a
-    /// different wire reason: `TOO_LARGE` tells the coordinator to route the
-    /// job elsewhere, while `OVERLOADED` reads as transient pressure and
-    /// invites a retry that would fail identically every time.
+    /// different harness condition: `Capacity` tells the coordinator to route
+    /// the job elsewhere, while [`Self::Driver`] and [`Self::Metal`] describe
+    /// the device itself, not this one job's size.
     #[error("job exceeds Metal backend capacity: {0}")]
     TooLarge(String),
 }
 
 impl SampleError {
-    /// Wire reject reason for this failure ("Servicing a job" in
-    /// `MINER_PROTOCOL.md`). Everything that is not a capacity refusal is
-    /// reported as `OVERLOADED`: the protocol has no reason code for
-    /// "backend permanently broken", so a kernel compile failure and a device
-    /// reset share it. Arms are listed explicitly so a new variant forces a
-    /// decision rather than silently inheriting `Overloaded`.
+    /// Map to the harness's device-condition report
+    /// ([`quip_solver_core::SampleError`], "Gotchas" in `MIGRATING.md`): a
+    /// capacity refusal maps to `Capacity`. Everything else here — a kernel
+    /// compile failure, a device reset, a GPU watchdog timeout, or an
+    /// internal invariant violation — is a state this backend will not
+    /// recover from without a restart, so it maps to `DeviceFault` rather
+    /// than `DeviceBusy`. Reporting these as transient load (`OVERLOADED`
+    /// pre-migration) is exactly the "wedged GPU forever" failure mode
+    /// `MIGRATING.md` warns against: `DeviceBusy` invites the coordinator to
+    /// keep sending jobs a broken device can never serve, where `DeviceFault`
+    /// ends the session for a supervisor restart. Arms are listed explicitly
+    /// so a new variant forces a decision rather than silently inheriting one.
     ///
     /// # Examples
     ///
     /// ```
     /// use quip_miner_metal::sampler::SampleError;
-    /// use quip_proto::v1::RejectReason;
+    /// use quip_solver_core::SampleError as HarnessSampleError;
     ///
     /// let err = SampleError::TooLarge("nodes > SA cap".into());
-    /// assert_eq!(err.reject_reason(), RejectReason::TooLarge);
+    /// assert_eq!(err.to_sample_error(), HarnessSampleError::Capacity);
     ///
     /// let err = SampleError::Driver("command buffer failed".into());
-    /// assert_eq!(err.reject_reason(), RejectReason::Overloaded);
+    /// assert!(matches!(err.to_sample_error(), HarnessSampleError::DeviceFault(_)));
     /// ```
-    pub fn reject_reason(&self) -> quip_proto::v1::RejectReason {
+    pub fn to_sample_error(&self) -> quip_solver_core::SampleError {
         match self {
-            Self::TooLarge(_) => quip_proto::v1::RejectReason::TooLarge,
-            Self::Driver(_) | Self::Metal(_) => quip_proto::v1::RejectReason::Overloaded,
+            Self::TooLarge(_) => quip_solver_core::SampleError::Capacity,
+            Self::Driver(msg) => quip_solver_core::SampleError::DeviceFault(msg.clone()),
+            Self::Metal(e) => quip_solver_core::SampleError::DeviceFault(e.to_string()),
         }
     }
 }
@@ -120,7 +128,7 @@ pub(crate) const GIBBS_MAX_NODES: usize = 4800;
 /// Largest `num_sweeps` a dispatch accepts.
 ///
 /// `num_sweeps` arrives from the coordinator and nothing upstream bounds it:
-/// `quip_miner_core`'s `pick_param` returns the job's value verbatim when
+/// `quip_solver_core`'s `pick_param` returns the job's value verbatim when
 /// non-zero, and unlike `num_reads` (rejected `TooLarge` against `max_reads`)
 /// there is no identity-const gate for it. Unbounded, it sizes the beta
 /// schedule — `geometric_beta_schedule` collects `num_sweeps / sweeps_per_beta`
@@ -128,7 +136,7 @@ pub(crate) const GIBBS_MAX_NODES: usize = 4800;
 /// many kernel sweeps, i.e. both an OOM and a GPU-watchdog denial of service.
 ///
 /// 65536 is 32x the `max_sweeps: 2048` in `METAL_ADAPT` (`lib.rs`).
-/// `quip-miner-core` doubles the resolved sweeps for Gibbs
+/// `quip-solver-core` doubles the resolved sweeps for Gibbs
 /// (`GIBBS_SWEEP_MULTIPLIER`), so the largest legitimate adapt-driven job
 /// reaching here is 4096 — 16x of headroom — while bounding the schedule to
 /// 64Ki `f64` + 64Ki `f32` (~768 KiB). Raise this only together with
@@ -929,13 +937,13 @@ pub(crate) fn harvest_batch(
 ///
 /// # Errors
 ///
-/// Returns [`SampleError::TooLarge`] (wire `TOO_LARGE`) when:
+/// Returns [`SampleError::TooLarge`] (harness `SampleError::Capacity`) when:
 /// - `graph.num_nodes()` exceeds the algorithm's kernel node cap
 ///   (`SA_MAX_NODES` / `GIBBS_MAX_NODES`);
 /// - `params.num_sweeps` exceeds `MAX_SWEEPS`, the sampler's guard against an
 ///   unbounded coordinator-supplied beta schedule.
 ///
-/// Returns [`SampleError::Driver`] (wire `OVERLOADED`) when:
+/// Returns [`SampleError::Driver`] (harness `SampleError::DeviceFault`) when:
 /// - the command buffer finished in a non-`Completed` state (device reset,
 ///   kernel fault, or GPU watchdog timeout) — the zeroed sample buffer would
 ///   otherwise score as a real all-`+1` solution;
@@ -1070,8 +1078,10 @@ mod tests {
     }
 
     /// Message of a capacity refusal, asserting the variant on the way — the
-    /// variant is what picks the wire reason (`TOO_LARGE`, not `OVERLOADED`),
-    /// so a size gate degrading to `Driver` is a protocol regression.
+    /// variant is what picks the harness condition (`Capacity`, not
+    /// `DeviceFault`), so a size gate degrading to `Driver` is a protocol
+    /// regression: `Capacity` is a per-job reject, `DeviceFault` ends the
+    /// session.
     fn too_large_msg(err: SampleError) -> String {
         match err {
             SampleError::TooLarge(m) => m,
@@ -1197,16 +1207,19 @@ mod tests {
     }
 
     #[test]
-    fn reject_reason_separates_capacity_refusals_from_device_failures() {
+    fn to_sample_error_separates_capacity_refusals_from_device_faults() {
         // A capacity refusal is permanent for this backend: the coordinator
         // must re-route, not retry here.
         assert_eq!(
-            SampleError::TooLarge("n".into()).reject_reason(),
-            quip_proto::v1::RejectReason::TooLarge
+            SampleError::TooLarge("n".into()).to_sample_error(),
+            quip_solver_core::SampleError::Capacity
         );
+        // A driver failure is a state this backend cannot recover from on its
+        // own — the session must end for a supervisor restart, not reject a
+        // job and keep accepting more work a wedged device can never serve.
         assert_eq!(
-            SampleError::Driver("device reset".into()).reject_reason(),
-            quip_proto::v1::RejectReason::Overloaded
+            SampleError::Driver("device reset".into()).to_sample_error(),
+            quip_solver_core::SampleError::DeviceFault("device reset".into())
         );
     }
 
@@ -1218,7 +1231,7 @@ mod tests {
 
     #[test]
     fn sweep_cap_clears_the_gibbs_doubled_adapt_maximum() {
-        // `METAL_ADAPT.max_sweeps` is 2048 and quip-miner-core doubles it for
+        // `METAL_ADAPT.max_sweeps` is 2048 and quip-solver-core doubles it for
         // Gibbs, so no legitimate adapt-driven job may be rejected. Update
         // this alongside `lib.rs` if either bound moves.
         let adapt_max_sweeps = 2048usize;

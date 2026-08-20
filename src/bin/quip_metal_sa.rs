@@ -6,8 +6,8 @@
 #![warn(clippy::expect_used)]
 
 use clap::Parser;
-use quip_miner_core::CommonArgs;
-use quip_miner_metal::{run_metal, Algorithm, METAL_SA_IDENTITY};
+use quip_miner_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
+use quip_solver_core::CommonArgs;
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -31,9 +31,8 @@ fn main() -> ExitCode {
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("metal-{}", cli.device));
     }
-    run_metal(
+    run_metal::<SaTag>(
         METAL_SA_IDENTITY,
-        Algorithm::Sa,
         &cli.common,
         cli.device,
         cli.utilization,

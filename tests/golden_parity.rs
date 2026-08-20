@@ -8,8 +8,8 @@
 use quip_miner_metal::metal_device::MetalDevice;
 use quip_miner_metal::sampler::sample_ising;
 use quip_miner_metal::{Algorithm, IsingGraph, SampleParams};
-use quip_protocol::scoring::energy_milli;
-use quip_protocol::wire::{decode_spins, encode_spins};
+use quip_solver_core::quip_protocol::scoring::energy_milli;
+use quip_solver_core::quip_protocol::wire::{decode_spins, encode_spins};
 use serde_json::Value;
 use std::fs;
 

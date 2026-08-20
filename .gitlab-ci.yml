@@ -21,9 +21,12 @@ cache:
     # `--no-modify-path` keeps rustup-init from appending `source $CARGO_HOME/env`
     # to the runner's shell profile. `CARGO_HOME` is inside the build directory,
     # so that line breaks every later login shell once the job is cleaned up.
+    #
+    # No `protoc` install: the solver contract crates (`quip-proto`,
+    # `quip-protocol`, `quip-solver-core`) come from crates.io with their
+    # generated stubs checked in, so this workspace runs no protobuf codegen.
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
-    - brew install protobuf
 
 # Lint, format and the full test suite, including the tests that need a real
 # GPU. The runner is a Mac with Metal, so nothing is skipped.
