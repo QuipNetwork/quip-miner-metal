@@ -3,26 +3,11 @@
 //!
 //! Metal GPU tests: needs a real device (Apple Silicon).
 
-use quip_solver_conformance::driver::{drive_miner, DriverReport, Terminal};
+use quip_solver_conformance::driver::{
+    drive_miner, DriverReport, Terminal, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER,
+};
 use quip_solver_core::quip_proto::v1::RejectReason;
 use std::process::Command;
-
-/// The sweep budget the driver's script configures via `Configure`
-/// (`CONFIGURED_SWEEPS` in quip-solver-conformance's driver.rs — the const
-/// is private there, so this mirrors it).
-const CONFIGURED_SWEEPS: u32 = 512;
-
-/// What a Gibbs miner's `SamplerMeta.sweeps` actually echoes.
-///
-/// quip-solver-core 0.0.0 doubles the resolved sweeps for a backend whose
-/// identity algorithm is `"gibbs"` (`GIBBS_SWEEP_MULTIPLIER` in its job.rs)
-/// and echoes the doubled value into `SamplerMeta`, while the conformance
-/// driver's `sweeps_honoured` axis expects the configured value verbatim.
-/// A Gibbs miner therefore cannot satisfy that axis (or the composite
-/// `is_conformant`) as published. The assertions below grade every axis
-/// individually and pin the doubled echo, so the test documents the real
-/// contract until upstream reconciles the driver with its own session.
-const GIBBS_META_SWEEPS: u32 = 2 * CONFIGURED_SWEEPS;
 
 /// The four jobs the driver expects a `Result` for, and the only four a
 /// conformant miner may answer with one.
@@ -30,11 +15,12 @@ const SOLVABLE_JOBS: [&[u8]; 4] = [b"job-1", b"job-2", b"job-hash", b"job-sparse
 
 /// Grade one driven session against every axis of the miner protocol.
 ///
-/// Per-axis assertions rather than the driver's composite `is_conformant()`:
-/// a bare composite failure says "not conformant" without saying which rule
-/// broke, and the composite's `sweeps_honoured` axis cannot pass for a Gibbs
-/// miner (see [`GIBBS_META_SWEEPS`]). `expected_meta_sweeps` is
-/// [`CONFIGURED_SWEEPS`] for SA and [`GIBBS_META_SWEEPS`] for Gibbs.
+/// Per-axis assertions ahead of the driver's composite `is_conformant()`: a
+/// bare composite failure says "not conformant" without saying which rule
+/// broke. `expected_meta_sweeps` states this test's own expectation —
+/// [`CONFIGURED_SWEEPS`] for SA, doubled for Gibbs — and is cross-checked
+/// against the driver's derivation so a miner advertising the wrong
+/// algorithm cannot make both sides agree by accident.
 fn assert_conformant(bin: &str, report: &DriverReport, expected_meta_sweeps: u32) {
     // Handshake: Hello -> Welcome -> Configure -> Ready (SPEC.md
     // "Handshake"). Dispatch stays blocked until `Ready`.
@@ -83,6 +69,12 @@ fn assert_conformant(bin: &str, report: &DriverReport, expected_meta_sweeps: u32
             r.job_id
         );
     }
+    assert_eq!(
+        report.expected_meta_sweeps(),
+        expected_meta_sweeps,
+        "{bin}: the driver derives a different sweep expectation from the \
+         advertised algorithm than this test states"
+    );
     assert!(
         report.energies_rescore_clean(),
         "{bin}: a reported energy did not survive the driver's re-score"
@@ -141,17 +133,13 @@ fn assert_conformant(bin: &str, report: &DriverReport, expected_meta_sweeps: u32
     );
     assert_eq!(report.exit_code, 0, "{bin}: clean shutdown expected");
 
-    // The reference composite verdict includes `sweeps_honoured`, which a
-    // Gibbs miner cannot satisfy (see [`GIBBS_META_SWEEPS`]), so it is only
-    // checked where it can pass. The per-axis assertions above cover every
-    // axis the composite grades.
-    if expected_meta_sweeps == CONFIGURED_SWEEPS {
-        assert!(
-            report.is_conformant(),
-            "{bin}: not conformant per the reference verdict:\n{}",
-            report.summary()
-        );
-    }
+    // The reference composite verdict. Algorithm-aware since
+    // quip-solver-conformance 0.0.1-rc1, so a Gibbs miner passes it too.
+    assert!(
+        report.is_conformant(),
+        "{bin}: not conformant per the reference verdict:\n{}",
+        report.summary()
+    );
 }
 
 /// Cross-package binary path (deps/ → profile/ → bin).
@@ -212,7 +200,11 @@ async fn quip_metal_gibbs_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    assert_conformant("quip-metal-gibbs", &report, GIBBS_META_SWEEPS);
+    assert_conformant(
+        "quip-metal-gibbs",
+        &report,
+        CONFIGURED_SWEEPS * GIBBS_SWEEP_MULTIPLIER,
+    );
 }
 
 #[test]
