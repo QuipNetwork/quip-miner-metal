@@ -16,10 +16,21 @@ int32_t quip_ane_create(
     const int8_t *fields, size_t field_count,
     void **program, char *error, size_t error_capacity);
 
+// Both handles must be live and on the same owning thread. Rebinds only the
+// neighbor input; each program keeps its own output shape and other surfaces.
+int32_t quip_ane_share_input(void *program, void *source, char *error, size_t error_capacity);
+
+#define QUIP_ANE_INPUT_FULL 0
+#define QUIP_ANE_INPUT_ROWS 1
+
 // program must be a live handle returned by create, used on its owning thread.
+// neighbors always has the full input shape. FULL uploads all entries and
+// requires no changed rows. ROWS uploads only the listed 128-lane rows, after
+// a successful full upload to the shared input. Unlisted entries are not read.
 int32_t quip_ane_evaluate(
     void *program,
     const int8_t *neighbors, size_t neighbor_count,
+    uint32_t input_mode, const size_t *changed_rows, size_t changed_row_count,
     const int8_t *spins, size_t spin_count,
     const uint8_t *thresholds, size_t threshold_count,
     int8_t *output, size_t output_count,

@@ -22,8 +22,8 @@ pub const ANE_MSA_IDENTITY: quip_solver_core::BackendIdentity = quip_solver_core
     max_edges: crate::graph::MAX_EDGES as u32,
     features: &["streaming"],
     adapt: quip_solver_core::adapt::AdaptBounds {
-        min_sweeps: 64,
-        max_sweeps: 256,
+        min_sweeps: 2048,
+        max_sweeps: 8192,
         min_reads: 128,
         max_reads: 128,
         reads_solution_min_factor: 0,
@@ -38,4 +38,17 @@ pub(crate) enum AneError {
     Capacity(String),
     #[error("{0}")]
     Runtime(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ANE_MSA_IDENTITY;
+    use quip_solver_core::adapt::adapt_params;
+
+    #[test]
+    fn adaptive_budget_matches_zero_field_advantage_topology() {
+        let adapted = adapt_params(-14_612_000, 1, 4_577, 41_514, &[0], &ANE_MSA_IDENTITY.adapt);
+        assert_eq!(adapted.num_sweeps, 8_049);
+        assert_eq!(adapted.num_reads, 128);
+    }
 }

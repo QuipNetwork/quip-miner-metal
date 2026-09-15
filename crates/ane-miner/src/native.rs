@@ -27,10 +27,19 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
+    fn quip_ane_share_input(
+        program: *mut c_void,
+        source: *mut c_void,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
     fn quip_ane_evaluate(
         program: *mut c_void,
         neighbors: *const i8,
         neighbor_count: usize,
+        input_mode: u32,
+        changed_rows: *const usize,
+        changed_row_count: usize,
         spins: *const i8,
         spin_count: usize,
         thresholds: *const u8,
@@ -43,6 +52,11 @@ unsafe extern "C" {
     ) -> i32;
     fn quip_ane_destroy(program: *mut c_void, error: *mut c_char, error_capacity: usize) -> i32;
     fn quip_ane_parent_pid() -> u32;
+}
+
+pub(crate) enum NeighborUpdate<'a> {
+    Full,
+    Rows(&'a [usize]),
 }
 
 pub(crate) struct AneProgram {
@@ -157,27 +171,85 @@ impl AneProgram {
         })
     }
 
+    pub(crate) fn share_input(&mut self, source: &Self) -> Result<(), AneError> {
+        if self.input_channels != source.input_channels {
+            return Err(AneError::Runtime(
+                "ANE shared input shape mismatch".to_owned(),
+            ));
+        }
+        let (Some(handle), Some(source)) = (self.handle, source.handle) else {
+            return Err(AneError::Runtime("ANE program is closed".to_owned()));
+        };
+        let mut error = [u8::MAX; ERROR_BYTES];
+        // SAFETY: Both handles are live and confined to this thread. Native
+        // code retains the shared input owner and rebinds only that input.
+        let status = unsafe {
+            quip_ane_share_input(
+                handle.as_ptr(),
+                source.as_ptr(),
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            return Err(AneError::Runtime(native_error(&error)));
+        }
+        Ok(())
+    }
+
     pub(crate) fn evaluate(
         &mut self,
         neighbors: &[i8],
         spins: &[i8],
         thresholds: &[u8],
     ) -> Result<(Vec<i8>, EvalTimes), AneError> {
+        let mut output = vec![0; self.output_channels * LANES];
+        let times = self.evaluate_into(
+            neighbors,
+            NeighborUpdate::Full,
+            spins,
+            thresholds,
+            &mut output,
+        )?;
+        Ok((output, times))
+    }
+
+    pub(crate) fn evaluate_into(
+        &mut self,
+        neighbors: &[i8],
+        update: NeighborUpdate<'_>,
+        spins: &[i8],
+        thresholds: &[u8],
+        output: &mut [i8],
+    ) -> Result<EvalTimes, AneError> {
         // These products and their FP16 allocation bounds were checked at creation.
         let input_count = self.input_channels * LANES;
         let output_count = self.output_channels * LANES;
         if neighbors.len() != input_count
             || spins.len() != output_count
             || thresholds.len() != output_count
+            || output.len() != output_count
         {
             return Err(AneError::Runtime(
                 "ANE evaluation slice length mismatch".to_owned(),
             ));
         }
+        let (input_mode, changed_rows) = match update {
+            NeighborUpdate::Full => (0, &[][..]),
+            NeighborUpdate::Rows(rows) => {
+                if rows.len() > self.input_channels
+                    || rows.iter().any(|&row| row >= self.input_channels)
+                {
+                    return Err(AneError::Runtime(
+                        "ANE changed rows outside input shape".to_owned(),
+                    ));
+                }
+                (1, rows)
+            }
+        };
         let handle = self
             .handle
             .ok_or_else(|| AneError::Runtime("ANE program is closed".to_owned()))?;
-        let mut output = vec![0; output_count];
         let mut times = EvalTimes::default();
         let mut error = [u8::MAX; ERROR_BYTES];
         // SAFETY: The owned handle is live and confined to one thread. Every
@@ -188,6 +260,9 @@ impl AneProgram {
                 handle.as_ptr(),
                 neighbors.as_ptr(),
                 neighbors.len(),
+                input_mode,
+                changed_rows.as_ptr(),
+                changed_rows.len(),
                 spins.as_ptr(),
                 spins.len(),
                 thresholds.as_ptr(),
@@ -202,7 +277,7 @@ impl AneProgram {
         if status != 0 {
             return Err(AneError::Runtime(native_error(&error)));
         }
-        Ok((output, times))
+        Ok(times)
     }
 
     pub(crate) fn close(mut self) -> Result<(), AneError> {
@@ -261,6 +336,219 @@ mod tests {
         assert!(AneProgram::compile(32, 32, &[0; 1024], &[0; 31]).is_err());
         assert!(AneProgram::compile(32, 32, &[2; 1024], &[0; 32]).is_err());
         assert!(AneProgram::compile(32, 32, &[0; 1024], &[2; 32]).is_err());
+    }
+
+    #[test]
+    fn changed_rows_reject_out_of_range_indices_before_runtime() {
+        let mut program = AneProgram {
+            input_channels: 32,
+            output_channels: 32,
+            handle: None,
+            _one_thread: PhantomData,
+        };
+        let mut output = vec![0; 32 * LANES];
+        for rows in [&[32][..], &[usize::MAX][..], &[0; 33][..]] {
+            let error = program
+                .evaluate_into(
+                    &[0; 32 * LANES],
+                    NeighborUpdate::Rows(rows),
+                    &[1; 32 * LANES],
+                    &[0; 32 * LANES],
+                    &mut output,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("changed rows"), "{error}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Apple Silicon ANE"]
+    fn hardware_shared_input_rows_and_owner_lifetime() {
+        let mut weights = vec![0; 32 * 32];
+        for channel in 0..32 {
+            weights[channel * 32 + channel] = 1;
+        }
+        let mut first = AneProgram::compile(32, 32, &weights, &[0; 32]).unwrap();
+        // Different output shapes must retain their own spin and output surfaces.
+        let mut second = AneProgram::compile(32, 64, &vec![0; 32 * 64], &[0; 64]).unwrap();
+        second.share_input(&first).unwrap();
+        let mut third = AneProgram::compile(32, 32, &weights, &[0; 32]).unwrap();
+        third.share_input(&second).unwrap();
+        let mut neighbors = vec![-1; 32 * LANES];
+        let spins = vec![1; 32 * LANES];
+        let thresholds = vec![0; 32 * LANES];
+        let mut output = vec![0; 32 * LANES];
+        assert!(third
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Rows(&[]),
+                &spins,
+                &thresholds,
+                &mut output
+            )
+            .is_err());
+        first
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Full,
+                &spins,
+                &thresholds,
+                &mut output,
+            )
+            .unwrap();
+        assert!(output.iter().all(|&spin| spin == 1));
+        let mut wide_output = vec![0; 64 * LANES];
+        second
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Rows(&[]),
+                &[1; 64 * LANES],
+                &[0; 64 * LANES],
+                &mut wide_output,
+            )
+            .unwrap();
+        assert!(wide_output.iter().all(|&spin| spin == -1));
+        first.close().unwrap();
+        second.close().unwrap();
+        neighbors[LANES..2 * LANES].fill(1);
+        // Unchanged host rows are not copied or validated during a row update.
+        neighbors[0] = 127;
+        third
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Rows(&[1]),
+                &spins,
+                &thresholds,
+                &mut output,
+            )
+            .unwrap();
+        assert!(output[..LANES].iter().all(|&spin| spin == 1));
+        assert!(output[LANES..2 * LANES].iter().all(|&spin| spin == -1));
+        assert!(output[2 * LANES..].iter().all(|&spin| spin == 1));
+        assert!(third
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Full,
+                &spins,
+                &thresholds,
+                &mut output
+            )
+            .is_err());
+        neighbors[LANES] = 22;
+        assert!(third
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Rows(&[1]),
+                &spins,
+                &thresholds,
+                &mut output
+            )
+            .is_err());
+        third
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Rows(&[]),
+                &spins,
+                &thresholds,
+                &mut output,
+            )
+            .unwrap();
+        assert!(output[LANES..2 * LANES].iter().all(|&spin| spin == -1));
+        third.close().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Apple Silicon ANE"]
+    fn hardware_native_changed_row_validation() {
+        let mut weights = vec![0; 32 * 32];
+        for channel in 0..32 {
+            weights[channel * 32 + channel] = 1;
+        }
+        let mut program = AneProgram::compile(32, 32, &weights, &[0; 32]).unwrap();
+        let mut other = AneProgram::compile(64, 32, &[0; 64 * 32], &[0; 32]).unwrap();
+        let mut error = [u8::MAX; ERROR_BYTES];
+        // SAFETY: Both handles are live. Different input shapes must be
+        // rejected before any request or surface is replaced.
+        let status = unsafe {
+            quip_ane_share_input(
+                other.handle.unwrap().as_ptr(),
+                program.handle.unwrap().as_ptr(),
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        };
+        assert_eq!(status, 1);
+        assert!(native_error(&error).contains("shape mismatch"));
+        assert!(other.share_input(&program).is_err());
+        other.close().unwrap();
+        let mut neighbors = vec![-1; 32 * LANES];
+        let spins = vec![1; 32 * LANES];
+        let thresholds = vec![0; 32 * LANES];
+        let mut output = vec![0; 32 * LANES];
+        program
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Full,
+                &spins,
+                &thresholds,
+                &mut output,
+            )
+            .unwrap();
+        neighbors[LANES..2 * LANES].fill(1);
+        let invalid_rows = [1, 32];
+        let excessive_rows = [0; 33];
+        let huge_row = [usize::MAX];
+        for (mode, rows, count, expected) in [
+            (1, std::ptr::null(), 1, "changed rows buffer"),
+            (1, excessive_rows.as_ptr(), 33, "changed rows buffer"),
+            (1, invalid_rows.as_ptr(), 2, "outside input shape"),
+            (1, huge_row.as_ptr(), 1, "outside input shape"),
+            (0, invalid_rows.as_ptr(), 1, "cannot specify changed rows"),
+            (2, std::ptr::null(), 0, "update mode"),
+        ] {
+            let mut times = EvalTimes::default();
+            error.fill(u8::MAX);
+            // SAFETY: All arrays are live with sufficient storage for their
+            // supplied counts. Invalid row metadata must fail before staging
+            // or indexing the neighbor array. Output and error are writable.
+            let status = unsafe {
+                quip_ane_evaluate(
+                    program.handle.unwrap().as_ptr(),
+                    neighbors.as_ptr(),
+                    neighbors.len(),
+                    mode,
+                    rows,
+                    count,
+                    spins.as_ptr(),
+                    spins.len(),
+                    thresholds.as_ptr(),
+                    thresholds.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &mut times,
+                    error.as_mut_ptr().cast(),
+                    error.len(),
+                )
+            };
+            assert_eq!(status, 1);
+            assert!(
+                native_error(&error).contains(expected),
+                "{}",
+                native_error(&error)
+            );
+        }
+        // Even a valid row preceding an invalid index must not have been staged.
+        program
+            .evaluate_into(
+                &neighbors,
+                NeighborUpdate::Rows(&[]),
+                &spins,
+                &thresholds,
+                &mut output,
+            )
+            .unwrap();
+        assert!(output.iter().all(|&spin| spin == 1));
+        program.close().unwrap();
     }
 
     #[test]
@@ -336,6 +624,19 @@ mod tests {
             assert!(handle.is_null());
             assert!(error.contains(&0));
         }
+        let mut share_error = [u8::MAX; ERROR_BYTES];
+        // SAFETY: Null handles are rejected before dereference and the error
+        // buffer is writable for the supplied capacity.
+        let status = unsafe {
+            quip_ane_share_input(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                share_error.as_mut_ptr().cast(),
+                share_error.len(),
+            )
+        };
+        assert_eq!(status, 1);
+        assert!(native_error(&share_error).contains("Missing ANE sharing handle"));
         let mut error = [u8::MAX; 1];
         // SAFETY: A missing handle is explicitly rejected without dereference;
         // the one-byte error buffer is writable and tests bounded termination.
@@ -475,6 +776,9 @@ mod tests {
                     handle,
                     neighbors.as_ptr(),
                     neighbors.len() - 1,
+                    0,
+                    std::ptr::null(),
+                    0,
                     spins.as_ptr(),
                     spins.len(),
                     thresholds.as_ptr(),
@@ -494,6 +798,9 @@ mod tests {
                     handle,
                     neighbors.as_ptr(),
                     neighbors.len(),
+                    0,
+                    std::ptr::null(),
+                    0,
                     std::ptr::null(),
                     spins.len(),
                     thresholds.as_ptr(),

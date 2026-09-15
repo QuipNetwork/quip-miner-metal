@@ -76,12 +76,26 @@ static uint64_t monotonicUS(void) {
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
 }
 
+@interface QuipAneInput : NSObject {
+@public
+    IOSurfaceRef surface;
+    BOOL initialized;
+}
+@end
+
+@implementation QuipAneInput
+- (void)dealloc {
+    if (surface != NULL) CFRelease(surface);
+}
+@end
+
 @interface QuipAneProgram : NSObject {
 @public
     size_t inputElements;
     size_t outputElements;
-    IOSurfaceRef surfaces[4];
+    IOSurfaceRef surfaces[3];
 }
+@property(nonatomic, strong) QuipAneInput *input;
 @property(nonatomic, strong) id model;
 @property(nonatomic, strong) id request;
 @property(nonatomic, strong) NSArray *wrappers;
@@ -121,7 +135,7 @@ static uint64_t monotonicUS(void) {
     _request = nil;
     _wrappers = nil;
     _model = nil;
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < 3; ++i) {
         if (surfaces[i] != NULL) CFRelease(surfaces[i]);
     }
 }
@@ -291,12 +305,19 @@ int32_t quip_ane_create(size_t input_channels, size_t output_channels,
             if (![result.model loadWithQoS:21 options:@{} error:&nativeError]) return fail(error, error_capacity, describe(@"Load ANE program", nativeError));
             result.loaded = YES;
             if (![result removeDirectory:&nativeError]) return fail(error, error_capacity, describe(@"Remove ANE staging directory", nativeError));
+            result.input = [QuipAneInput new];
+            result.input->surface = makeSurface(inputElements);
+            if (result.input->surface == NULL) return fail(error, error_capacity, @"ANE input IOSurface allocation failed");
             NSMutableArray *wrappers = [NSMutableArray arrayWithCapacity:4];
             for (size_t i = 0; i < 4; ++i) {
-                result->surfaces[i] = makeSurface(i == 0 ? inputElements : outputElements);
-                if (result->surfaces[i] == NULL) return fail(error, error_capacity, @"ANE IOSurface allocation failed");
+                IOSurfaceRef surface = result.input->surface;
+                if (i != 0) {
+                    surface = makeSurface(outputElements);
+                    result->surfaces[i - 1] = surface;
+                }
+                if (surface == NULL) return fail(error, error_capacity, @"ANE IOSurface allocation failed");
                 requireSelector(surfaceClass, @selector(objectWithIOSurface:));
-                id wrapper = [surfaceClass objectWithIOSurface:result->surfaces[i]];
+                id wrapper = [surfaceClass objectWithIOSurface:surface];
                 if (wrapper == nil) return fail(error, error_capacity, @"ANE IOSurface wrapping failed");
                 [wrappers addObject:wrapper];
             }
@@ -314,7 +335,39 @@ int32_t quip_ane_create(size_t input_channels, size_t output_channels,
     }
 }
 
-static BOOL stageSurface(IOSurfaceRef surface, const void *values, size_t count, BOOL unsignedValues, NSString **error) {
+int32_t quip_ane_share_input(void *program, void *source, char *error, size_t error_capacity) {
+    @autoreleasepool {
+        @try {
+            if (error == NULL || error_capacity == 0) return 1;
+            error[0] = '\0';
+            if (program == NULL || source == NULL) return fail(error, error_capacity, @"Missing ANE sharing handle");
+            QuipAneProgram *owned = (__bridge QuipAneProgram *)program;
+            QuipAneProgram *shared = (__bridge QuipAneProgram *)source;
+            if (!owned.loaded || !shared.loaded || owned->inputElements != shared->inputElements) {
+                return fail(error, error_capacity, @"ANE shared input shape mismatch or unloaded program");
+            }
+            NSMutableArray *wrappers = [owned.wrappers mutableCopy];
+            wrappers[0] = shared.wrappers[0];
+            Class requestClass = NSClassFromString(@"_ANERequest");
+            requireSelector(requestClass, @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:));
+            id request = [requestClass requestWithInputs:[wrappers subarrayWithRange:NSMakeRange(0, 3)]
+                inputIndices:@[@0, @1, @2] outputs:@[wrappers[3]] outputIndices:@[@0]
+                weightsBuffer:nil perfStats:nil procedureIndex:@0];
+            if (request == nil) return fail(error, error_capacity, @"ANE shared input request creation failed");
+            // Keep the old surface alive until its request and wrappers are gone.
+            // The shared owner releases its one IOSurface reference at last use.
+            owned.request = request;
+            owned.wrappers = wrappers;
+            owned.input = shared.input;
+            return 0;
+        } @catch (NSException *exception) {
+            return fail(error, error_capacity, [NSString stringWithFormat:@"ANE share input exception: %@", exception.reason]);
+        }
+    }
+}
+
+static BOOL stageSurface(IOSurfaceRef surface, const void *values, size_t count, BOOL unsignedValues,
+                         const size_t *rows, size_t rowCount, NSString **error) {
     IOReturn status = IOSurfaceLock(surface, 0, NULL);
     if (status != kIOReturnSuccess) {
         *error = [NSString stringWithFormat:@"ANE input lock failed: %d", status];
@@ -327,8 +380,17 @@ static BOOL stageSurface(IOSurfaceRef surface, const void *values, size_t count,
             *error = @"ANE input IOSurface has no base address";
             valid = NO;
         } else {
-            for (size_t i = 0; i < count; ++i) {
-                destination[i] = unsignedValues ? (_Float16)((const uint8_t *)values)[i] : (_Float16)((const int8_t *)values)[i];
+            if (rows != NULL) {
+                for (size_t row = 0; row < rowCount; ++row) {
+                    size_t start = rows[row] * 128;
+                    for (size_t i = start; i < start + 128; ++i) {
+                        destination[i] = (_Float16)((const int8_t *)values)[i];
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < count; ++i) {
+                    destination[i] = unsignedValues ? (_Float16)((const uint8_t *)values)[i] : (_Float16)((const int8_t *)values)[i];
+                }
             }
         }
     } @finally {
@@ -342,7 +404,9 @@ static BOOL stageSurface(IOSurfaceRef surface, const void *values, size_t count,
 }
 
 int32_t quip_ane_evaluate(void *program,
-    const int8_t *neighbors, size_t neighbor_count, const int8_t *spins, size_t spin_count,
+    const int8_t *neighbors, size_t neighbor_count,
+    uint32_t input_mode, const size_t *changed_rows, size_t changed_row_count,
+    const int8_t *spins, size_t spin_count,
     const uint8_t *thresholds, size_t threshold_count, int8_t *output, size_t output_count,
     QuipAneTimes *times, char *error, size_t error_capacity) {
     @autoreleasepool {
@@ -359,17 +423,42 @@ int32_t quip_ane_evaluate(void *program,
                 return fail(error, error_capacity, @"Invalid ANE evaluation dimensions or unloaded program");
             }
             uint64_t stagingStart = monotonicUS();
-            for (size_t i = 0; i < neighbor_count; ++i) {
-                if (neighbors[i] < -21 || neighbors[i] > 21) return fail(error, error_capacity, @"ANE neighbor outside [-21, 21]");
+            if (input_mode == QUIP_ANE_INPUT_FULL) {
+                if (changed_row_count != 0) return fail(error, error_capacity, @"Full ANE input cannot specify changed rows");
+                for (size_t i = 0; i < neighbor_count; ++i) {
+                    if (neighbors[i] < -21 || neighbors[i] > 21) return fail(error, error_capacity, @"ANE neighbor outside [-21, 21]");
+                }
+            } else if (input_mode == QUIP_ANE_INPUT_ROWS) {
+                if (!owned.input->initialized) return fail(error, error_capacity, @"ANE shared input requires a full upload");
+                if (changed_row_count > owned->inputElements / 128 || (changed_row_count != 0 && changed_rows == NULL)) {
+                    return fail(error, error_capacity, @"Invalid ANE changed rows buffer");
+                }
+                for (size_t row = 0; row < changed_row_count; ++row) {
+                    if (changed_rows[row] >= owned->inputElements / 128) return fail(error, error_capacity, @"ANE changed row outside input shape");
+                    size_t start = changed_rows[row] * 128;
+                    for (size_t i = start; i < start + 128; ++i) {
+                        if (neighbors[i] < -21 || neighbors[i] > 21) return fail(error, error_capacity, @"ANE changed neighbor outside [-21, 21]");
+                    }
+                }
+            } else {
+                return fail(error, error_capacity, @"Invalid ANE input update mode");
             }
             for (size_t i = 0; i < spin_count; ++i) {
                 if (spins[i] != -1 && spins[i] != 1) return fail(error, error_capacity, @"ANE own spin must be -1 or +1");
                 if (thresholds[i] > 63) return fail(error, error_capacity, @"ANE threshold exceeds 63");
             }
             NSString *stagingError = nil;
-            if (!stageSurface(owned->surfaces[0], neighbors, neighbor_count, NO, &stagingError) ||
-                !stageSurface(owned->surfaces[1], spins, spin_count, NO, &stagingError) ||
-                !stageSurface(owned->surfaces[2], thresholds, threshold_count, YES, &stagingError)) {
+            if (input_mode == QUIP_ANE_INPUT_FULL || changed_row_count != 0) {
+                // Any failed write requires a new full upload before reuse.
+                owned.input->initialized = NO;
+                if (!stageSurface(owned.input->surface, neighbors, neighbor_count, NO,
+                    input_mode == QUIP_ANE_INPUT_ROWS ? changed_rows : NULL, changed_row_count, &stagingError)) {
+                    return fail(error, error_capacity, stagingError);
+                }
+                owned.input->initialized = YES;
+            }
+            if (!stageSurface(owned->surfaces[0], spins, spin_count, NO, NULL, 0, &stagingError) ||
+                !stageSurface(owned->surfaces[1], thresholds, threshold_count, YES, NULL, 0, &stagingError)) {
                 return fail(error, error_capacity, stagingError);
             }
             times->staging_us = monotonicUS() - stagingStart;
@@ -379,11 +468,11 @@ int32_t quip_ane_evaluate(void *program,
             BOOL completed = [owned.model evaluateWithQoS:21 options:@{} request:owned.request error:&nativeError];
             times->dispatch_us = monotonicUS() - dispatchStart;
             if (!completed) return fail(error, error_capacity, describe(@"Evaluate ANE program", nativeError));
-            IOReturn status = IOSurfaceLock(owned->surfaces[3], kIOSurfaceLockReadOnly, NULL);
+            IOReturn status = IOSurfaceLock(owned->surfaces[2], kIOSurfaceLockReadOnly, NULL);
             if (status != kIOReturnSuccess) return fail(error, error_capacity, [NSString stringWithFormat:@"ANE output lock failed: %d", status]);
             NSString *outputError = nil;
             @try {
-                const _Float16 *source = IOSurfaceGetBaseAddress(owned->surfaces[3]);
+                const _Float16 *source = IOSurfaceGetBaseAddress(owned->surfaces[2]);
                 if (source == NULL) {
                     outputError = @"ANE output IOSurface has no base address";
                 } else {
@@ -396,7 +485,7 @@ int32_t quip_ane_evaluate(void *program,
                     }
                 }
             } @finally {
-                status = IOSurfaceUnlock(owned->surfaces[3], kIOSurfaceLockReadOnly, NULL);
+                status = IOSurfaceUnlock(owned->surfaces[2], kIOSurfaceLockReadOnly, NULL);
                 if (status != kIOReturnSuccess) outputError = [NSString stringWithFormat:@"ANE output unlock failed: %d", status];
             }
             if (outputError != nil) return fail(error, error_capacity, outputError);

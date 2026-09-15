@@ -139,10 +139,10 @@ fn cuts(beta: f64) -> [u64; 64] {
 }
 
 fn draw_threshold(cut: &[u64; 64], uniform: u32) -> u8 {
-    (1..=63)
-        .rev()
-        .find(|&m| u64::from(uniform) < cut[m])
-        .map_or(0, |m| m as u8)
+    // Largest m in 1..=63 with uniform < cut[m], else 0. cut is monotone
+    // non-increasing, so the predicate is a prefix of cut[1..].
+    let uniform = u64::from(uniform);
+    cut[1..].partition_point(|&cutoff| uniform < cutoff) as u8
 }
 
 /// SplitMix64 reference implementation: <https://prng.di.unimi.it/splitmix64.c>.
@@ -196,6 +196,60 @@ mod tests {
             let at = u32::try_from(cut[m]).unwrap();
             assert!(draw_threshold(&cut, below) >= m as u8, "m={m}");
             assert!(draw_threshold(&cut, at) < m as u8, "m={m}");
+        }
+    }
+
+    #[test]
+    fn threshold_binary_search_matches_former_reverse_scan() {
+        fn former(cut: &[u64; 64], uniform: u32) -> u8 {
+            (1..=63)
+                .rev()
+                .find(|&m| u64::from(uniform) < cut[m])
+                .map_or(0, |m| m as u8)
+        }
+
+        let mut tables: Vec<[u64; 64]> = [
+            0.0, 0.01, 0.05, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 10.0, 1_000.0,
+        ]
+        .into_iter()
+        .map(cuts)
+        .collect();
+
+        tables.push([1u64 << 32; 64]);
+
+        let mut none_accept = [0u64; 64];
+        none_accept[0] = 1u64 << 32;
+        tables.push(none_accept);
+
+        let mut plateau = [0u64; 64];
+        plateau[0] = 1u64 << 32;
+        plateau[1..=20].fill(1_000);
+        plateau[21..=40].fill(500);
+        tables.push(plateau);
+
+        for cut in &tables {
+            let mut uniforms = vec![0, 1, u32::MAX / 2, u32::MAX];
+            for cutoff in cut.iter().copied().skip(1) {
+                let Ok(at) = u32::try_from(cutoff) else {
+                    continue;
+                };
+                uniforms.push(at);
+                if at > 0 {
+                    uniforms.push(at - 1);
+                }
+                if at < u32::MAX {
+                    uniforms.push(at + 1);
+                }
+            }
+            for uniform in uniforms {
+                assert_eq!(
+                    draw_threshold(cut, uniform),
+                    former(cut, uniform),
+                    "cut[1]={} cut[63]={} u={uniform}",
+                    cut[1],
+                    cut[63]
+                );
+            }
         }
     }
 

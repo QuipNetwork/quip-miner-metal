@@ -5,7 +5,7 @@ use quip_solver_core::{IsingGraph, SampleParams};
 
 use crate::graph::{prepare, PreparedGraph, LANES};
 use crate::msa::{initial_spins, schedule, validate_params, ThresholdRows};
-use crate::native::AneProgram;
+use crate::native::{AneProgram, NeighborUpdate};
 use crate::AneError;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -51,24 +51,28 @@ pub(crate) fn solve_in_process(
         });
     }
 
-    let mut programs = Vec::with_capacity(prepared.tiles.len());
+    let mut programs: Vec<AneProgram> = Vec::with_capacity(prepared.tiles.len());
     for tile in &prepared.tiles {
         let weights = prepared.tile_weights(tile)?;
         let mut fields = vec![0; tile.output_channels];
         for (row, &node) in tile.nodes.iter().enumerate() {
             fields[row] = prepared.fields[node];
         }
-        programs.push(AneProgram::compile(
+        let mut program = AneProgram::compile(
             prepared.input_channels,
             tile.output_channels,
             &weights,
             &fields,
-        )?);
+        )?;
+        if let Some(first) = programs.first() {
+            program.share_input(first)?;
+        }
+        programs.push(program);
     }
     stats.programs = u32::try_from(programs.len())
         .map_err(|_| AneError::Runtime("ANE program count exceeds u32".into()))?;
+    let mut buffers = TileBuffers::new(&prepared);
     stats.setup_us = elapsed_us(setup_started.elapsed())?;
-
     let anneal_started = Instant::now();
     let mut rows = ThresholdRows::new(params.seed);
     for (rung_index, rung) in rungs.iter().enumerate() {
@@ -83,6 +87,7 @@ pub(crate) fn solve_in_process(
                     &mut state,
                     &thresholds,
                     &mut stats,
+                    &mut buffers,
                 )?;
             }
         }
@@ -110,13 +115,38 @@ fn read_major_spins(state: &[i8], nodes: usize, reads: usize) -> Vec<Vec<i8>> {
         .collect()
 }
 
-pub(crate) fn advance_color(
+struct TileBuffers {
+    own: Vec<i8>,
+    selected: Vec<u8>,
+    output: Vec<i8>,
+    previous_tile: Option<usize>,
+}
+
+impl TileBuffers {
+    fn new(prepared: &PreparedGraph) -> Self {
+        let count = prepared
+            .tiles
+            .iter()
+            .map(|tile| tile.output_channels * LANES)
+            .max()
+            .unwrap_or(0);
+        Self {
+            own: vec![1; count],
+            selected: vec![0; count],
+            output: vec![0; count],
+            previous_tile: None,
+        }
+    }
+}
+
+fn advance_color(
     prepared: &PreparedGraph,
     programs: &mut [AneProgram],
     color: usize,
     state: &mut [i8],
     thresholds: &[u8],
     stats: &mut RunStats,
+    buffers: &mut TileBuffers,
 ) -> Result<(), AneError> {
     if programs.len() != prepared.tiles.len() {
         return Err(AneError::Runtime(
@@ -131,21 +161,30 @@ pub(crate) fn advance_color(
         ));
     }
 
-    for (tile, program) in prepared
+    for (tile_index, (tile, program)) in prepared
         .tiles
         .iter()
         .zip(programs)
-        .filter(|(tile, _)| tile.color == color)
+        .enumerate()
+        .filter(|(_, (tile, _))| tile.color == color)
     {
-        let mut own = vec![1; tile.output_channels * LANES];
-        let mut selected = vec![0; tile.output_channels * LANES];
+        let count = tile.output_channels * LANES;
+        let own = &mut buffers.own[..count];
+        let selected = &mut buffers.selected[..count];
+        let output = &mut buffers.output[..count];
+        own.fill(1);
+        selected.fill(0);
         for (row, &node) in tile.nodes.iter().enumerate() {
             own[row * LANES..(row + 1) * LANES]
                 .copy_from_slice(&state[node * LANES..(node + 1) * LANES]);
             selected[row * LANES..(row + 1) * LANES]
                 .copy_from_slice(&thresholds[node * LANES..(node + 1) * LANES]);
         }
-        let (output, times) = program.evaluate(state, &own, &selected)?;
+        let update = match buffers.previous_tile {
+            None => NeighborUpdate::Full,
+            Some(previous) => NeighborUpdate::Rows(&prepared.tiles[previous].nodes),
+        };
+        let times = program.evaluate_into(state, update, own, selected, output)?;
         stats.dispatches += 1;
         stats.staging_us += times.staging_us;
         stats.dispatch_us += times.dispatch_us;
@@ -153,6 +192,7 @@ pub(crate) fn advance_color(
             state[node * LANES..(node + 1) * LANES]
                 .copy_from_slice(&output[row * LANES..(row + 1) * LANES]);
         }
+        buffers.previous_tile = Some(tile_index);
     }
     Ok(())
 }
@@ -161,7 +201,7 @@ pub(crate) fn advance_color(
 mod tests {
     use std::time::Instant;
 
-    use super::{advance_color, solve_in_process, RunOutput, RunStats};
+    use super::{advance_color, solve_in_process, RunOutput, RunStats, TileBuffers};
     use crate::graph::{prepare, LANES};
     use crate::msa::{initial_spins, schedule, ThresholdRows};
     use crate::native::AneProgram;
@@ -178,7 +218,7 @@ mod tests {
     }
 
     fn compile_programs(prepared: &crate::graph::PreparedGraph) -> Vec<AneProgram> {
-        prepared
+        let mut programs: Vec<AneProgram> = prepared
             .tiles
             .iter()
             .map(|tile| {
@@ -195,7 +235,13 @@ mod tests {
                 )
                 .unwrap()
             })
-            .collect()
+            .collect();
+        if let Some((first, rest)) = programs.split_first_mut() {
+            for program in rest {
+                program.share_input(first).unwrap();
+            }
+        }
+        programs
     }
 
     fn oracle_color(
@@ -292,6 +338,7 @@ mod tests {
         let setup_started = Instant::now();
         let prepared = prepare(graph).unwrap();
         let mut programs = compile_programs(&prepared);
+        let mut buffers = TileBuffers::new(&prepared);
         let mut state = initial_spins(prepared.node_count, params.seed);
         state.resize(prepared.input_channels * LANES, 0);
         let mut stats = RunStats {
@@ -315,6 +362,7 @@ mod tests {
                         &mut state,
                         &thresholds,
                         &mut stats,
+                        &mut buffers,
                     )
                     .unwrap();
                     mismatches += state
@@ -412,19 +460,8 @@ mod tests {
     fn hardware_colors_observe_prior_updates() {
         let graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 1)]);
         let prepared = prepare(&graph).unwrap();
-        let mut programs = Vec::new();
-        for tile in &prepared.tiles {
-            let weights = prepared.tile_weights(tile).unwrap();
-            programs.push(
-                AneProgram::compile(
-                    prepared.input_channels,
-                    tile.output_channels,
-                    &weights,
-                    &vec![0; tile.output_channels],
-                )
-                .unwrap(),
-            );
-        }
+        let mut programs = compile_programs(&prepared);
+        let mut buffers = TileBuffers::new(&prepared);
         let mut state = vec![0; prepared.input_channels * LANES];
         state[..2 * LANES].fill(1);
         let thresholds = vec![0; 2 * LANES];
@@ -436,6 +473,7 @@ mod tests {
             &mut state,
             &thresholds,
             &mut stats,
+            &mut buffers,
         )
         .unwrap();
         advance_color(
@@ -445,6 +483,7 @@ mod tests {
             &mut state,
             &thresholds,
             &mut stats,
+            &mut buffers,
         )
         .unwrap();
         assert!(state[..LANES].iter().all(|&spin| spin == -1));

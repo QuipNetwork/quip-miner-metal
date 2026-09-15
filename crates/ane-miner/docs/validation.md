@@ -1,12 +1,9 @@
 # Validation
 
 This file records Apple Neural Engine (ANE) multi-spin simulated annealing results.
-The worktree started from commit `e465a035a71882351b4f49c10370619dc34dd42c`.
-That commit is the fork point. It does not contain this miner.
-This tree holds the miner source. Git has not committed that source.
-
-This file does not rerun the exhaustive, capacity, or lifetime suites.
-The measured results stay in the sections below.
+The first standalone version is commit `7c2b1b2`.
+The earlier measurements remain below.
+The sweep redesign has a separate section with new release measurements.
 
 ## Host and tools
 
@@ -343,6 +340,114 @@ The parent logged `coefficient must be -1, 0, or 1` before each reject.
 The supported-fixture gate does not change that stock incompatibility.
 This miner does not accept fractional coefficients.
 It does not claim unrestricted coordinator compatibility.
+
+## Sweep redesign, September 15, 2026
+
+These changes start from merge commit `4ec7ed8746ce5bcd41b2c5e5584cc9d2dba8dbc8`.
+Programs share one neighbor input surface and upload changed rows after the first dispatch.
+Tile buffers persist across sweeps.
+Threshold draws use binary search with the same cutoff comparisons and random streams.
+
+The adaptive range changes from 64–256 to 2,048–8,192 sweeps, with 128 reads.
+The hard cap remains 65,536 sweeps.
+A zero-field target of `-14612` on 4,577 nodes and 41,514 edges selects 8,049 sweeps.
+The new regression test first failed with the old result of 251 sweeps.
+Explicit job and target overrides keep their precedence.
+The configured sweep count remains a fallback after adaptation.
+
+### Release checks
+
+All commands use the same package and release output directory:
+
+```sh
+cargo test --manifest-path crates/ane-miner/Cargo.toml --target-dir target --locked --release
+cargo test --manifest-path crates/ane-miner/Cargo.toml --target-dir target --locked --release --lib native::tests:: -- --include-ignored --test-threads=1
+cargo test --manifest-path crates/ane-miner/Cargo.toml --target-dir target --locked --release --lib solver::tests:: -- --include-ignored --test-threads=1
+cargo test --manifest-path crates/ane-miner/Cargo.toml --target-dir target --locked --release --lib process::tests::hardware_ -- --ignored --skip hardware_64_jobs_use_distinct_children_and_match_oracle --test-threads=1
+cargo test --manifest-path crates/ane-miner/Cargo.toml --target-dir target --locked --release --test protocol -- --ignored --test-threads=1
+cargo clippy --manifest-path crates/ane-miner/Cargo.toml --target-dir target --locked --release --all-targets --all-features -- -D warnings
+```
+
+| Check | Result |
+| --- | --- |
+| Ordinary library tests | 52 passed, 20 hardware tests ignored |
+| Ordinary command-line tests | 4 passed, 4 hardware tests ignored |
+| Native tests, including hardware | 14 passed |
+| Solver tests, including hardware | 9 passed |
+| Selected worker hardware tests | 3 passed |
+| Hardware protocol tests | 4 passed |
+| Clippy, formatting, and diff whitespace | pass |
+
+The native and solver totals include host tests from the ordinary run.
+The exhaustive native check covered 32,384 integer acceptance cases with zero mismatches.
+Shared surface tests covered owner lifetime and different output shapes.
+Row update tests checked changed data and invalid row metadata.
+Capacity tests passed at 6,016, 8,192, and 16,384 nodes.
+Final states and each checked color matched the CPU oracle.
+
+The selected process tests used a local symlink from their fixed debug path to the release executable.
+A 16,384-node job with 65,536 requested sweeps stopped after 62.8 milliseconds when cancellation began at 50 milliseconds.
+The parent reaped the child and removed its temporary directory.
+Closing the output channel also stopped the worker and removed its directory.
+The protocol check covered live cancellation and credit refunds.
+
+### Controlled mining replay
+
+The saved live problem has 4,577 variables, 41,514 edges, zero fields, and unit signed couplings.
+Each run returned 128 states.
+An independent scorer checked every returned energy using the original graph.
+The local mining process did not run during these new measurements.
+
+Binary `SHA-256` hashes:
+
+```text
+Before: fb24ec381f618de275032841d03788df1b4ccd22b748905e901f5849c76c7a6e
+After:  5c93e4f688a008910e2695d0c64fbf09544632266ad7bd230572a1f4ff8f68e1
+```
+
+Three paired runs used 1,024 sweeps and consecutive seeds starting at `3302488336868276095`.
+The order was before/after, after/before, then before/after.
+
+| Seed offset | Before, seconds | After, seconds | Lowest energy |
+| --- | ---: | ---: | ---: |
+| 10 | 10.0506 | 7.6401 | -14322 |
+| 11 | 9.9765 | 7.5924 | -14328 |
+| 12 | 11.2235 | 8.6062 | -14336 |
+
+Each pair produced byte-identical JSON.
+Every spin and energy matched.
+The median paired speed ratio was 1.314, or 23.9% less elapsed time.
+Comparisons at 251 and 4,096 sweeps also produced byte-identical JSON.
+
+The following new-binary runs use seed `3302488336868276085`:
+
+| Sweeps | Whole-process seconds | Lowest energy | Median energy | States at or below `-14612` |
+| ---: | ---: | ---: | ---: | ---: |
+| 251 | 2.2387 | -14226 | -14122 | 0 |
+| 4096 | 28.3303 | -14378 | -14324 | 0 |
+| 8049 | 55.1571 | -14386 | -14344 | 0 |
+
+The 8,049-sweep run made 64,392 dispatches through eight color programs.
+It spent 0.308 seconds in setup, 19.677 seconds staging data, and 11.032 seconds in device dispatch.
+Total annealing time was 54.714 seconds, including host work outside those counters.
+More sweeps improved this job, but no returned state reached the target.
+These measurements do not establish a qualifying rate across mining jobs.
+
+### Comparison with the reference miner
+
+[MR 27](https://gitlab.com/quip.network/quip-miner-cuda/-/merge_requests/27) sets the `CUDA` miner to 7,392–29,568 adaptive sweeps and 128 reads.
+The same target and topology select 29,053 sweeps there.
+Both implementations use ordered color updates and Metropolis acceptance.
+
+Source inspection points to a benchmark mismatch in [MR 26](https://gitlab.com/quip.network/quip-miner-cuda/-/merge_requests/26).
+The default benchmark preset permits fields in `{-1, 0, 1}` and has 41,515 edges.
+The captured live problem has zero fields and 41,514 edges.
+The MR does not publish the full command and raw records needed to reconstruct all 24 benchmark jobs.
+Its absolute energy values do not establish quality for this live problem.
+
+Same-problem comparisons with Metal and CPU solvers showed similar energy distributions at matched sweep counts.
+All returned energies passed independent scoring.
+This evidence does not identify an ANE-specific Metropolis or scoring defect.
 
 ## Follow-up work
 

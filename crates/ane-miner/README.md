@@ -1,4 +1,4 @@
-# quip-ane-msa
+# `quip-ane-msa`
 
 `quip-ane-msa` is a standalone Apple Neural Engine (ANE) miner.
 It runs multi-spin simulated annealing for protocol 1.
@@ -105,6 +105,25 @@ That stock driver cannot pass for this miner.
 The crate protocol suite uses a local test-only coordinator.
 It still scores the session with public `DriverReport::is_conformant` checks.
 
+### Mining sweep budget
+
+Mining sessions use 128 reads and 2,048 to 8,192 sweeps.
+The target energy determines the sweep count within those bounds.
+Failed attempts do not increase the count.
+A zero-field job with 4,577 nodes, 41,514 edges, and target `-14612` selects 8,049 sweeps.
+The hard cap remains 65,536 sweeps.
+
+An explicit job count takes precedence over the target count.
+An explicit target count takes precedence over the adaptive count.
+The miner `num_sweeps` setting is a fallback when no target supplies an adaptive count.
+Changing `[metal].num_sweeps` alone does not override a normal mining target.
+Use `--solve` with an explicit `num_sweeps` to compare budgets on the same problem.
+
+More sweeps give each read a longer search.
+Some jobs still miss their energy target.
+
+### Protocol tests
+
 Run ordinary protocol tests in debug:
 
 ```sh
@@ -160,6 +179,11 @@ The parent keeps the coordinator connection.
 It starts one child process per job.
 The parent scores returned spins with the consensus scorer.
 
+The worker shares one neighbor input surface across its color programs.
+It uploads the full initial spin state once.
+Later updates upload only the rows changed by the prior tile.
+The worker reuses tile buffers throughout the anneal.
+
 ## Memory
 
 Each program carries a dense FP16 weight matrix.
@@ -172,7 +196,7 @@ Those caps bound dense weight bytes.
 They are not a total ANE memory budget.
 Measured peak resident set size belongs to the test process.
 It excludes separate runtime and driver allocations.
-IOSurface buffers add neighbor, spin, threshold, and output surfaces.
+IOSurface buffers add one shared neighbor surface and per-program spin, threshold, and output surfaces.
 Those surfaces align to 65,536 bytes.
 
 ## Follow-up work
