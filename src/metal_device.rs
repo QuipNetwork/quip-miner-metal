@@ -1,4 +1,4 @@
-//! Metal device + runtime-compiled SA/Gibbs pipelines for one Apple GPU.
+//! Metal device + runtime-compiled SA / Gibbs / multi-spin pipelines for one Apple GPU.
 //!
 //! One process owns one device (`[metal.N]` → device N / miner id `metal-N`).
 //! Kernels are JIT-compiled from `.metal` source via
@@ -22,6 +22,9 @@ use thiserror::Error;
 
 const SA_SRC: &str = include_str!("../kernels/sa.metal");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.metal");
+
+/// Multi-spin coded SA, see `kernels/msa.metal`.
+const MSA_SRC: &str = include_str!("../kernels/msa.metal");
 
 /// Failure opening a Metal device or compiling its SA/Gibbs pipelines.
 #[derive(Debug, Error)]
@@ -62,10 +65,18 @@ pub struct MetalDevice {
     /// split the nodes of each color, `threadgroup`-shared state. Same buffer
     /// layout as `gibbs`, different dispatch geometry.
     pub(crate) gibbs_parallel: ComputePipelineState,
+    /// Multi-spin coded SA: one threadgroup per (problem, 32-replica word),
+    /// threads split each colour class, spin words in `threadgroup` memory.
+    /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "host dispatch of msa_anneal is a later change")
+    )]
+    pub(crate) msa: ComputePipelineState,
 }
 
 impl MetalDevice {
-    /// Open device `device_index` and compile both SA and Gibbs kernels.
+    /// Open device `device_index` and compile the SA, Gibbs and multi-spin kernels.
     ///
     /// Indexing: `Device::all()` order. Index 0 is typically the system
     /// default (Apple Silicon integrated GPU). Higher indices map into
@@ -104,6 +115,7 @@ impl MetalDevice {
         let sa = compile_pipeline(&device, SA_SRC, "pure_simulated_annealing")?;
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
         let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
+        let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
         let queue = device.new_command_queue();
 
         Ok(Self {
@@ -113,6 +125,7 @@ impl MetalDevice {
             sa,
             gibbs,
             gibbs_parallel,
+            msa,
         })
     }
 
@@ -235,5 +248,28 @@ mod tests {
             return;
         }
         MetalDevice::check(0).unwrap();
+    }
+
+    #[test]
+    fn msa_pipeline_compiles_and_admits_256_threads() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = MetalDevice::open(0).unwrap();
+        // The host dispatches 256 threads per multi-spin threadgroup; a
+        // pipeline that admits fewer would silently shrink every colour class
+        // stride and break the persistent-RNG layout.
+        assert!(dev.msa.max_total_threads_per_threadgroup() >= 256);
+        // Static threadgroup arrays (row + cut) must leave room for the
+        // largest advertised N at 4 bytes per spin under the 32 KB cap.
+        let static_bytes = dev.msa.static_threadgroup_memory_length() as usize;
+        assert!(
+            static_bytes <= 8192 + 64 * 4 + 64,
+            "static tg bytes {static_bytes}"
+        );
+        assert!(
+            static_bytes + 6016 * 4 <= dev.device.max_threadgroup_memory_length() as usize,
+            "6016 spins do not fit beside {static_bytes} static bytes"
+        );
     }
 }
