@@ -68,10 +68,6 @@ pub struct MetalDevice {
     /// Multi-spin coded SA: one threadgroup per (problem, 32-replica word),
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "host dispatch of msa_anneal is a later change")
-    )]
     pub(crate) msa: ComputePipelineState,
 }
 

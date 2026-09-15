@@ -38,6 +38,9 @@ pub enum Kernel {
     /// Metropolis simulated annealing, one thread per read
     /// (`kernels/sa.metal`, `pure_simulated_annealing`).
     Sa,
+    /// Multi-spin coded simulated annealing: 32 replicas per `uint` word, one
+    /// threadgroup per (problem, word) (`kernels/msa.metal`, `msa_anneal`).
+    Msa,
     /// Chromatic heat-bath Gibbs, one threadgroup per sample
     /// (`kernels/gibbs.metal`, `block_gibbs_parallel` / `block_gibbs_sampler`).
     Gibbs,
@@ -141,6 +144,42 @@ pub(crate) const SA_MAX_NODES: usize = 4593;
 /// Single source of truth with the identity const, as for [`SA_MAX_NODES`].
 pub(crate) const GIBBS_MAX_NODES: usize = 4800;
 
+/// Replicas per 32-bit word in `kernels/msa.metal`.
+///
+/// Equal to [`SIMD_WIDTH`], so [`simd_rounded_reads`] always yields whole
+/// words and `words = num_reads / MSA_LANES` is exact.
+pub(crate) const MSA_LANES: usize = 32;
+const _: () = assert!(
+    MSA_LANES == SIMD_WIDTH,
+    "simd_rounded_reads must produce whole 32-lane multi-spin words"
+);
+/// Threads per multi-spin threadgroup: they split each colour class's nodes.
+/// Also the per-threadgroup RNG stream count the persistent buffer is sized by.
+const MSA_THREADS: usize = 256;
+/// Static threadgroup bytes `msa_anneal` declares: an 8192-byte threshold row
+/// plus 64 `uint` cut values. `msa_pipeline_compiles_and_admits_256_threads`
+/// in `metal_device.rs` pins the compiled figure to this constant.
+const MSA_STATIC_TG_BYTES: usize = 8192 + 64 * 4;
+/// Threadgroup memory every Apple GPU family offers per threadgroup, bytes.
+/// There is no opt-in above it (CUDA's `MAX_DYNAMIC_SHARED_SIZE_BYTES` has no
+/// counterpart), which is why the kernel uses 32-bit words: one `u64` per
+/// spin does not fit Advantage2's 4577 spins.
+const APPLE_TG_MEMORY_BYTES: usize = 32 * 1024;
+/// Multi-spin kernel `N` cap: `N * 4` bytes of spin words must fit beside the
+/// static arrays under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 8448 = 32,512).
+///
+/// `crate::METAL_MSA_IDENTITY` advertises this same cap, so the identity
+/// const and the dispatch guard have one source.
+pub(crate) const MSA_MAX_NODES: usize = 6016;
+const _: () = assert!(
+    MSA_MAX_NODES * 4 + MSA_STATIC_TG_BYTES <= APPLE_TG_MEMORY_BYTES,
+    "MSA_MAX_NODES spin words must fit in Apple threadgroup memory"
+);
+/// Largest CSR degree the kernel's unrolled 20-neighbour prefetch admits.
+/// Zephyr (Advantage2) is degree 20. A nonzero field is a 21st input, which
+/// the kernel's `popcount21` covers.
+pub(crate) const MSA_MAX_DEG: usize = 20;
+
 /// Largest `num_sweeps` a dispatch accepts.
 ///
 /// `num_sweeps` arrives from the coordinator and nothing upstream bounds it:
@@ -231,12 +270,28 @@ const GIBBS_UPDATES_PER_SEC: f64 = 1.2e9;
 /// which the aggregate rate above does not separate out.
 const GIBBS_THROUGHPUT_SAFETY: f64 = 0.7;
 
-/// Expected spin-updates per second for a dispatch of `groups` threadgroups.
+/// Multi-spin word-update rate, word-updates/s. One word update advances 32
+/// replicas of one spin: 21 threadgroup loads, a 21-input carry-save tree,
+/// and one store.
+///
+/// Not yet measured. 0.2e9 is a tenth of SA's saturated spin-update rate,
+/// chosen pessimistic so the first chunks cannot approach the watchdog. The
+/// benchmark in `tests/msa_bench.rs` replaces it with a measured value.
+const MSA_WORD_UPDATES_PER_SEC: f64 = 0.2e9;
+/// See [`SA_THROUGHPUT_SAFETY`].
+const MSA_THROUGHPUT_SAFETY: f64 = 0.7;
+
+/// Expected updates per second for a dispatch of `groups` threadgroups: spin
+/// updates for SA and Gibbs, word updates (32 replicas each) for the
+/// multi-spin kernel.
 ///
 /// Below the first measured point the curve is extrapolated linearly toward the
 /// origin (a nearly-empty GPU really is proportionally slow); above the last it
 /// is held flat, since throughput has saturated by then.
 fn estimated_updates_per_sec(kernel: Kernel, groups: usize) -> f64 {
+    if kernel == Kernel::Msa {
+        return MSA_WORD_UPDATES_PER_SEC * MSA_THROUGHPUT_SAFETY;
+    }
     if kernel == Kernel::Gibbs {
         return GIBBS_UPDATES_PER_SEC * GIBBS_THROUGHPUT_SAFETY;
     }
@@ -321,6 +376,7 @@ pub(crate) fn gibbs_node_parallel() -> bool {
 pub(crate) fn kernel_max_nodes(kernel: Kernel) -> usize {
     match kernel {
         Kernel::Sa => SA_MAX_NODES,
+        Kernel::Msa => MSA_MAX_NODES,
         Kernel::Gibbs => GIBBS_MAX_NODES,
     }
 }
@@ -531,6 +587,24 @@ struct DispatchBuffers {
     energies: metal::Buffer,
 }
 
+/// Largest CSR row length `SelfFeedingTopology::build` would produce for
+/// `graph`: an out-of-range endpoint skips the edge and a self-loop counts
+/// once, the same rules the builder applies.
+fn max_csr_degree(graph: &IsingGraph) -> usize {
+    let n = graph.num_nodes();
+    let mut degree = vec![0usize; n];
+    for &(u, v) in &graph.edges {
+        if u >= n || v >= n {
+            continue;
+        }
+        degree[u] += 1;
+        if u != v {
+            degree[v] += 1;
+        }
+    }
+    degree.into_iter().max().unwrap_or(0)
+}
+
 /// Validate a batch's shared inputs, returning the establishing graph and `N`.
 ///
 /// Split out of [`encode_batch`] so both rejections are reachable without a
@@ -556,6 +630,18 @@ fn validate_batch<'a>(
         return Err(SampleError::TooLarge(format!(
             "graph N={n} exceeds {kernel:?} kernel limit {cap}"
         )));
+    }
+    if kernel == Kernel::Msa {
+        // The kernel unrolls a fixed 20-neighbour prefetch; a denser node
+        // would read past it. Capacity, not a driver fault: the coordinator
+        // routes the job to a backend that walks CSR rows of any length.
+        let max_deg = max_csr_degree(first);
+        if max_deg > MSA_MAX_DEG {
+            return Err(SampleError::TooLarge(format!(
+                "graph max degree {max_deg} exceeds the multi-spin kernel's \
+                 {MSA_MAX_DEG}-neighbour budget"
+            )));
+        }
     }
     if params.num_sweeps > MAX_SWEEPS {
         // No defense in depth here: nothing upstream bounds `num_sweeps` at
@@ -692,11 +778,58 @@ fn new_gibbs_persistent(
     }
 }
 
-/// Bind Gibbs's chunk window and carry-over state.
-///
-/// Indices start at 21 because the colour-block buffers already occupy 16..20 —
-/// the one place Gibbs's layout diverges from SA's.
-fn bind_gibbs_chunk(
+/// Multi-spin carry-over state: one `uint` word per (threadgroup, spin) plus
+/// one xoshiro128** stream (four `uint`) per (threadgroup, thread). The
+/// threshold row is rebuilt at every rung and the sweep offsets are hashed
+/// from their coordinates, so nothing else survives a chunk boundary.
+fn new_msa_persistent(
+    device: &crate::metal_device::MetalDevice,
+    num_streams: usize,
+    n: usize,
+    threads_per_group: usize,
+) -> [metal::Buffer; 2] {
+    const RNG_BYTES_PER_STREAM: usize = 16;
+    [
+        device.new_zeroed_buffer((num_streams * n.max(1) * 4) as u64),
+        device.new_zeroed_buffer(
+            (num_streams * threads_per_group.max(1) * RNG_BYTES_PER_STREAM) as u64,
+        ),
+    ]
+}
+
+/// Per-kernel encode state: the carry-over buffers every chunk binds, plus
+/// what the colour-block kernels need at bind time. Replaces the pair of
+/// `Option`s the loop used to match on.
+enum KernelEncode {
+    Sa {
+        persist: [metal::Buffer; 4],
+    },
+    Gibbs {
+        persist: [metal::Buffer; 2],
+    },
+    Msa {
+        persist: [metal::Buffer; 2],
+        /// Words per problem, bound at slot 19.
+        words: i32,
+        /// Bytes of `threadgroup uint state[N]` at threadgroup index 0,
+        /// rounded up to Metal's 16-byte granularity.
+        state_bytes: u64,
+    },
+}
+
+impl KernelEncode {
+    fn into_keep(self) -> Vec<metal::Buffer> {
+        match self {
+            Self::Sa { persist } => persist.into(),
+            Self::Gibbs { persist } | Self::Msa { persist, .. } => persist.into(),
+        }
+    }
+}
+
+/// Bind the chunk window and carry-over state of a colour-block kernel (Gibbs
+/// or multi-spin). Indices start at 21 because the colour-block bindings
+/// occupy 16..20.
+fn bind_color_kernel_chunk(
     enc: &metal::ComputeCommandEncoderRef,
     persist: &[metal::Buffer; 2],
     beta_start: i32,
@@ -728,15 +861,19 @@ fn bind_sa_chunk(
     enc.set_buffer(21, Some(&persist[3]), 0);
 }
 
-/// Gibbs-only color-block buffers (indices 16..20).
+/// Colour-block buffers (indices 16..18) and the two scalars after them, shared
+/// by the Gibbs and multi-spin kernels.
 ///
-/// Color blocks are shared across the batch (same topology → same coloring);
-/// the kernel indexes them globally, not per problem.
-fn encode_gibbs_buffers(
+/// Colour blocks are shared across the batch (same topology → same coloring);
+/// the kernel indexes them globally, not per problem. `slot19` is
+/// `update_mode` for Gibbs (0 = heat-bath) and `words` for the multi-spin
+/// kernel; slot 20 is `num_colors` for both.
+fn encode_color_buffers(
     device: &crate::metal_device::MetalDevice,
     enc: &metal::ComputeCommandEncoderRef,
     topo: &SelfFeedingTopology,
     keep: &mut Vec<metal::Buffer>,
+    slot19: i32,
 ) {
     let starts = pad_i32(&topo.colors.starts);
     let counts = pad_i32(&topo.colors.counts);
@@ -747,7 +884,7 @@ fn encode_gibbs_buffers(
     enc.set_buffer(16, Some(&d_cstart), 0);
     enc.set_buffer(17, Some(&d_ccount), 0);
     enc.set_buffer(18, Some(&d_cnodes), 0);
-    set_bytes_i32(enc, 19, 0); // update_mode = heat-bath Gibbs
+    set_bytes_i32(enc, 19, slot19);
     set_bytes_i32(enc, 20, topo.colors.num_colors);
     keep.extend([d_cstart, d_ccount, d_cnodes]);
 }
@@ -757,19 +894,31 @@ fn encode_gibbs_buffers(
 /// `graphs` must be non-empty and share a topology (same `N` and `edges`) — the
 /// caller ([`crate::streaming`]) guarantees this by batch key; the topology is
 /// built from `graphs[0]`. `params` (reads, sweeps, beta) is shared across the
-/// batch, matching v0.2 (`compute_beta_schedule(h[0], J[0], ...)`). Dispatches
-/// `dispatchThreadgroups(num_problems, num_reads)`.
+/// batch, matching v0.2 (`compute_beta_schedule(h[0], J[0], ...)`).
 pub(crate) fn encode_batch(
     device: &crate::metal_device::MetalDevice,
     graphs: &[&IsingGraph],
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<EncodedBatch, SampleError> {
+    encode_batch_inner(device, graphs, params, kernel, None)
+}
+
+/// [`encode_batch`] with an optional chunk-plan override, so a test can split
+/// one anneal at chosen rung boundaries and compare it with the unsplit run.
+/// Production passes `None` and lets [`chunk_plan`] decide.
+fn encode_batch_inner(
+    device: &crate::metal_device::MetalDevice,
+    graphs: &[&IsingGraph],
+    params: &SampleParams,
+    kernel: Kernel,
+    plan_override: Option<&[(i32, i32)]>,
+) -> Result<EncodedBatch, SampleError> {
     let (first, n) = validate_batch(graphs, params, kernel)?;
 
     let num_problems = graphs.len();
     let num_reads = simd_rounded_reads(params.num_reads);
-    let num_threads = num_problems * num_reads;
+    let num_samples = num_problems * num_reads;
     let packed_size = n.div_ceil(8).max(1);
 
     let (beta, sweeps_per) = build_beta_schedule(
@@ -778,6 +927,48 @@ pub(crate) fn encode_batch(
         params.sweeps_per_beta,
         params.beta_range,
     );
+
+    // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
+    // only the dispatch geometry below differs.
+    let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
+    let pipeline = match kernel {
+        Kernel::Sa => &device.sa,
+        Kernel::Msa => &device.msa,
+        Kernel::Gibbs if node_parallel => &device.gibbs_parallel,
+        Kernel::Gibbs => &device.gibbs,
+    };
+
+    // Dispatch geometry is constant across a batch's chunks, and must be: the
+    // chromatic and multi-spin kernels' RNG stream identity is
+    // `(threadgroup, thread_in_group)`, so varying the threadgroup width
+    // mid-anneal would resume the wrong streams.
+    //
+    // Sequential kernels: one threadgroup per problem, `num_reads` threads (one
+    // per read) each — `problem_id = thread_id / num_reads` = the threadgroup
+    // index, so a model maps to a core and its reads are the threads inside.
+    //
+    // Chromatic Gibbs: one threadgroup per *sample* (`sample_id =
+    // problem*num_reads + read`), and its threads split each color's nodes. The
+    // group is capped at 256 by the kernel's `threadgroup int
+    // partial_energies[256]` reduction array.
+    //
+    // Multi-spin: one threadgroup per (problem, 32-replica word), `words`
+    // threadgroups per problem, 256 threads splitting each colour class.
+    let words = num_reads.div_ceil(MSA_LANES);
+    let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
+    let (groups, threads_per_group) = match kernel {
+        Kernel::Msa => (num_problems * words, MSA_THREADS.min(max_threads).max(1)),
+        Kernel::Gibbs if node_parallel => (num_samples, 256.min(max_threads).max(1)),
+        Kernel::Sa | Kernel::Gibbs => (num_problems, num_reads),
+    };
+    // `buffer(12)`: threads for SA / sequential Gibbs (one per read),
+    // threadgroups for chromatic Gibbs and multi-spin. Also the count
+    // `chunk_plan` multiplies: spin updates per thread, or word updates per
+    // threadgroup.
+    let num_threads = match kernel {
+        Kernel::Msa => groups,
+        Kernel::Sa | Kernel::Gibbs => num_samples,
+    };
     let dims = BatchDims {
         n,
         num_betas: beta.len() as i32,
@@ -789,24 +980,45 @@ pub(crate) fn encode_batch(
         packed_size,
     };
 
+    // The multi-spin kernel's spin words live in threadgroup memory sized per
+    // dispatch. Refuse a job the opened device cannot hold rather than let
+    // Metal fail the command buffer, which would end the session as a
+    // DeviceFault for a per-job size problem.
+    let state_bytes = (n.max(1) * 4).div_ceil(16) * 16;
+    if kernel == Kernel::Msa {
+        let need = state_bytes + MSA_STATIC_TG_BYTES;
+        let have = device.device.max_threadgroup_memory_length() as usize;
+        if need > have {
+            return Err(SampleError::TooLarge(format!(
+                "graph N={n} needs {need} B of threadgroup memory; device offers {have} B"
+            )));
+        }
+    }
+
     let topo = SelfFeedingTopology::build(first);
     let inputs = upload_inputs(device, &topo, graphs);
     let out = DispatchBuffers {
         beta: device.new_buffer_from_slice(&beta),
-        samples: device.new_zeroed_buffer((num_threads * packed_size) as u64),
-        energies: device.new_zeroed_buffer((num_threads * 4) as u64), // i32
+        samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
+        energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
     };
 
-    // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
-    // only the dispatch geometry below differs.
-    let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
-    // Gibbs colour-block buffers are recreated per chunk today; Gibbs runs a
-    // single chunk until its kernel gains a resume entry point.
-    let mut gibbs_keep: Vec<metal::Buffer> = Vec::new();
-    let pipeline = match kernel {
-        Kernel::Sa => &device.sa,
-        Kernel::Gibbs if node_parallel => &device.gibbs_parallel,
-        Kernel::Gibbs => &device.gibbs,
+    let plan = match plan_override {
+        Some(p) => p.to_vec(),
+        None => chunk_plan(kernel, &dims, groups),
+    };
+    let kstate = match kernel {
+        Kernel::Sa => KernelEncode::Sa {
+            persist: new_sa_persistent(device, &dims),
+        },
+        Kernel::Gibbs => KernelEncode::Gibbs {
+            persist: new_gibbs_persistent(device, &dims, node_parallel, threads_per_group),
+        },
+        Kernel::Msa => KernelEncode::Msa {
+            persist: new_msa_persistent(device, groups, n, threads_per_group),
+            words: words as i32,
+            state_bytes: state_bytes as u64,
+        },
     };
 
     // One command buffer per chunk of the beta schedule. Splitting here rather
@@ -814,45 +1026,30 @@ pub(crate) fn encode_batch(
     // watchdog measures a *command buffer*, and the driver can only preempt
     // between them, so a single buffer holding every dispatch would be exactly
     // as dangerous as the unchunked version.
-    // Dispatch geometry is constant across a batch's chunks, and must be: the
-    // chromatic kernel's RNG stream identity is `(sample, thread_in_group)`, so
-    // varying the threadgroup width mid-anneal would resume the wrong streams.
-    //
-    // Sequential kernels: one threadgroup per problem, `num_reads` threads (one
-    // per read) each — `problem_id = thread_id / num_reads` = the threadgroup
-    // index, so a model maps to a core and its reads are the threads inside.
-    //
-    // Chromatic Gibbs: one threadgroup per *sample* (`sample_id =
-    // problem*num_reads + read`), and its threads split each color's nodes. The
-    // group is capped at 256 by the kernel's `threadgroup int
-    // partial_energies[256]` reduction array.
-    let (groups, threads_per_group) = if node_parallel {
-        let t = 256
-            .min(pipeline.max_total_threads_per_threadgroup() as usize)
-            .max(1);
-        (num_threads, t) // num_threads == num_problems * num_reads == samples
-    } else {
-        (num_problems, num_reads)
-    };
-
-    let plan = chunk_plan(kernel, &dims, groups);
-    let sa_persist = (kernel == Kernel::Sa).then(|| new_sa_persistent(device, &dims));
-    let gibbs_persist = (kernel == Kernel::Gibbs)
-        .then(|| new_gibbs_persistent(device, &dims, node_parallel, threads_per_group));
-
+    let mut color_keep: Vec<metal::Buffer> = Vec::new();
     let mut cmds = Vec::with_capacity(plan.len());
     for (beta_start, beta_count) in plan {
         let cmd = device.queue.new_command_buffer().to_owned();
         let encoder = cmd.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         bind_shared_args(encoder, &inputs, &out, &dims);
-        match (&sa_persist, &gibbs_persist) {
-            (Some(persist), _) => bind_sa_chunk(encoder, persist, beta_start, beta_count),
-            (_, Some(persist)) => {
-                encode_gibbs_buffers(device, encoder, &topo, &mut gibbs_keep);
-                bind_gibbs_chunk(encoder, persist, beta_start, beta_count);
+        match &kstate {
+            KernelEncode::Sa { persist } => {
+                bind_sa_chunk(encoder, persist, beta_start, beta_count);
             }
-            _ => {}
+            KernelEncode::Gibbs { persist } => {
+                encode_color_buffers(device, encoder, &topo, &mut color_keep, 0);
+                bind_color_kernel_chunk(encoder, persist, beta_start, beta_count);
+            }
+            KernelEncode::Msa {
+                persist,
+                words,
+                state_bytes,
+            } => {
+                encode_color_buffers(device, encoder, &topo, &mut color_keep, *words);
+                bind_color_kernel_chunk(encoder, persist, beta_start, beta_count);
+                encoder.set_threadgroup_memory_length(0, *state_bytes);
+            }
         }
         encoder.dispatch_thread_groups(mtl_size_1d(groups), mtl_size_1d(threads_per_group));
         encoder.end_encoding();
@@ -874,13 +1071,8 @@ pub(crate) fn encode_batch(
     } = out;
     let mut keep = inputs.into_keep();
     keep.extend([beta, energies]);
-    keep.append(&mut gibbs_keep);
-    if let Some(persist) = sa_persist {
-        keep.extend(persist);
-    }
-    if let Some(persist) = gibbs_persist {
-        keep.extend(persist);
-    }
+    keep.append(&mut color_keep);
+    keep.extend(kstate.into_keep());
 
     Ok(EncodedBatch {
         cmds,
@@ -1263,6 +1455,155 @@ mod tests {
         assert_eq!(kernel_max_nodes(Kernel::Gibbs), 4800);
         assert_eq!(kernel_max_nodes(Kernel::Sa), SA_MAX_NODES);
         assert_eq!(kernel_max_nodes(Kernel::Gibbs), GIBBS_MAX_NODES);
+        assert_eq!(kernel_max_nodes(Kernel::Msa), MSA_MAX_NODES);
+        assert_eq!(kernel_max_nodes(Kernel::Msa), 6016);
+    }
+
+    /// A star whose hub has `leaves` neighbours.
+    fn star(leaves: usize) -> IsingGraph {
+        let n = leaves + 1;
+        let edges: Vec<(usize, usize)> = (1..n).map(|i| (0, i)).collect();
+        IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges)
+    }
+
+    #[test]
+    fn validate_batch_rejects_msa_degree_over_the_prefetch_budget() {
+        // The kernel unrolls a fixed 20-neighbour prefetch; a denser node
+        // would read past it. Capacity, not DeviceFault: the coordinator
+        // routes the job to another backend.
+        let g = star(21);
+        let err = validate_batch(&[&g], &params(64), Kernel::Msa).unwrap_err();
+        let msg = too_large_msg(err);
+        assert!(msg.contains("degree 21"), "{msg}");
+        // The other kernels walk CSR rows of any length.
+        validate_batch(&[&g], &params(64), Kernel::Sa).unwrap();
+        validate_batch(&[&g], &params(64), Kernel::Gibbs).unwrap();
+    }
+
+    #[test]
+    fn validate_batch_accepts_msa_degree_at_the_budget() {
+        let g = star(MSA_MAX_DEG);
+        validate_batch(&[&g], &params(64), Kernel::Msa).unwrap();
+    }
+
+    #[test]
+    fn max_csr_degree_follows_the_topology_builder_rules() {
+        // A self-loop counts once; an out-of-range endpoint skips the edge.
+        let g = IsingGraph::new(
+            vec![0.0; 3],
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![(0, 1), (1, 1), (1, 2), (2, 9)],
+        );
+        assert_eq!(max_csr_degree(&g), 3);
+        let t = SelfFeedingTopology::build(&g);
+        let builder_max = t
+            .row_ptr
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as usize)
+            .max()
+            .unwrap();
+        assert_eq!(max_csr_degree(&g), builder_max);
+    }
+
+    #[test]
+    fn msa_node_cap_fits_apple_threadgroup_memory() {
+        assert_eq!(kernel_max_nodes(Kernel::Msa), MSA_MAX_NODES);
+        const {
+            assert!(MSA_MAX_NODES * 4 + MSA_STATIC_TG_BYTES <= APPLE_TG_MEMORY_BYTES);
+            // Larger than either existing cap: the kernel holds 4 bytes per spin
+            // where SA holds a delta-energy byte plus a packed bit per spin per
+            // thread.
+            assert!(MSA_MAX_NODES > SA_MAX_NODES);
+            assert!(MSA_MAX_NODES > GIBBS_MAX_NODES);
+        }
+    }
+
+    #[test]
+    fn simd_rounded_reads_are_whole_msa_words() {
+        for reads in [1usize, 31, 32, 33, 64, 100, 255, 256, 1000] {
+            let r = simd_rounded_reads(reads);
+            assert_eq!(r % MSA_LANES, 0, "reads={reads} rounded to {r}");
+            assert!((1..=MAX_READS / MSA_LANES).contains(&(r / MSA_LANES)));
+        }
+    }
+
+    /// Ferromagnetic chain of `n` spins with ternary fields, so every degree
+    /// (1 at the ends, 2 inside) and every field value gets exercised.
+    fn chain(n: usize) -> IsingGraph {
+        let h = (0..n).map(|i| [-1.0, 0.0, 1.0][i % 3]).collect();
+        let edges: Vec<(usize, usize)> = (0..n - 1).map(|i| (i, i + 1)).collect();
+        let j = vec![-1.0; edges.len()];
+        IsingGraph::new(h, j, edges)
+    }
+
+    /// Chunk boundaries fall on rung boundaries, and every carry-over (the
+    /// spin words and each thread's RNG stream) round-trips through the
+    /// persistent buffers, so splitting an anneal into chunks must not change
+    /// one bit of output. This is the resume path's only direct test: small
+    /// graphs never plan more than one chunk on their own.
+    #[test]
+    fn msa_chunked_anneal_is_bit_identical_to_one_chunk() {
+        let device = crate::metal_device::MetalDevice::open(0).unwrap();
+        let graph = chain(96);
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 64,
+            sweeps_per_beta: 1,
+            beta_range: Some((0.1, 4.0)),
+            seed: 7,
+        };
+        let whole =
+            encode_batch_inner(&device, &[&graph], &params, Kernel::Msa, Some(&[(0, 64)])).unwrap();
+        let split = encode_batch_inner(
+            &device,
+            &[&graph],
+            &params,
+            Kernel::Msa,
+            Some(&[(0, 16), (16, 16), (32, 16), (48, 16)]),
+        )
+        .unwrap();
+        whole.wait_until_completed();
+        split.wait_until_completed();
+        assert!(whole.failed_status().is_none());
+        assert!(split.failed_status().is_none());
+        let count = 64 * whole.packed_size;
+        let a = read_i8_buffer(&whole.d_samples, count).unwrap();
+        let b = read_i8_buffer(&split.d_samples, count).unwrap();
+        assert_eq!(a, b);
+        // The anneal did something: not every read is the all-+1 zero state.
+        assert!(a.iter().any(|&byte| byte != 0));
+    }
+
+    /// Two problems in one batch with two words each: every (problem, word)
+    /// threadgroup packs into its own region and nothing overlaps.
+    #[test]
+    fn msa_batch_packs_each_problem_and_word_into_its_own_region() {
+        let device = crate::metal_device::MetalDevice::open(0).unwrap();
+        let a = chain(40);
+        let b = chain(40);
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 32,
+            sweeps_per_beta: 1,
+            beta_range: Some((0.1, 4.0)),
+            seed: 3,
+        };
+        let batch = encode_batch(&device, &[&a, &b], &params, Kernel::Msa).unwrap();
+        batch.wait_until_completed();
+        assert!(batch.failed_status().is_none());
+        let per_problem = harvest_batch(&batch, &[&a, &b]).unwrap();
+        assert_eq!(per_problem.len(), 2);
+        for reads in &per_problem {
+            assert_eq!(reads.len(), 64);
+            for r in reads {
+                assert_eq!(r.spins.len(), 40);
+                assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
+            }
+        }
+        // 64 reads are two 32-lane words drawn from independent streams, so
+        // the two words of one problem are not copies of each other.
+        let (w0, w1) = per_problem[0].split_at(32);
+        assert!(w0.iter().zip(w1).any(|(x, y)| x.spins != y.spins));
     }
 
     #[test]
@@ -1368,7 +1709,7 @@ mod tests {
         /// must not change non-test code).
         #[test]
         fn chunk_plan_covers_schedule_without_zero_counts(
-            kernel in prop_oneof![Just(Kernel::Sa), Just(Kernel::Gibbs)],
+            kernel in prop_oneof![Just(Kernel::Sa), Just(Kernel::Msa), Just(Kernel::Gibbs)],
             num_betas in 0i32..=512,
             n in 0usize..=64,
             sweeps_per in 0usize..=256,

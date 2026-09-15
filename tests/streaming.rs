@@ -191,15 +191,20 @@ fn outcome_kind(o: &StreamOutcome) -> &'static str {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Full batch round trip: several matching jobs → one result each with sane fields.
-#[test]
-fn run_stream_batch_round_trip() {
-    with_timeout(60, "run_stream_batch_round_trip", || {
+/// Full batch round trip on `kernel`: several matching jobs → one result each
+/// with sane fields.
+fn batch_round_trip(kernel: Kernel) {
+    let label: &'static str = match kernel {
+        Kernel::Sa => "run_stream_batch_round_trip",
+        Kernel::Msa => "run_stream_msa_batch_round_trip",
+        Kernel::Gibbs => "run_stream_gibbs_batch_round_trip",
+    };
+    with_timeout(60, label, move || {
         let (job_tx, job_rx) = tokio::sync::mpsc::channel(8);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(8);
         let cancel = CancelToken::default();
 
-        let worker = spawn_stream(Kernel::Sa, job_rx, out_tx, cancel);
+        let worker = spawn_stream(kernel, job_rx, out_tx, cancel);
 
         let ids: &[&[u8]] = &[b"job-a", b"job-b", b"job-c"];
         for (i, id) in ids.iter().enumerate() {
@@ -209,8 +214,8 @@ fn run_stream_batch_round_trip() {
         }
         drop(job_tx);
 
-        let results = drain_results(out_rx, 45, "run_stream_batch_round_trip");
-        join_with_timeout(worker, 15, "run_stream_batch_round_trip");
+        let results = drain_results(out_rx, 45, label);
+        join_with_timeout(worker, 15, label);
 
         assert_eq!(
             results.len(),
@@ -235,12 +240,22 @@ fn run_stream_batch_round_trip() {
                 .get(*id)
                 .unwrap_or_else(|| panic!("missing result for {}", String::from_utf8_lossy(id)));
             assert_completed_sane(r, 4, 4);
-            // GPU path should report device time (empty-graph path is 0).
-            // Soft check: non-zero is expected after a real dispatch; tolerate
-            // zero if the driver omits timestamps rather than fail the trip.
             let _ = r.device_access_time_us;
         }
     });
+}
+
+#[test]
+fn run_stream_batch_round_trip() {
+    batch_round_trip(Kernel::Sa);
+}
+
+/// The multi-spin kernel dispatches `words` threadgroups per problem and
+/// packs 32 lanes per word; the 4-read job here rounds to one 32-lane word
+/// and must still come back truncated to 4 reads of 4 spins.
+#[test]
+fn run_stream_msa_batch_round_trip() {
+    batch_round_trip(Kernel::Msa);
 }
 
 /// CancelToken mid-stream: after a live job completes, cancel stale generations

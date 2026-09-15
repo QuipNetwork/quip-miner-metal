@@ -98,7 +98,11 @@ fn tg_budget(kernel: Kernel) -> usize {
         .max(1);
     let default = match kernel {
         Kernel::Sa => SA_TG_PER_CORE,
-        Kernel::Gibbs => GIBBS_TG_PER_CORE,
+        // Not yet tuned by an occupancy sweep; the multi-spin kernel is a
+        // colour-block dispatch like chromatic Gibbs (one threadgroup per
+        // (problem, word) rather than per problem), so it starts from
+        // Gibbs's budget rather than SA's until it gets its own sweep.
+        Kernel::Msa | Kernel::Gibbs => GIBBS_TG_PER_CORE,
     };
     let per_core = std::env::var("QUIP_METAL_TG_PER_CORE")
         .ok()
