@@ -1,7 +1,8 @@
 //! Metal Ising samplers.
 //!
-//! Two binaries share this library:
+//! Three binaries share this library:
 //! - `quip-metal-sa` — Metropolis simulated annealing on one Apple GPU
+//! - `quip-metal-msa` — multi-spin coded simulated annealing (32 replicas per word) on one Apple GPU
 //! - `quip-metal-gibbs` — single-site heat-bath Gibbs on one Apple GPU
 //!
 //! Kernels take **explicit per-job** CSR buffers from the host (no kernel-side
@@ -87,6 +88,29 @@ const METAL_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adap
     reads_solution_floor_factor: 0,
 };
 
+/// Multi-spin adapt envelope.
+///
+/// Reads are pinned to 128: four 32-lane words per problem, the count the
+/// CUDA port fixed for its shared-memory budget, kept here so the two `msa`
+/// miners answer the same job shape. Sweeps are not yet measured on Apple
+/// hardware; the benchmark in `tests/msa_bench.rs` sets them. Every accepted
+/// job is still bounded by `sampler::MAX_SWEEPS`.
+const METAL_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
+    quip_solver_core::adapt::AdaptBounds {
+        min_sweeps: 2048,
+        max_sweeps: 8192,
+        min_reads: 128,
+        max_reads: 128,
+        reads_solution_min_factor: 0,
+        reads_solution_max_factor: 0,
+        reads_solution_floor_factor: 0,
+    };
+
+const _: () = assert!(
+    sampler::MAX_SWEEPS >= METAL_MSA_ADAPT.max_sweeps as usize,
+    "sampler::MAX_SWEEPS must admit METAL_MSA_ADAPT.max_sweeps"
+);
+
 /// Backend identity for `quip-metal-sa`.
 ///
 /// # Examples
@@ -135,6 +159,28 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // Same capability set as `METAL_SA_IDENTITY`: streaming + governor.
     features: &["streaming", "governor"],
     adapt: METAL_ADAPT,
+};
+
+/// Backend identity for `quip-metal-msa`.
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::METAL_MSA_IDENTITY;
+///
+/// assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
+/// assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
+/// assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads, 128);
+/// ```
+pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "metal",
+    algorithm: "msa",
+    // Same single-source rule as SA and Gibbs: the cap is the kernel's
+    // threadgroup-memory budget in `sampler::MSA_MAX_NODES`.
+    max_nodes: crate::sampler::MSA_MAX_NODES as u32,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &["streaming", "governor"],
+    adapt: METAL_MSA_ADAPT,
 };
 
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization
@@ -327,6 +373,13 @@ impl KernelTag for GibbsTag {
     const KERNEL: Kernel = Kernel::Gibbs;
 }
 
+/// Tag for `quip-metal-msa`.
+pub struct MsaTag;
+
+impl KernelTag for MsaTag {
+    const KERNEL: Kernel = Kernel::Msa;
+}
+
 /// [`MetalSampler`] bound to its binary's kernel at the type level, so the
 /// associated `declared_stream_width` answers per kernel. [`run_metal`]
 /// constructs the inner sampler from `A::KERNEL`, keeping the tag and the
@@ -433,7 +486,7 @@ mod tests {
     /// declared width must be answerable without a GPU.
     #[test]
     fn tagged_declared_widths_follow_their_kernels() {
-        use super::{GibbsTag, Kernel, SaTag, TaggedSampler};
+        use super::{GibbsTag, Kernel, MsaTag, SaTag, TaggedSampler};
         use quip_solver_core::Sampler;
         assert_eq!(
             TaggedSampler::<SaTag>::declared_stream_width(),
@@ -444,6 +497,28 @@ mod tests {
             u32::try_from(crate::streaming::declared_stream_width(Kernel::Gibbs))
                 .unwrap_or(u32::MAX)
         );
+        assert_eq!(
+            TaggedSampler::<MsaTag>::declared_stream_width(),
+            u32::try_from(crate::streaming::declared_stream_width(Kernel::Msa)).unwrap_or(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn msa_identity_advertises_the_multi_spin_kernel() {
+        use super::{METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
+        assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
+        assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
+        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 6016);
+        assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
+        // Reads are pinned to whole words.
+        assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads % 32, 0);
+        assert_eq!(
+            METAL_MSA_IDENTITY.adapt.min_reads,
+            METAL_MSA_IDENTITY.adapt.max_reads
+        );
+        const {
+            assert!(METAL_MSA_IDENTITY.adapt.min_sweeps <= METAL_MSA_IDENTITY.adapt.max_sweeps);
+        }
     }
 
     /// CLI defaults the pure resolver starts from in every case below.

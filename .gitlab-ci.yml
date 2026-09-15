@@ -56,6 +56,7 @@ build-macos-arm64:
     - mkdir -p dist
     - cp target/release/quip-metal-sa dist/quip-metal-sa-darwin-arm64
     - cp target/release/quip-metal-gibbs dist/quip-metal-gibbs-darwin-arm64
+    - cp target/release/quip-metal-msa dist/quip-metal-msa-darwin-arm64
 
 # On a tag: upload the built binaries to the generic package registry, then cut
 # a Release linking them as downloadable assets. `build-macos-arm64` is not

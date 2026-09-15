@@ -52,14 +52,15 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
 /// constant means two different occupancies:
 ///
 /// ```text
-/// SA / sequential Gibbs:  threadgroups = P       (one per problem, R threads each)
-/// chromatic Gibbs:        threadgroups = P * R   (one per SAMPLE, 256 threads each)
+/// SA / sequential Gibbs:  threadgroups = P           (one per problem, R threads each)
+/// chromatic Gibbs:        threadgroups = P * R       (one per SAMPLE, 256 threads each)
+/// multi-spin:             threadgroups = P * (R/32)  (one per 32-lane word; unmeasured)
 /// ```
 ///
-/// Budgeting in threadgroups instead makes one constant mean one thing. Both
-/// values are from the occupancy sweep on an M4 Max (40 cores), full Advantage2
-/// topology, 64 reads / 128 sweeps, measured in spin-updates/s from per-dispatch
-/// GPU time:
+/// Budgeting in threadgroups instead makes one constant mean one thing. The SA
+/// and Gibbs values are from the occupancy sweep on an M4 Max (40 cores), full
+/// Advantage2 topology, 64 reads / 128 sweeps, measured in spin-updates/s from
+/// per-dispatch GPU time. The multi-spin figure is unmeasured.
 ///
 /// ```text
 /// SA      tg/core:  0.2   0.5   1     2     3     4     6     8
@@ -86,10 +87,21 @@ const SA_TG_PER_CORE: f64 = 6.0;
 /// See [`SA_TG_PER_CORE`]. Chromatic Gibbs saturates here; higher only costs
 /// dispatch length.
 const GIBBS_TG_PER_CORE: f64 = 16.0;
+/// See [`SA_TG_PER_CORE`]. Multi-spin threadgroups carry 256 threads and up
+/// to 26 KB of threadgroup memory each, so fewer are resident per core than
+/// SA's. Not yet measured: 2.0 is a starting point the benchmark in
+/// `tests/msa_bench.rs` replaces.
+const MSA_TG_PER_CORE: f64 = 2.0;
 
-/// Nominal reads used to size [`stream_width`] before any job has arrived.
-/// Matches `METAL_ADAPT.min_reads`, the smallest count the adapt path issues.
-const NOMINAL_READS: usize = 64;
+/// Nominal reads used to size [`stream_width`] before any job has arrived:
+/// each kernel's adapt envelope `min_reads`, the smallest count the adapt
+/// path issues (`METAL_ADAPT` for SA and Gibbs, `METAL_MSA_ADAPT` for MSA).
+fn nominal_reads(kernel: Kernel) -> usize {
+    match kernel {
+        Kernel::Sa | Kernel::Gibbs => 64,
+        Kernel::Msa => 128,
+    }
+}
 
 /// Threadgroups this dispatch aims to have in flight.
 fn tg_budget(kernel: Kernel) -> usize {
@@ -98,11 +110,8 @@ fn tg_budget(kernel: Kernel) -> usize {
         .max(1);
     let default = match kernel {
         Kernel::Sa => SA_TG_PER_CORE,
-        // Not yet tuned by an occupancy sweep; the multi-spin kernel is a
-        // colour-block dispatch like chromatic Gibbs (one threadgroup per
-        // (problem, word) rather than per problem), so it starts from
-        // Gibbs's budget rather than SA's until it gets its own sweep.
-        Kernel::Msa | Kernel::Gibbs => GIBBS_TG_PER_CORE,
+        Kernel::Msa => MSA_TG_PER_CORE,
+        Kernel::Gibbs => GIBBS_TG_PER_CORE,
     };
     let per_core = std::env::var("QUIP_METAL_TG_PER_CORE")
         .ok()
@@ -121,14 +130,19 @@ fn tg_budget(kernel: Kernel) -> usize {
 /// Problems per dispatch for a job with `num_reads` reads.
 ///
 /// Converts the threadgroup budget into a problem count using the kernel's own
-/// mapping: chromatic Gibbs spends `num_reads` threadgroups per problem, so its
-/// batch shrinks as reads grow; SA spends one.
+/// mapping: chromatic Gibbs spends `num_reads` threadgroups per problem and
+/// multi-spin spends `num_reads / 32`, so their batches shrink as reads grow.
+/// SA spends one.
 fn batch_size_for_reads(kernel: Kernel, num_reads: usize) -> usize {
     let budget = tg_budget(kernel);
-    let per_problem = if kernel == Kernel::Gibbs && sampler::gibbs_node_parallel() {
-        sampler::simd_rounded_reads(num_reads).max(1)
-    } else {
-        1
+    let per_problem = match kernel {
+        Kernel::Gibbs if sampler::gibbs_node_parallel() => {
+            sampler::simd_rounded_reads(num_reads).max(1)
+        }
+        Kernel::Msa => sampler::simd_rounded_reads(num_reads)
+            .div_ceil(sampler::MSA_LANES)
+            .max(1),
+        Kernel::Sa | Kernel::Gibbs => 1,
     };
     budget.div_ceil(per_problem).max(1)
 }
@@ -166,12 +180,12 @@ fn scale_budget(nominal: usize, scale: f64) -> usize {
 /// ```
 #[must_use]
 pub fn declared_stream_width(kernel: Kernel) -> usize {
-    (batch_size_for_reads(kernel, NOMINAL_READS) * 2).max(1)
+    (batch_size_for_reads(kernel, nominal_reads(kernel)) * 2).max(1)
 }
 
 /// `Sampler::stream_width`: how many models the backend keeps in flight.
 ///
-/// Sized from [`NOMINAL_READS`] because it is fixed at startup, before any job
+/// Sized from [`nominal_reads`] because it is fixed at startup, before any job
 /// reveals its read count. Two batches' worth, so the harness buffers the next
 /// batch while one dispatches.
 ///
@@ -852,6 +866,32 @@ mod tests {
             );
         }
         assert!(batch_size_for_reads(Kernel::Gibbs, 4096) >= 1, "never zero");
+
+        // Multi-spin spends one threadgroup per 32-lane word, so 128 reads
+        // cost four threadgroups per problem and 32 reads cost one.
+        let m_budget = ((cores as f64 * env.unwrap_or(MSA_TG_PER_CORE)).round() as usize).max(1);
+        assert_eq!(
+            batch_size_for_reads(Kernel::Msa, 128),
+            m_budget.div_ceil(4).max(1)
+        );
+        assert_eq!(batch_size_for_reads(Kernel::Msa, 32), m_budget);
+        assert_eq!(
+            batch_size_for_reads(Kernel::Msa, 256),
+            m_budget.div_ceil(8).max(1)
+        );
+    }
+
+    #[test]
+    fn declared_width_uses_each_kernels_nominal_reads() {
+        // The width is sized before any job arrives, from the smallest read
+        // count the adapt envelope issues: 64 for SA and Gibbs, 128 for MSA.
+        assert_eq!(nominal_reads(Kernel::Sa), 64);
+        assert_eq!(nominal_reads(Kernel::Gibbs), 64);
+        assert_eq!(nominal_reads(Kernel::Msa), 128);
+        assert_eq!(
+            declared_stream_width(Kernel::Msa),
+            (batch_size_for_reads(Kernel::Msa, 128) * 2).max(1)
+        );
     }
 
     #[test]
@@ -1013,7 +1053,7 @@ mod tests {
         /// Problem batch size is always at least one, for any read count.
         #[test]
         fn batch_size_for_reads_never_zero(
-            kernel in prop_oneof![Just(Kernel::Sa), Just(Kernel::Gibbs)],
+            kernel in prop_oneof![Just(Kernel::Sa), Just(Kernel::Msa), Just(Kernel::Gibbs)],
             num_reads in any::<usize>()
         ) {
             prop_assert!(
