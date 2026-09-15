@@ -24,8 +24,24 @@
 //! committing; [`harvest_batch`] reads the bit-packed samples per problem. The
 //! synchronous [`sample_ising`] runs a single-problem batch and waits.
 
-use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
+
+/// Which GPU kernel a binary drives.
+///
+/// Distinct from [`quip_solver_core::Algorithm`]: the coordinator protocol
+/// only names `sa` and `gibbs`, and more than one kernel can serve `sa`. The
+/// crate keys pipelines, node caps, chunk rates, and threadgroup budgets on
+/// the kernel, not the protocol algorithm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kernel {
+    /// Metropolis simulated annealing, one thread per read
+    /// (`kernels/sa.metal`, `pure_simulated_annealing`).
+    Sa,
+    /// Chromatic heat-bath Gibbs, one threadgroup per sample
+    /// (`kernels/gibbs.metal`, `block_gibbs_parallel` / `block_gibbs_sampler`).
+    Gibbs,
+}
 
 use crate::topology::{fill_h_j, SelfFeedingTopology};
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
@@ -220,8 +236,8 @@ const GIBBS_THROUGHPUT_SAFETY: f64 = 0.7;
 /// Below the first measured point the curve is extrapolated linearly toward the
 /// origin (a nearly-empty GPU really is proportionally slow); above the last it
 /// is held flat, since throughput has saturated by then.
-fn estimated_updates_per_sec(algorithm: Algorithm, groups: usize) -> f64 {
-    if matches!(algorithm, Algorithm::Gibbs) {
+fn estimated_updates_per_sec(kernel: Kernel, groups: usize) -> f64 {
+    if kernel == Kernel::Gibbs {
         return GIBBS_UPDATES_PER_SEC * GIBBS_THROUGHPUT_SAFETY;
     }
     let cores = crate::iokit_gov::gpu_core_count().unwrap_or(10).max(1);
@@ -255,11 +271,11 @@ fn estimated_updates_per_sec(algorithm: Algorithm, groups: usize) -> f64 {
 ///
 /// Both kernels can resume mid-schedule: `beta_start == 0` initializes, any
 /// other value restores the carry-over state the previous chunk wrote.
-fn chunk_plan(algorithm: Algorithm, dims: &BatchDims, groups: usize) -> Vec<(i32, i32)> {
+fn chunk_plan(kernel: Kernel, dims: &BatchDims, groups: usize) -> Vec<(i32, i32)> {
     let num_betas = dims.num_betas.max(1);
     let per_beta =
         (dims.num_threads as f64) * (dims.sweeps_per.max(1) as f64) * (dims.n.max(1) as f64);
-    let budget = TARGET_DISPATCH_MS / 1000.0 * estimated_updates_per_sec(algorithm, groups);
+    let budget = TARGET_DISPATCH_MS / 1000.0 * estimated_updates_per_sec(kernel, groups);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "clamped to 1..=num_betas immediately below"
@@ -301,10 +317,11 @@ pub(crate) fn gibbs_node_parallel() -> bool {
     })
 }
 
-pub(crate) fn algo_max_nodes(algorithm: Algorithm) -> usize {
-    match algorithm {
-        Algorithm::Sa => SA_MAX_NODES,
-        Algorithm::Gibbs => GIBBS_MAX_NODES,
+/// Largest `N` the kernel's fixed-size arrays admit.
+pub(crate) fn kernel_max_nodes(kernel: Kernel) -> usize {
+    match kernel {
+        Kernel::Sa => SA_MAX_NODES,
+        Kernel::Gibbs => GIBBS_MAX_NODES,
     }
 }
 
@@ -521,7 +538,7 @@ struct DispatchBuffers {
 fn validate_batch<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: Kernel,
 ) -> Result<(&'a IsingGraph, usize), SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
@@ -531,13 +548,13 @@ fn validate_batch<'a>(
         ));
     };
     let n = first.num_nodes();
-    let cap = algo_max_nodes(algorithm);
+    let cap = kernel_max_nodes(kernel);
     if n > cap {
         // Defense in depth: the harness rejects N > max_nodes (identity const)
         // before the sampler; this catches drift before it overruns the
         // kernel's fixed-size thread-local arrays.
         return Err(SampleError::TooLarge(format!(
-            "graph N={n} exceeds {algorithm:?} kernel limit {cap}"
+            "graph N={n} exceeds {kernel:?} kernel limit {cap}"
         )));
     }
     if params.num_sweeps > MAX_SWEEPS {
@@ -746,9 +763,9 @@ pub(crate) fn encode_batch(
     device: &crate::metal_device::MetalDevice,
     graphs: &[&IsingGraph],
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: Kernel,
 ) -> Result<EncodedBatch, SampleError> {
-    let (first, n) = validate_batch(graphs, params, algorithm)?;
+    let (first, n) = validate_batch(graphs, params, kernel)?;
 
     let num_problems = graphs.len();
     let num_reads = simd_rounded_reads(params.num_reads);
@@ -782,14 +799,14 @@ pub(crate) fn encode_batch(
 
     // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
     // only the dispatch geometry below differs.
-    let node_parallel = matches!(algorithm, Algorithm::Gibbs) && gibbs_node_parallel();
+    let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
     // Gibbs colour-block buffers are recreated per chunk today; Gibbs runs a
     // single chunk until its kernel gains a resume entry point.
     let mut gibbs_keep: Vec<metal::Buffer> = Vec::new();
-    let pipeline = match algorithm {
-        Algorithm::Sa => &device.sa,
-        Algorithm::Gibbs if node_parallel => &device.gibbs_parallel,
-        Algorithm::Gibbs => &device.gibbs,
+    let pipeline = match kernel {
+        Kernel::Sa => &device.sa,
+        Kernel::Gibbs if node_parallel => &device.gibbs_parallel,
+        Kernel::Gibbs => &device.gibbs,
     };
 
     // One command buffer per chunk of the beta schedule. Splitting here rather
@@ -818,9 +835,9 @@ pub(crate) fn encode_batch(
         (num_problems, num_reads)
     };
 
-    let plan = chunk_plan(algorithm, &dims, groups);
-    let sa_persist = matches!(algorithm, Algorithm::Sa).then(|| new_sa_persistent(device, &dims));
-    let gibbs_persist = matches!(algorithm, Algorithm::Gibbs)
+    let plan = chunk_plan(kernel, &dims, groups);
+    let sa_persist = (kernel == Kernel::Sa).then(|| new_sa_persistent(device, &dims));
+    let gibbs_persist = (kernel == Kernel::Gibbs)
         .then(|| new_gibbs_persistent(device, &dims, node_parallel, threads_per_group));
 
     let mut cmds = Vec::with_capacity(plan.len());
@@ -955,10 +972,7 @@ pub(crate) fn harvest_batch(
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_metal::{
-///     sample_ising, Algorithm, IsingGraph, SampleParams,
-///     metal_device::MetalDevice,
-/// };
+/// use quip_miner_metal::{sample_ising, Kernel, IsingGraph, SampleParams, metal_device::MetalDevice};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = MetalDevice::open(0)?;
@@ -972,7 +986,7 @@ pub(crate) fn harvest_batch(
 ///     num_sweeps: 64,
 ///     ..Default::default()
 /// };
-/// let samples = sample_ising(&device, &graph, &params, Algorithm::Sa)?;
+/// let samples = sample_ising(&device, &graph, &params, Kernel::Sa)?;
 /// assert_eq!(samples.len(), 4);
 /// # Ok(())
 /// # }
@@ -981,7 +995,7 @@ pub fn sample_ising(
     device: &crate::metal_device::MetalDevice,
     graph: &IsingGraph,
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: Kernel,
 ) -> Result<Vec<SamplerResult>, SampleError> {
     let n = graph.num_nodes();
     if n == 0 {
@@ -994,7 +1008,7 @@ pub fn sample_ising(
             .collect());
     }
 
-    let batch = encode_batch(device, &[graph], params, algorithm)?;
+    let batch = encode_batch(device, &[graph], params, kernel)?;
     batch.wait_until_completed();
 
     // A GPU-side failure (device reset, kernel fault, timeout) leaves d_samples
@@ -1168,14 +1182,14 @@ mod tests {
     fn validate_batch_rejects_an_empty_batch() {
         // Release builds compiled the old `debug_assert!` out and panicked on
         // `graphs[0]`.
-        let err = validate_batch(&[], &params(64), Algorithm::Sa).unwrap_err();
+        let err = validate_batch(&[], &params(64), Kernel::Sa).unwrap_err();
         assert!(driver_msg(err).contains("at least one graph"));
     }
 
     #[test]
     fn validate_batch_accepts_a_normal_job() {
         let g = ring();
-        let (first, n) = validate_batch(&[&g], &params(64), Algorithm::Sa).unwrap();
+        let (first, n) = validate_batch(&[&g], &params(64), Kernel::Sa).unwrap();
         assert_eq!(n, 4);
         assert_eq!(first.num_nodes(), 4);
     }
@@ -1183,7 +1197,7 @@ mod tests {
     #[test]
     fn validate_batch_rejects_n_over_the_kernel_cap() {
         let big = IsingGraph::new(vec![0.0; SA_MAX_NODES + 1], vec![], vec![]);
-        let err = validate_batch(&[&big], &params(64), Algorithm::Sa).unwrap_err();
+        let err = validate_batch(&[&big], &params(64), Kernel::Sa).unwrap_err();
         let msg = too_large_msg(err);
         assert!(msg.contains("exceeds"), "{msg}");
         assert!(msg.contains(&SA_MAX_NODES.to_string()), "{msg}");
@@ -1192,7 +1206,7 @@ mod tests {
     #[test]
     fn validate_batch_rejects_num_sweeps_over_the_cap() {
         let g = ring();
-        let err = validate_batch(&[&g], &params(MAX_SWEEPS + 1), Algorithm::Sa).unwrap_err();
+        let err = validate_batch(&[&g], &params(MAX_SWEEPS + 1), Kernel::Sa).unwrap_err();
         let msg = too_large_msg(err);
         assert!(msg.contains("num_sweeps"), "{msg}");
     }
@@ -1202,7 +1216,7 @@ mod tests {
         // The reported DoS: `num_sweeps = u32::MAX` sized a ~34 GB Vec<f64>.
         let g = ring();
         let sweeps = u32::MAX as usize;
-        let err = validate_batch(&[&g], &params(sweeps), Algorithm::Sa).unwrap_err();
+        let err = validate_batch(&[&g], &params(sweeps), Kernel::Sa).unwrap_err();
         assert!(too_large_msg(err).contains("num_sweeps"));
     }
 
@@ -1226,7 +1240,7 @@ mod tests {
     #[test]
     fn validate_batch_accepts_the_cap_exactly() {
         let g = ring();
-        validate_batch(&[&g], &params(MAX_SWEEPS), Algorithm::Sa).unwrap();
+        validate_batch(&[&g], &params(MAX_SWEEPS), Kernel::Sa).unwrap();
     }
 
     #[test]
@@ -1238,17 +1252,17 @@ mod tests {
         assert!(MAX_SWEEPS >= 2 * adapt_max_sweeps);
         let g = ring();
         let sweeps = 2 * adapt_max_sweeps;
-        validate_batch(&[&g], &params(sweeps), Algorithm::Gibbs).unwrap();
+        validate_batch(&[&g], &params(sweeps), Kernel::Gibbs).unwrap();
     }
 
     #[test]
-    fn algo_max_nodes_matches_the_kernel_arrays() {
+    fn kernel_max_nodes_matches_the_kernel_arrays() {
         // `delta_energy[4593]` in sa.metal, `packed_state[600]` (600*8) in
         // gibbs.metal.
-        assert_eq!(algo_max_nodes(Algorithm::Sa), 4593);
-        assert_eq!(algo_max_nodes(Algorithm::Gibbs), 4800);
-        assert_eq!(algo_max_nodes(Algorithm::Sa), SA_MAX_NODES);
-        assert_eq!(algo_max_nodes(Algorithm::Gibbs), GIBBS_MAX_NODES);
+        assert_eq!(kernel_max_nodes(Kernel::Sa), 4593);
+        assert_eq!(kernel_max_nodes(Kernel::Gibbs), 4800);
+        assert_eq!(kernel_max_nodes(Kernel::Sa), SA_MAX_NODES);
+        assert_eq!(kernel_max_nodes(Kernel::Gibbs), GIBBS_MAX_NODES);
     }
 
     #[test]
@@ -1354,7 +1368,7 @@ mod tests {
         /// must not change non-test code).
         #[test]
         fn chunk_plan_covers_schedule_without_zero_counts(
-            algorithm in prop_oneof![Just(Algorithm::Sa), Just(Algorithm::Gibbs)],
+            kernel in prop_oneof![Just(Kernel::Sa), Just(Kernel::Gibbs)],
             num_betas in 0i32..=512,
             n in 0usize..=64,
             sweeps_per in 0usize..=256,
@@ -1371,7 +1385,7 @@ mod tests {
                 num_reads: 1,
                 packed_size: 0,
             };
-            let plan = chunk_plan(algorithm, &dims, groups);
+            let plan = chunk_plan(kernel, &dims, groups);
             let cover = dims.num_betas.max(1);
             prop_assert!(!plan.is_empty());
             let mut cursor = 0i32;

@@ -18,10 +18,9 @@
 //! `Sampler::sample_stream`; every Metal object stays on that thread.
 
 use crate::metal_device::MetalDevice;
-use crate::sampler::{self, algo_max_nodes};
+use crate::sampler::{self, kernel_max_nodes, Kernel};
 use quip_solver_core::{
-    Algorithm, CancelToken, IsingGraph, SampleError, SamplerResult, StreamJob, StreamOutcome,
-    StreamResult,
+    CancelToken, IsingGraph, SampleError, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -37,12 +36,12 @@ const DEFAULT_GPU_CORES: usize = 10;
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::{streaming, Algorithm};
+/// use quip_miner_metal::{streaming, Kernel};
 ///
-/// assert_eq!(streaming::max_reads(Algorithm::Sa), 256);
-/// assert_eq!(streaming::max_reads(Algorithm::Gibbs), 256);
+/// assert_eq!(streaming::max_reads(Kernel::Sa), 256);
+/// assert_eq!(streaming::max_reads(Kernel::Gibbs), 256);
 /// ```
-pub fn max_reads(_algorithm: Algorithm) -> u32 {
+pub fn max_reads(_kernel: Kernel) -> u32 {
     sampler::MAX_READS as u32
 }
 
@@ -93,13 +92,13 @@ const GIBBS_TG_PER_CORE: f64 = 16.0;
 const NOMINAL_READS: usize = 64;
 
 /// Threadgroups this dispatch aims to have in flight.
-fn tg_budget(algorithm: Algorithm) -> usize {
+fn tg_budget(kernel: Kernel) -> usize {
     let cores = crate::iokit_gov::gpu_core_count()
         .unwrap_or(DEFAULT_GPU_CORES)
         .max(1);
-    let default = match algorithm {
-        Algorithm::Sa => SA_TG_PER_CORE,
-        Algorithm::Gibbs => GIBBS_TG_PER_CORE,
+    let default = match kernel {
+        Kernel::Sa => SA_TG_PER_CORE,
+        Kernel::Gibbs => GIBBS_TG_PER_CORE,
     };
     let per_core = std::env::var("QUIP_METAL_TG_PER_CORE")
         .ok()
@@ -120,9 +119,9 @@ fn tg_budget(algorithm: Algorithm) -> usize {
 /// Converts the threadgroup budget into a problem count using the kernel's own
 /// mapping: chromatic Gibbs spends `num_reads` threadgroups per problem, so its
 /// batch shrinks as reads grow; SA spends one.
-fn batch_size_for_reads(algorithm: Algorithm, num_reads: usize) -> usize {
-    let budget = tg_budget(algorithm);
-    let per_problem = if algorithm == Algorithm::Gibbs && sampler::gibbs_node_parallel() {
+fn batch_size_for_reads(kernel: Kernel, num_reads: usize) -> usize {
+    let budget = tg_budget(kernel);
+    let per_problem = if kernel == Kernel::Gibbs && sampler::gibbs_node_parallel() {
         sampler::simd_rounded_reads(num_reads).max(1)
     } else {
         1
@@ -157,13 +156,13 @@ fn scale_budget(nominal: usize, scale: f64) -> usize {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::{streaming, Algorithm};
+/// use quip_miner_metal::{streaming, Kernel};
 ///
-/// assert!(streaming::declared_stream_width(Algorithm::Sa) >= 1);
+/// assert!(streaming::declared_stream_width(Kernel::Sa) >= 1);
 /// ```
 #[must_use]
-pub fn declared_stream_width(algorithm: Algorithm) -> usize {
-    (batch_size_for_reads(algorithm, NOMINAL_READS) * 2).max(1)
+pub fn declared_stream_width(kernel: Kernel) -> usize {
+    (batch_size_for_reads(kernel, NOMINAL_READS) * 2).max(1)
 }
 
 /// `Sampler::stream_width`: how many models the backend keeps in flight.
@@ -180,17 +179,17 @@ pub fn declared_stream_width(algorithm: Algorithm) -> usize {
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_metal::{streaming, Algorithm, metal_device::MetalDevice};
+/// use quip_miner_metal::{streaming, Kernel, metal_device::MetalDevice};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = MetalDevice::open(0)?;
-/// let width = streaming::stream_width(&device, Algorithm::Sa);
+/// let width = streaming::stream_width(&device, Kernel::Sa);
 /// assert!(width >= 1);
 /// # Ok(())
 /// # }
 /// ```
-pub fn stream_width(_device: &MetalDevice, algorithm: Algorithm) -> usize {
-    declared_stream_width(algorithm)
+pub fn stream_width(_device: &MetalDevice, kernel: Kernel) -> usize {
+    declared_stream_width(kernel)
 }
 
 /// Structural + sampling identity a single dispatch batches over: same topology
@@ -285,7 +284,7 @@ struct StreamCtx<'a> {
     jobs: &'a mut Receiver<StreamJob>,
     out: &'a Sender<StreamResult>,
     pending: &'a mut Option<StreamJob>,
-    algorithm: Algorithm,
+    kernel: Kernel,
     /// Utilization ceiling, external-load accounting, and dispatch backpressure.
     gov: &'a dyn GpuGovernor,
     /// Reseed watermark: job watermarks at or below it were abandoned by the
@@ -391,7 +390,7 @@ fn next_seed(ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<StreamJob> {
             answer_empty(ctx.out, job);
             continue;
         }
-        if job.graph.num_nodes() > algo_max_nodes(ctx.algorithm) {
+        if job.graph.num_nodes() > kernel_max_nodes(ctx.kernel) {
             send_reject(ctx.out, job, SampleError::Capacity);
             continue;
         }
@@ -424,7 +423,7 @@ fn fill_batch(
         match ctx.jobs.try_recv() {
             Ok(job) if ctx.cancel.is_cancelled(job.watermark) => send_cancelled(ctx.out, job),
             Ok(job) if job.graph.num_nodes() == 0 => answer_empty(ctx.out, job),
-            Ok(job) if job.graph.num_nodes() > algo_max_nodes(ctx.algorithm) => {
+            Ok(job) if job.graph.num_nodes() > kernel_max_nodes(ctx.kernel) => {
                 send_reject(ctx.out, job, SampleError::Capacity)
             }
             Ok(job) if key.matches(&job) => {
@@ -463,7 +462,7 @@ struct InFlight {
 /// behind GPU compute.
 pub fn run_stream(
     device: &MetalDevice,
-    algorithm: Algorithm,
+    kernel: Kernel,
     mut jobs: Receiver<StreamJob>,
     out: &Sender<StreamResult>,
     gov: &dyn GpuGovernor,
@@ -474,7 +473,7 @@ pub fn run_stream(
         jobs: &mut jobs,
         out,
         pending: &mut pending,
-        algorithm,
+        kernel,
         gov,
         cancel,
     };
@@ -531,7 +530,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
     // while yielding. Sizing the dispatch is what actually shares the GPU —
     // a smaller grid leaves cores free for whoever else wants them, for the
     // whole duration of the dispatch rather than only in the gaps.
-    let nominal = batch_size_for_reads(ctx.algorithm, seed_job.params.num_reads);
+    let nominal = batch_size_for_reads(ctx.kernel, seed_job.params.num_reads);
     let cap = scale_budget(nominal, ctx.gov.budget_scale());
     // Keep `seed_job` live while `key` borrows its edge list; collect further
     // matches into a side vec, then assemble the full batch.
@@ -565,7 +564,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
     // Scope `graphs` so its borrow of `batch` ends before `batch` moves.
     let encoded = {
         let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
-        sampler::encode_batch(device, &graphs, &batch[0].params, ctx.algorithm)
+        sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel)
     };
     match encoded {
         Ok(enc) => {
@@ -830,8 +829,8 @@ mod tests {
         // SA spends one threadgroup per problem, so problems == budget and the
         // batch does not shrink as reads grow.
         let sa_budget = ((cores as f64 * env.unwrap_or(SA_TG_PER_CORE)).round() as usize).max(1);
-        assert_eq!(batch_size_for_reads(Algorithm::Sa, 64), sa_budget);
-        assert_eq!(batch_size_for_reads(Algorithm::Sa, 256), sa_budget);
+        assert_eq!(batch_size_for_reads(Kernel::Sa, 64), sa_budget);
+        assert_eq!(batch_size_for_reads(Kernel::Sa, 256), sa_budget);
 
         // Chromatic Gibbs spends `num_reads` threadgroups per problem, so the
         // same budget buys 4x fewer problems at 4x the reads. This is the whole
@@ -840,18 +839,15 @@ mod tests {
             let g_budget =
                 ((cores as f64 * env.unwrap_or(GIBBS_TG_PER_CORE)).round() as usize).max(1);
             assert_eq!(
-                batch_size_for_reads(Algorithm::Gibbs, 64),
+                batch_size_for_reads(Kernel::Gibbs, 64),
                 g_budget.div_ceil(64).max(1)
             );
             assert_eq!(
-                batch_size_for_reads(Algorithm::Gibbs, 256),
+                batch_size_for_reads(Kernel::Gibbs, 256),
                 g_budget.div_ceil(256).max(1)
             );
         }
-        assert!(
-            batch_size_for_reads(Algorithm::Gibbs, 4096) >= 1,
-            "never zero"
-        );
+        assert!(batch_size_for_reads(Kernel::Gibbs, 4096) >= 1, "never zero");
     }
 
     #[test]
@@ -882,7 +878,7 @@ mod tests {
             jobs: &mut job_rx,
             out: &out_tx,
             pending: &mut pending,
-            algorithm: Algorithm::Sa,
+            kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
         };
@@ -907,7 +903,7 @@ mod tests {
 
     #[test]
     fn next_seed_rejects_too_large() {
-        let n = algo_max_nodes(Algorithm::Sa) + 1;
+        let n = kernel_max_nodes(Kernel::Sa) + 1;
         let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(4);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
         let huge = job(
@@ -925,7 +921,7 @@ mod tests {
             jobs: &mut job_rx,
             out: &out_tx,
             pending: &mut pending,
-            algorithm: Algorithm::Sa,
+            kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
         };
@@ -952,7 +948,7 @@ mod tests {
             jobs: &mut job_rx,
             out: &out_tx,
             pending: &mut pending,
-            algorithm: Algorithm::Sa,
+            kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
         };
@@ -972,7 +968,7 @@ mod tests {
             jobs: &mut job_rx,
             out: &out_tx,
             pending: &mut pending,
-            algorithm: Algorithm::Sa,
+            kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
         };
@@ -1013,13 +1009,13 @@ mod tests {
         /// Problem batch size is always at least one, for any read count.
         #[test]
         fn batch_size_for_reads_never_zero(
-            algo in prop_oneof![Just(Algorithm::Sa), Just(Algorithm::Gibbs)],
+            kernel in prop_oneof![Just(Kernel::Sa), Just(Kernel::Gibbs)],
             num_reads in any::<usize>()
         ) {
             prop_assert!(
-                batch_size_for_reads(algo, num_reads) >= 1,
+                batch_size_for_reads(kernel, num_reads) >= 1,
                 "batch_size_for_reads({:?}, {}) returned 0",
-                algo,
+                kernel,
                 num_reads
             );
         }

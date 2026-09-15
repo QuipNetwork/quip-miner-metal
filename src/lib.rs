@@ -54,7 +54,7 @@ pub mod topology;
 
 pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 
-pub use sampler::sample_ising;
+pub use sampler::{sample_ising, Kernel};
 
 use quip_solver_core::{run, BackendIdentity, CommonArgs};
 use std::process::ExitCode;
@@ -144,7 +144,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 ///
 /// ```no_run
 /// use quip_miner_metal::{
-///     Algorithm, MetalSampler,
+///     Kernel, MetalSampler,
 ///     iokit_gov::UtilGovernor,
 ///     metal_device::MetalDevice,
 /// };
@@ -152,7 +152,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = MetalDevice::open(0)?;
 /// let gov = UtilGovernor::start(0, 100, false);
-/// let sampler = MetalSampler::new(device, gov, Algorithm::Sa);
+/// let sampler = MetalSampler::new(device, gov, Kernel::Sa);
 /// let _ = sampler;
 /// # Ok(())
 /// # }
@@ -161,7 +161,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 pub struct MetalSampler {
     device: crate::metal_device::MetalDevice,
     gov: crate::iokit_gov::UtilGovernor,
-    algorithm: Algorithm,
+    kernel: Kernel,
 }
 
 /// Metal backend config, parsed from the verbatim `config.toml` subsection in
@@ -185,7 +185,7 @@ impl MetalSampler {
     ///
     /// ```no_run
     /// use quip_miner_metal::{
-    ///     Algorithm, MetalSampler,
+    ///     Kernel, MetalSampler,
     ///     iokit_gov::UtilGovernor,
     ///     metal_device::MetalDevice,
     /// };
@@ -193,19 +193,19 @@ impl MetalSampler {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let device = MetalDevice::open(0)?;
     /// let gov = UtilGovernor::start(0, 100, false);
-    /// let _sampler = MetalSampler::new(device, gov, Algorithm::Gibbs);
+    /// let _sampler = MetalSampler::new(device, gov, Kernel::Gibbs);
     /// # Ok(())
     /// # }
     /// ```
     pub fn new(
         device: crate::metal_device::MetalDevice,
         gov: crate::iokit_gov::UtilGovernor,
-        algorithm: Algorithm,
+        kernel: Kernel,
     ) -> Self {
         Self {
             device,
             gov,
-            algorithm,
+            kernel,
         }
     }
 }
@@ -216,7 +216,7 @@ impl quip_solver_core::Sampler for MetalSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, quip_solver_core::SampleError> {
-        sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
+        sample_ising(&self.device, graph, params, self.kernel).map_err(|e| {
             // `kind` carries the local `sampler::SampleError` variant (Debug),
             // so a kernel compile failure and a device reset stay
             // distinguishable in the log even though both map to
@@ -245,11 +245,11 @@ impl quip_solver_core::Sampler for MetalSampler {
         // behavior, so the dependency is made explicit in the signature. The
         // governor is passed whole (not just a throttle closure) because sizing
         // is a loop: the stream reports its GPU time back through it.
-        streaming::run_stream(&self.device, self.algorithm, jobs, &out, &self.gov, &cancel);
+        streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
     }
 
     fn stream_width(&self) -> usize {
-        streaming::stream_width(&self.device, self.algorithm)
+        streaming::stream_width(&self.device, self.kernel)
     }
 
     fn utilization(&self) -> f64 {
@@ -261,7 +261,7 @@ impl quip_solver_core::Sampler for MetalSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        streaming::max_reads(self.algorithm)
+        streaming::max_reads(self.kernel)
     }
 
     fn apply_config(&self, backend_toml: &str) {
@@ -299,44 +299,44 @@ fn resolve_governor_config(
     (ceiling, yielding)
 }
 
-/// Algorithm selection at the type level, one tag per Metal binary.
+/// Kernel selection at the type level, one tag per Metal binary.
 ///
 /// [`quip_solver_core::Sampler::declared_stream_width`] is associated —
 /// `--capabilities` answers it with no device — so a width that differs per
-/// algorithm needs a `Sampler` type per binary. [`run_metal`] takes the tag
+/// kernel needs a `Sampler` type per binary. [`run_metal`] takes the tag
 /// and builds the matching [`TaggedSampler`].
 ///
 /// `Send + Sync + 'static` because `Sampler` requires them of the whole
 /// sampler type; a zero-sized tag satisfies all three trivially.
-pub trait AlgorithmTag: Send + Sync + 'static {
-    /// The algorithm this tag selects.
-    const ALGORITHM: Algorithm;
+pub trait KernelTag: Send + Sync + 'static {
+    /// The kernel this tag selects.
+    const KERNEL: Kernel;
 }
 
 /// Tag for `quip-metal-sa`.
 pub struct SaTag;
 
-impl AlgorithmTag for SaTag {
-    const ALGORITHM: Algorithm = Algorithm::Sa;
+impl KernelTag for SaTag {
+    const KERNEL: Kernel = Kernel::Sa;
 }
 
 /// Tag for `quip-metal-gibbs`.
 pub struct GibbsTag;
 
-impl AlgorithmTag for GibbsTag {
-    const ALGORITHM: Algorithm = Algorithm::Gibbs;
+impl KernelTag for GibbsTag {
+    const KERNEL: Kernel = Kernel::Gibbs;
 }
 
-/// [`MetalSampler`] bound to its binary's algorithm at the type level, so the
-/// associated `declared_stream_width` answers per algorithm. [`run_metal`]
-/// constructs the inner sampler from `A::ALGORITHM`, keeping the tag and the
-/// runtime algorithm equal by construction.
-pub struct TaggedSampler<A: AlgorithmTag> {
+/// [`MetalSampler`] bound to its binary's kernel at the type level, so the
+/// associated `declared_stream_width` answers per kernel. [`run_metal`]
+/// constructs the inner sampler from `A::KERNEL`, keeping the tag and the
+/// runtime kernel equal by construction.
+pub struct TaggedSampler<A: KernelTag> {
     inner: MetalSampler,
-    _algorithm: std::marker::PhantomData<A>,
+    _kernel: std::marker::PhantomData<A>,
 }
 
-impl<A: AlgorithmTag> quip_solver_core::Sampler for TaggedSampler<A> {
+impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
     fn sample(
         &self,
         graph: &IsingGraph,
@@ -359,10 +359,10 @@ impl<A: AlgorithmTag> quip_solver_core::Sampler for TaggedSampler<A> {
     }
 
     /// What the live [`MetalSampler::stream_width`] resolves to for this
-    /// tag's algorithm — the device does not participate in the Metal width,
+    /// tag's kernel — the device does not participate in the Metal width,
     /// so the advertised and live numbers agree by construction.
     fn declared_stream_width() -> u32 {
-        u32::try_from(streaming::declared_stream_width(A::ALGORITHM)).unwrap_or(u32::MAX)
+        u32::try_from(streaming::declared_stream_width(A::KERNEL)).unwrap_or(u32::MAX)
     }
 
     fn utilization(&self) -> f64 {
@@ -403,7 +403,7 @@ impl<A: AlgorithmTag> quip_solver_core::Sampler for TaggedSampler<A> {
 /// };
 /// let _code = run_metal::<SaTag>(METAL_SA_IDENTITY, &common, 0, 100, false);
 /// ```
-pub fn run_metal<A: AlgorithmTag>(
+pub fn run_metal<A: KernelTag>(
     id: BackendIdentity,
     common: &CommonArgs,
     device: usize,
@@ -418,8 +418,8 @@ pub fn run_metal<A: AlgorithmTag>(
             MetalDevice::open(device).map_err(|e| OpenError(format!("device {device}: {e}")))?;
         let gov = UtilGovernor::start(device as u32, utilization, yielding);
         Ok(TaggedSampler::<A> {
-            inner: MetalSampler::new(dev, gov, A::ALGORITHM),
-            _algorithm: std::marker::PhantomData,
+            inner: MetalSampler::new(dev, gov, A::KERNEL),
+            _kernel: std::marker::PhantomData,
         })
     })
 }
@@ -428,21 +428,20 @@ pub fn run_metal<A: AlgorithmTag>(
 mod tests {
     use super::resolve_governor_config;
 
-    /// A swapped tag constant would silently advertise the other algorithm's
-    /// width; pin the tag → algorithm binding. Device-free on purpose: the
+    /// A swapped tag constant would silently advertise the other kernel's
+    /// width; pin the tag → kernel binding. Device-free on purpose: the
     /// declared width must be answerable without a GPU.
     #[test]
-    fn tagged_declared_widths_follow_their_algorithms() {
-        use super::{GibbsTag, SaTag, TaggedSampler};
-        use quip_solver_core::{Algorithm, Sampler};
+    fn tagged_declared_widths_follow_their_kernels() {
+        use super::{GibbsTag, Kernel, SaTag, TaggedSampler};
+        use quip_solver_core::Sampler;
         assert_eq!(
             TaggedSampler::<SaTag>::declared_stream_width(),
-            u32::try_from(crate::streaming::declared_stream_width(Algorithm::Sa))
-                .unwrap_or(u32::MAX)
+            u32::try_from(crate::streaming::declared_stream_width(Kernel::Sa)).unwrap_or(u32::MAX)
         );
         assert_eq!(
             TaggedSampler::<GibbsTag>::declared_stream_width(),
-            u32::try_from(crate::streaming::declared_stream_width(Algorithm::Gibbs))
+            u32::try_from(crate::streaming::declared_stream_width(Kernel::Gibbs))
                 .unwrap_or(u32::MAX)
         );
     }

@@ -7,7 +7,7 @@
 
 use quip_miner_metal::metal_device::MetalDevice;
 use quip_miner_metal::sampler::sample_ising;
-use quip_miner_metal::{Algorithm, IsingGraph, SampleParams};
+use quip_miner_metal::{IsingGraph, Kernel, SampleParams};
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::quip_protocol::wire::{decode_spins, encode_spins};
 use serde_json::Value;
@@ -106,14 +106,14 @@ fn live_sample_energies_match_energy_milli() {
         ..Default::default()
     };
 
-    for algo in [Algorithm::Sa, Algorithm::Gibbs] {
-        let results = sample_ising(&dev, &graph, &params, algo).expect("sample");
+    for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        let results = sample_ising(&dev, &graph, &params, kernel).expect("sample");
         assert_eq!(results.len(), 16);
         for r in &results {
             let expected = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
             assert_eq!(
                 r.energy_milli, expected,
-                "{algo:?} reported energy_milli {} != consensus {}",
+                "{kernel:?} reported energy_milli {} != consensus {}",
                 r.energy_milli, expected
             );
             assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
@@ -146,7 +146,7 @@ fn sa_finds_ground_state_on_ferro() {
         seed: 42,
         ..Default::default()
     };
-    let results = sample_ising(&dev, &graph, &params, Algorithm::Sa).expect("sa");
+    let results = sample_ising(&dev, &graph, &params, Kernel::Sa).expect("sa");
     assert!(
         results.iter().any(|r| r.energy_milli == -1000),
         "SA failed to find ferro ground: {:?}",
