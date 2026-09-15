@@ -92,13 +92,26 @@ const METAL_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adap
 ///
 /// Reads are pinned to 128: four 32-lane words per problem, the count the
 /// CUDA port fixed for its shared-memory budget, kept here so the two `msa`
-/// miners answer the same job shape. Sweeps are not yet measured on Apple
-/// hardware; the benchmark in `tests/msa_bench.rs` sets them. Every accepted
-/// job is still bounded by `sampler::MAX_SWEEPS`.
+/// miners answer the same job shape. `max_sweeps` is the largest measured S
+/// at which MSA jobs/s stays at or above SA jobs/s at 2048 sweeps / 256
+/// reads. `min_sweeps = max_sweeps / 4`. Every accepted job is still bounded
+/// by `sampler::MAX_SWEEPS`.
+///
+/// Measured 2026-09-15 on Apple M4 Max (40 GPU cores), 40 jobs, 4576-node
+/// degree-20 graph. SA at 2048 sweeps / 256 reads: 0.47 jobs/s. MSA at 128
+/// reads, mean best in milli:
+///
+/// ```text
+/// S        jobs/s   mean best
+/// 2048     21.55    -15442350
+/// 4096     15.20    -15460150
+/// 8192      8.22    -15470200
+/// 16384     5.72    -15478300
+/// ```
 const METAL_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
     quip_solver_core::adapt::AdaptBounds {
-        min_sweeps: 2048,
-        max_sweeps: 8192,
+        min_sweeps: 4096,
+        max_sweeps: 16384,
         min_reads: 128,
         max_reads: 128,
         reads_solution_min_factor: 0,

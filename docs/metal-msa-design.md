@@ -205,13 +205,18 @@ commit, which bounds wasted work to about one chunk.
   the job elsewhere), and `N * 4 + static <= max_threadgroup_memory_length`
   on the opened device.
 - **Chunk rate.** `MSA_WORD_UPDATES_PER_SEC` with the same 0.7 safety factor
-  as SA. Initial value 0.2e9. **Exploratory**, replaced by measurement.
-- **Threadgroup budget.** `MSA_TG_PER_CORE`, initial 2.0. **Exploratory**.
-  `batch_size_for_reads(Kernel::Msa, reads)` divides the budget by `words`.
+  as SA. The 2026-09-15 run on Apple M4 Max measured 3.0e8 word-updates/s.
+  The largest `max_chunk_ms` after tuning was 199.
+- **Threadgroup budget.** `MSA_TG_PER_CORE` is 1.0. The 2026-09-15 run at 80
+  jobs measured 15.74, 8.93, 10.48, 10.31, 9.56 jobs/s at 1, 2, 4, 6, 8
+  tg/core. `batch_size_for_reads(Kernel::Msa, reads)` divides the budget by
+  `words`.
 - **Identity.** `METAL_MSA_IDENTITY`: backend `metal`, algorithm `msa`,
   `max_nodes = MSA_MAX_NODES`, features `streaming` and `governor`. Adapt
-  envelope initial `2048..8192` sweeps, `128` reads fixed (four words).
-  **Exploratory**. `MAX_SWEEPS = 65536` still bounds every accepted job.
+  envelope `4096..16384` sweeps, `128` reads fixed (four words). MSA at 128
+  reads was at least the SA rate of 0.47 jobs/s at 2048 sweeps and 256
+  reads. At 16384 sweeps MSA ran at 5.72 jobs/s. `MAX_SWEEPS = 65536` still
+  bounds every accepted job.
 - **Binary.** `quip-metal-msa`, same CLI as `quip-metal-sa`.
 
 ### Precondition on inputs
@@ -248,5 +253,8 @@ one unit of the CPU solver. This port keeps that coupling.
 4. On a 4576-node, degree-20 bipartite graph at 128 reads, the multi-spin
    miner completes more jobs per second than `quip-metal-sa` at the same
    sweep count, with every read a valid `+-1` vector whose reported energy
-   equals `energy_milli`. Numbers are recorded in the README.
+   equals `energy_milli`. The 2026-09-15 run used Chipset Model Apple M4 Max
+   with 40 GPU cores. At 40 jobs and 16384 sweeps, multi-spin ran at 5.72
+   jobs/s and SA ran at 0.13 jobs/s. The largest `max_chunk_ms` after tuning
+   was 199. The README records the numbers.
 5. The largest chunk stays under 500 ms at the tuned rate.

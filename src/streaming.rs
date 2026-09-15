@@ -54,13 +54,14 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
 /// ```text
 /// SA / sequential Gibbs:  threadgroups = P           (one per problem, R threads each)
 /// chromatic Gibbs:        threadgroups = P * R       (one per SAMPLE, 256 threads each)
-/// multi-spin:             threadgroups = P * (R/32)  (one per 32-lane word; unmeasured)
+/// multi-spin:             threadgroups = P * (R/32)  (one per 32-lane word)
 /// ```
 ///
 /// Budgeting in threadgroups instead makes one constant mean one thing. The SA
 /// and Gibbs values are from the occupancy sweep on an M4 Max (40 cores), full
 /// Advantage2 topology, 64 reads / 128 sweeps, measured in spin-updates/s from
-/// per-dispatch GPU time. The multi-spin figure is unmeasured.
+/// per-dispatch GPU time. The multi-spin figure is from the same machine,
+/// 80 jobs, 128 reads, 7392 sweeps, 4576-node degree-20 bipartite graph.
 ///
 /// ```text
 /// SA      tg/core:  0.2   0.5   1     2     3     4     6     8
@@ -70,6 +71,10 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
 /// Gibbs   tg/core:  16    32    64    128   182   256   384   512
 ///         Gupd/s:   2.06  2.05  2.12  2.09  2.05  2.00  1.98  1.98
 ///         dispatch: 0.36  0.73  1.43  2.82  4.10  5.95  8.88  11.87 s
+///
+/// MSA     tg/core:  1     2     4     6     8
+///         jobs/s:   15.74 8.93  10.48 10.31 9.56
+///         wall:     5.1   9.0   7.6   7.8   8.4 s
 /// ```
 ///
 /// SA climbs to 8 and is still gaining; 6 is the knee (+45% over the old
@@ -81,6 +86,9 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
 /// the range, and everything above merely lengthens dispatches. The old default
 /// put it at 128 tg/core, paying 8x the dispatch length for nothing.
 ///
+/// Multi-spin peaks at 1 tg/core; 2 through 8 are 33-43% slower. 1.0 is the
+/// knee.
+///
 /// Run-to-run variance is ~13%, so treat neighbouring points as ties.
 /// `QUIP_METAL_TG_PER_CORE` overrides for GPUs where the optimum differs.
 const SA_TG_PER_CORE: f64 = 6.0;
@@ -89,9 +97,10 @@ const SA_TG_PER_CORE: f64 = 6.0;
 const GIBBS_TG_PER_CORE: f64 = 16.0;
 /// See [`SA_TG_PER_CORE`]. Multi-spin threadgroups carry 256 threads and up
 /// to 26 KB of threadgroup memory each, so fewer are resident per core than
-/// SA's. Not yet measured: 2.0 is a starting point the benchmark in
-/// `tests/msa_bench.rs` replaces.
-const MSA_TG_PER_CORE: f64 = 2.0;
+/// SA's. Measured 2026-09-15 on Apple M4 Max (40 GPU cores): 1.0 is both
+/// the peak (15.74 jobs/s) and the smallest T within 10% of that peak;
+/// 2 through 8 sit at 8.93 to 10.48 jobs/s.
+const MSA_TG_PER_CORE: f64 = 1.0;
 
 /// Nominal reads used to size [`stream_width`] before any job has arrived:
 /// each kernel's adapt envelope `min_reads`, the smallest count the adapt

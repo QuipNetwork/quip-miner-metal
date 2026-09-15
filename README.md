@@ -86,8 +86,13 @@ kernels, because the device does not compute energies. Couplings must be in
 degree must be at most 20. The miner rejects denser graphs as over capacity
 so the coordinator routes them elsewhere.
 
-Throughput: not yet measured. `tests/msa_bench.rs` (run with
-`cargo test --release --test msa_bench -- --ignored --nocapture`) records it.
+The 2026-09-15 run measured throughput. The machine is Chipset Model Apple M4
+Max with 40 GPU cores. The fixture is a 4576-node, degree-20 bipartite graph.
+At 40 jobs and 128 reads with 16384 sweeps, the multi-spin kernel ran at 5.72
+jobs/s and SA ran at 0.13 jobs/s. After tuning, the largest `max_chunk_ms` was
+199. Run `tests/msa_bench.rs` with
+`cargo test --release --test msa_bench -- --ignored --nocapture` to repeat the
+measurement.
 
 ## Tests
 

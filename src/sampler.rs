@@ -274,10 +274,13 @@ const GIBBS_THROUGHPUT_SAFETY: f64 = 0.7;
 /// replicas of one spin: 21 threadgroup loads, a 21-input carry-save tree,
 /// and one store.
 ///
-/// Not yet measured. 0.2e9 is a tenth of SA's saturated spin-update rate,
-/// chosen pessimistic so the first chunks cannot approach the watchdog. The
-/// benchmark in `tests/msa_bench.rs` replaces it with a measured value.
-const MSA_WORD_UPDATES_PER_SEC: f64 = 0.2e9;
+/// Measured 2026-09-15 on Apple M4 Max (40 GPU cores): at 40 jobs, 128
+/// reads, 7392 sweeps, 4576 nodes, largest `max_chunk_ms` was 122 against a
+/// 500 ms target at 0.2e9 * 0.7, so 0.2e9 * 500 / 122 = 8.1967e8, rounded
+/// down to 8.1e8. Re-runs at 8.1e8, 4.8e8, and 3.6e8 peaked at 667 ms,
+/// 522 ms, and 425 ms. 425 ms is inside the ~13% run-to-run noise of 400 ms,
+/// so the rate is 3.6e8 * 400 / 425 = 3.388e8, taken conservative at 3.0e8.
+const MSA_WORD_UPDATES_PER_SEC: f64 = 3.0e8;
 /// See [`SA_THROUGHPUT_SAFETY`].
 const MSA_THROUGHPUT_SAFETY: f64 = 0.7;
 
