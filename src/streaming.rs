@@ -60,8 +60,7 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
 /// Budgeting in threadgroups instead makes one constant mean one thing. The SA
 /// and Gibbs values are from the occupancy sweep on an M4 Max (40 cores), full
 /// Advantage2 topology, 64 reads / 128 sweeps, measured in spin-updates/s from
-/// per-dispatch GPU time. The multi-spin figure is from the same machine,
-/// 80 jobs, 128 reads, 7392 sweeps, 4576-node degree-20 bipartite graph.
+/// per-dispatch GPU time. Multi-spin measurements are in [`MSA_TG_PER_CORE`].
 ///
 /// ```text
 /// SA      tg/core:  0.2   0.5   1     2     3     4     6     8
@@ -71,10 +70,6 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
 /// Gibbs   tg/core:  16    32    64    128   182   256   384   512
 ///         Gupd/s:   2.06  2.05  2.12  2.09  2.05  2.00  1.98  1.98
 ///         dispatch: 0.36  0.73  1.43  2.82  4.10  5.95  8.88  11.87 s
-///
-/// MSA     tg/core:  1     2     4     6     8
-///         jobs/s:   15.74 8.93  10.48 10.31 9.56
-///         wall:     5.1   9.0   7.6   7.8   8.4 s
 /// ```
 ///
 /// SA climbs to 8 and is still gaining; 6 is the knee (+45% over the old
@@ -86,20 +81,26 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
 /// the range, and everything above merely lengthens dispatches. The old default
 /// put it at 128 tg/core, paying 8x the dispatch length for nothing.
 ///
-/// Multi-spin peaks at 1 tg/core; 2 through 8 are 33-43% slower. 1.0 is the
-/// knee.
-///
 /// Run-to-run variance is ~13%, so treat neighbouring points as ties.
 /// `QUIP_METAL_TG_PER_CORE` overrides for GPUs where the optimum differs.
 const SA_TG_PER_CORE: f64 = 6.0;
 /// See [`SA_TG_PER_CORE`]. Chromatic Gibbs saturates here; higher only costs
 /// dispatch length.
 const GIBBS_TG_PER_CORE: f64 = 16.0;
-/// See [`SA_TG_PER_CORE`]. Multi-spin threadgroups carry 256 threads and up
-/// to 26 KB of threadgroup memory each, so fewer are resident per core than
-/// SA's. Measured 2026-09-15 on Apple M4 Max (40 GPU cores): 1.0 is both
-/// the peak (15.74 jobs/s) and the smallest T within 10% of that peak;
-/// 2 through 8 sit at 8.93 to 10.48 jobs/s.
+/// Multi-spin threadgroup budget per GPU core.
+///
+/// Measured 2026-09-15 on Apple M4 Max (40 GPU cores), using
+/// `tests/fixtures/advantage2-system1.edges`: 4577 nodes, 41515 edges, eight
+/// greedy colour classes. Each run used 80 jobs, 128 reads and 7392 sweeps.
+///
+/// ```text
+/// T, tg/core:  1      2      4      6      8
+/// jobs/s:     13.64  14.23  12.16  11.57  10.85
+/// wall, s:     5.9    5.6    6.6    6.9    7.4
+/// ```
+///
+/// T=1 is the smallest within 10% of the best: 13.64 >= 0.9 * 14.23.
+/// Each group uses 256 threads and 26,756 bytes of memory on this fixture.
 const MSA_TG_PER_CORE: f64 = 1.0;
 
 /// Nominal reads used to size [`stream_width`] before any job has arrived:
@@ -539,80 +540,88 @@ pub fn run_stream(
 }
 
 /// Collect the next batch and commit it to the GPU without waiting. With
-/// [`Seed::Blocking`], waits for the seed (returns `None` only on channel
-/// close); the non-blocking overlap path returns `None` if no job is
-/// immediately queued or on an encode failure (the caller finishes the
-/// in-flight batch, then retries).
+/// [`Seed::Blocking`], waits for a seed and retries after rejecting a batch
+/// or cancelling all its jobs. Returns `None` only when the job channel closes.
+/// The non-blocking overlap path also returns `None` if no job is queued,
+/// encoding fails, or cancellation empties the batch. The caller then finishes
+/// the in-flight batch before retrying with a blocking seed.
 fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<InFlight> {
-    // Yield before taking a seed, not after: once a job is dequeued it is ours
-    // to answer, and holding it through a pause would stall the coordinator's
-    // credit for no benefit.
-    ctx.yield_gate();
-    let seed_job = next_seed(ctx, seed)?;
-    // Batch size follows the seed's read count: chromatic Gibbs spends
-    // `num_reads` threadgroups per problem, so the same threadgroup budget is a
-    // different number of problems at 64 reads than at 256.
-    //
-    // Scaled by the governor: the utilization ceiling, less any external load
-    // while yielding. Sizing the dispatch is what actually shares the GPU —
-    // a smaller grid leaves cores free for whoever else wants them, for the
-    // whole duration of the dispatch rather than only in the gaps.
-    let nominal = batch_size_for_reads(ctx.kernel, seed_job.params.num_reads);
-    let cap = scale_budget(nominal, ctx.gov.budget_scale());
-    // Keep `seed_job` live while `key` borrows its edge list; collect further
-    // matches into a side vec, then assemble the full batch.
-    let mut matches = Vec::with_capacity(cap.saturating_sub(1));
-    {
-        let key = BatchKey::from_job(&seed_job);
-        fill_batch(ctx, &key, &mut matches, 1, cap);
-    }
-    let mut batch = Vec::with_capacity(matches.len() + 1);
-    batch.push(seed_job);
-    batch.append(&mut matches);
+    loop {
+        // Yield before taking a seed, not after: once a job is dequeued it is ours
+        // to answer, and holding it through a pause would stall the coordinator's
+        // credit for no benefit.
+        ctx.yield_gate();
+        let seed_job = next_seed(ctx, seed)?;
+        // Batch size follows the seed's read count: chromatic Gibbs spends
+        // `num_reads` threadgroups per problem, so the same threadgroup budget is a
+        // different number of problems at 64 reads than at 256.
+        //
+        // Scaled by the governor: the utilization ceiling, less any external load
+        // while yielding. Sizing the dispatch is what actually shares the GPU —
+        // a smaller grid leaves cores free for whoever else wants them, for the
+        // whole duration of the dispatch rather than only in the gaps.
+        let nominal = batch_size_for_reads(ctx.kernel, seed_job.params.num_reads);
+        let cap = scale_budget(nominal, ctx.gov.budget_scale());
+        // Keep `seed_job` live while `key` borrows its edge list; collect further
+        // matches into a side vec, then assemble the full batch.
+        let mut matches = Vec::with_capacity(cap.saturating_sub(1));
+        {
+            let key = BatchKey::from_job(&seed_job);
+            fill_batch(ctx, &key, &mut matches, 1, cap);
+        }
+        let mut batch = Vec::with_capacity(matches.len() + 1);
+        batch.push(seed_job);
+        batch.append(&mut matches);
 
-    // Last checkpoint before the GPU commits: filling a batch can take up to
-    // `hard_cap`, and a `Cancel` arriving in that window would otherwise buy a
-    // full dispatch of abandoned work. Re-check every job now that the batch is
-    // final; once committed, the dispatch runs to completion (Metal offers no
-    // mid-kernel abort).
-    if batch.iter().any(|j| ctx.cancel.is_cancelled(j.watermark)) {
-        let (live, stale): (Vec<StreamJob>, Vec<StreamJob>) = batch
-            .into_iter()
-            .partition(|j| !ctx.cancel.is_cancelled(j.watermark));
-        for job in stale {
-            send_cancelled(ctx.out, job);
-        }
-        batch = live;
-        if batch.is_empty() {
-            return None;
-        }
-    }
-
-    // Scope `graphs` so its borrow of `batch` ends before `batch` moves.
-    let encoded = {
-        let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
-        sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel)
-    };
-    match encoded {
-        Ok(enc) => {
-            tracing::debug!(batch = batch.len(), cap, chunks = enc.chunk_count(), seed = ?seed, "committed batch");
-            Some(InFlight {
-                encoded: enc,
-                jobs: batch,
-            })
-        }
-        Err(e) => {
-            // Every job in a batch shares the encode inputs that can be
-            // refused for size (`num_sweeps` is part of the batch key, and `N`
-            // is pre-filtered by `next_seed`), so a capacity refusal applies to
-            // all of them alike — reject the batch with the condition the
-            // failure actually carries rather than a blanket `DeviceFault`.
-            let err = e.to_sample_error();
-            tracing::error!(error = %e, ?err, "metal batch encode failed");
-            for job in batch {
-                send_reject(ctx.out, job, err.clone());
+        // Last checkpoint before the GPU commits: filling a batch can take up to
+        // `hard_cap`, and a `Cancel` arriving in that window would otherwise buy a
+        // full dispatch of abandoned work. Re-check every job now that the batch is
+        // final; once committed, the dispatch runs to completion (Metal offers no
+        // mid-kernel abort).
+        if batch.iter().any(|j| ctx.cancel.is_cancelled(j.watermark)) {
+            let (live, stale): (Vec<StreamJob>, Vec<StreamJob>) = batch
+                .into_iter()
+                .partition(|j| !ctx.cancel.is_cancelled(j.watermark));
+            for job in stale {
+                send_cancelled(ctx.out, job);
             }
-            None
+            batch = live;
+            if batch.is_empty() {
+                if seed == Seed::NonBlocking {
+                    return None;
+                }
+                continue;
+            }
+        }
+
+        // Scope `graphs` so its borrow of `batch` ends before `batch` moves.
+        let encoded = {
+            let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
+            sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel)
+        };
+        match encoded {
+            Ok(enc) => {
+                tracing::debug!(batch = batch.len(), cap, chunks = enc.chunk_count(), seed = ?seed, "committed batch");
+                return Some(InFlight {
+                    encoded: enc,
+                    jobs: batch,
+                });
+            }
+            Err(e) => {
+                // Every job in a batch shares the encode inputs that can be
+                // refused for size (`num_sweeps` is part of the batch key, and `N`
+                // is pre-filtered by `next_seed`), so a capacity refusal applies to
+                // all of them alike — reject the batch with the condition the
+                // failure actually carries rather than a blanket `DeviceFault`.
+                let err = e.to_sample_error();
+                tracing::error!(error = %e, ?err, "metal batch encode failed");
+                for job in batch {
+                    send_reject(ctx.out, job, err.clone());
+                }
+            }
+        }
+        if seed == Seed::NonBlocking {
+            return None;
         }
     }
 }
@@ -990,6 +999,47 @@ mod tests {
             StreamOutcome::Completed(Err(SampleError::Capacity))
         );
         assert!(is_too_large, "expected Capacity, got unexpected reject/ok");
+    }
+
+    #[test]
+    fn run_stream_continues_after_msa_degree_rejection() {
+        let device = MetalDevice::open(0).unwrap();
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(2);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(2);
+        let star = IsingGraph::new(
+            vec![0.0; 22],
+            vec![1.0; 21],
+            (1..=21).map(|leaf| (0, leaf)).collect(),
+        );
+        job_tx.blocking_send(job(b"star", star, 64, 32, 1)).unwrap();
+        job_tx
+            .blocking_send(job(b"ring", ring4(), 64, 32, 1))
+            .unwrap();
+        drop(job_tx);
+
+        run_stream(
+            &device,
+            Kernel::Msa,
+            job_rx,
+            &out_tx,
+            &NoGovernor,
+            &CancelToken::default(),
+        );
+        drop(out_tx);
+
+        let rejected = out_rx.blocking_recv().expect("star rejection");
+        assert_eq!(rejected.job_id, b"star");
+        assert!(matches!(
+            rejected.outcome,
+            StreamOutcome::Completed(Err(SampleError::Capacity))
+        ));
+        let completed = out_rx.blocking_recv().expect("ring result after rejection");
+        assert_eq!(completed.job_id, b"ring");
+        let StreamOutcome::Completed(Ok(reads)) = completed.outcome else {
+            panic!("expected successful ring result");
+        };
+        assert_eq!(reads.len(), 64);
+        assert!(out_rx.blocking_recv().is_none());
     }
 
     #[test]

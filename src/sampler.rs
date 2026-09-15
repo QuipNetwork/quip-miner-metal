@@ -29,10 +29,9 @@ use thiserror::Error;
 
 /// Which GPU kernel a binary drives.
 ///
-/// Distinct from [`quip_solver_core::Algorithm`]: the coordinator protocol
-/// only names `sa` and `gibbs`, and more than one kernel can serve `sa`. The
-/// crate keys pipelines, node caps, chunk rates, and threadgroup budgets on
-/// the kernel, not the protocol algorithm.
+/// Distinct from [`quip_solver_core::Algorithm`], which does not have a
+/// variant for every kernel. The crate keys pipelines, node caps, chunk
+/// rates, and threadgroup budgets on `Kernel`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kernel {
     /// Metropolis simulated annealing, one thread per read
@@ -270,19 +269,33 @@ const GIBBS_UPDATES_PER_SEC: f64 = 1.2e9;
 /// which the aggregate rate above does not separate out.
 const GIBBS_THROUGHPUT_SAFETY: f64 = 0.7;
 
-/// Multi-spin word-update rate, word-updates/s. One word update advances 32
-/// replicas of one spin: 21 threadgroup loads, a 21-input carry-save tree,
-/// and one store.
+/// Multi-spin occupancy curve: `(threadgroups per core, word-updates/s)`.
+/// One word update advances 32 replicas of one spin.
 ///
-/// Measured 2026-09-15 on Apple M4 Max (40 GPU cores): at 40 jobs, 128
-/// reads, 7392 sweeps, 4576 nodes, largest `max_chunk_ms` was 122 against a
-/// 500 ms target at 0.2e9 * 0.7, so 0.2e9 * 500 / 122 = 8.1967e8, rounded
-/// down to 8.1e8. Re-runs at 8.1e8, 4.8e8, and 3.6e8 peaked at 667 ms,
-/// 522 ms, and 425 ms. 425 ms is inside the ~13% run-to-run noise of 400 ms,
-/// so the rate is 3.6e8 * 400 / 425 = 3.388e8, taken conservative at 3.0e8.
-const MSA_WORD_UPDATES_PER_SEC: f64 = 3.0e8;
-/// See [`SA_THROUGHPUT_SAFETY`].
-const MSA_THROUGHPUT_SAFETY: f64 = 0.7;
+/// Measured 2026-09-15 on Apple M4 Max (40 GPU cores), using
+/// `tests/fixtures/advantage2-system1.edges`: 4577 nodes, 41515 edges, eight
+/// greedy colour classes. At T=1 and 7392 sweeps, calibration used 1, 2, 5,
+/// 10, 40 jobs at 128 reads and 1, 2 jobs at 256 reads. Each point takes the
+/// slowest batch at that occupancy, rounded to two significant figures.
+/// At safety 0.2, three rounds of 1, 2, 5, 10, 40 jobs at T=1, 128 reads
+/// and 7392 sweeps confirmed a largest chunk of 261 ms, in a 40-job run.
+/// The 40-job envelope at 2048, 4096, 8192 and 16384 sweeps peaked at 258 ms.
+const MSA_OCCUPANCY_CURVE: [(f64, f64); 5] = [
+    (0.1, 2.6e8),
+    (0.2, 5.2e8),
+    (0.4, 1.0e9),
+    (0.5, 1.2e9),
+    (1.0, 1.2e9),
+];
+/// Margin applied to [`MSA_OCCUPANCY_CURVE`] for per-chunk timing variation.
+/// On 2026-09-15, Apple M4 Max (40 GPU cores), the Advantage2 System 1 fixture
+/// at T=1, 128 reads and 7392 sweeps reached 580 ms at safety 0.7 across
+/// 1, 2, 5, 10, 40 jobs. Scaling to 400 ms gives `0.7 * 400 / 580 = 0.483`.
+/// Safety 0.4 passed three 7392-sweep rounds at 375 ms but reached 606 ms at
+/// 16384 sweeps and 40 jobs. `0.4 * 400 / 606 = 0.264` reaches the boundary.
+/// Use 0.2 to leave margin across the measured sweep envelope.
+/// Final verification at those settings peaked at 261 ms over three rounds.
+const MSA_THROUGHPUT_SAFETY: f64 = 0.2;
 
 /// Expected updates per second for a dispatch of `groups` threadgroups: spin
 /// updates for SA and Gibbs, word updates (32 replicas each) for the
@@ -292,32 +305,31 @@ const MSA_THROUGHPUT_SAFETY: f64 = 0.7;
 /// origin (a nearly-empty GPU really is proportionally slow); above the last it
 /// is held flat, since throughput has saturated by then.
 fn estimated_updates_per_sec(kernel: Kernel, groups: usize) -> f64 {
-    if kernel == Kernel::Msa {
-        return MSA_WORD_UPDATES_PER_SEC * MSA_THROUGHPUT_SAFETY;
-    }
-    if kernel == Kernel::Gibbs {
-        return GIBBS_UPDATES_PER_SEC * GIBBS_THROUGHPUT_SAFETY;
-    }
+    let (curve, safety, unit): (&[(f64, f64)], f64, f64) = match kernel {
+        Kernel::Sa => (&OCCUPANCY_CURVE, SA_THROUGHPUT_SAFETY, 1e9),
+        Kernel::Msa => (&MSA_OCCUPANCY_CURVE, MSA_THROUGHPUT_SAFETY, 1.0),
+        Kernel::Gibbs => return GIBBS_UPDATES_PER_SEC * GIBBS_THROUGHPUT_SAFETY,
+    };
     let cores = crate::iokit_gov::gpu_core_count().unwrap_or(10).max(1);
     let x = groups as f64 / cores as f64;
-    let (first_x, first_y) = OCCUPANCY_CURVE[0];
-    let (last_x, last_y) = OCCUPANCY_CURVE[OCCUPANCY_CURVE.len() - 1];
-    let gups = if x <= first_x {
+    let (first_x, first_y) = curve[0];
+    let (last_x, last_y) = curve[curve.len() - 1];
+    let rate = if x <= first_x {
         // Straight line through the origin, so a tiny batch is never credited
         // with more throughput than it can reach.
-        first_y * (x / first_x).max(0.05)
+        first_y * x / first_x
     } else if x >= last_x {
         last_y
     } else {
-        let hi = OCCUPANCY_CURVE
+        let hi = curve
             .iter()
             .position(|&(px, _)| px >= x)
-            .unwrap_or(OCCUPANCY_CURVE.len() - 1);
-        let (x0, y0) = OCCUPANCY_CURVE[hi - 1];
-        let (x1, y1) = OCCUPANCY_CURVE[hi];
+            .unwrap_or(curve.len() - 1);
+        let (x0, y0) = curve[hi - 1];
+        let (x1, y1) = curve[hi];
         y0 + (y1 - y0) * (x - x0) / (x1 - x0)
     };
-    gups * 1e9 * SA_THROUGHPUT_SAFETY
+    rate * unit * safety
 }
 
 /// Split a beta schedule into chunks whose dispatches each land near
@@ -1582,13 +1594,17 @@ mod tests {
     #[test]
     fn msa_batch_packs_each_problem_and_word_into_its_own_region() {
         let device = crate::metal_device::MetalDevice::open(0).unwrap();
-        let a = chain(40);
-        let b = chain(40);
+        let n = 128;
+        let mut a = chain(n);
+        a.h.fill(1.0);
+        let mut b = chain(n);
+        b.h.fill(-1.0);
         let params = SampleParams {
             num_reads: 64,
             num_sweeps: 32,
             sweeps_per_beta: 1,
-            beta_range: Some((0.1, 4.0)),
+            // Keep thermal variation so distinct words need not converge.
+            beta_range: Some((0.1, 0.5)),
             seed: 3,
         };
         let batch = encode_batch(&device, &[&a, &b], &params, Kernel::Msa).unwrap();
@@ -1596,17 +1612,48 @@ mod tests {
         assert!(batch.failed_status().is_none());
         let per_problem = harvest_batch(&batch, &[&a, &b]).unwrap();
         assert_eq!(per_problem.len(), 2);
-        for reads in &per_problem {
+        for (problem, reads) in per_problem.iter().enumerate() {
             assert_eq!(reads.len(), 64);
             for r in reads {
-                assert_eq!(r.spins.len(), 40);
+                assert_eq!(r.spins.len(), n);
                 assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
+                // E includes +h*s, so a spin opposite to its field lowers E.
+                let preferred = if problem == 0 { -1 } else { 1 };
+                assert!(
+                    r.spins.iter().filter(|&&s| s == preferred).count() > n / 2,
+                    "problem {problem} read must reflect its own fields"
+                );
             }
+            // Each problem has two words with independent random streams.
+            let (w0, w1) = reads.split_at(32);
+            assert!(
+                w0.iter().zip(w1).any(|(x, y)| x.spins != y.spins),
+                "problem {problem} words must differ"
+            );
         }
-        // 64 reads are two 32-lane words drawn from independent streams, so
-        // the two words of one problem are not copies of each other.
-        let (w0, w1) = per_problem[0].split_at(32);
-        assert!(w0.iter().zip(w1).any(|(x, y)| x.spins != y.spins));
+    }
+
+    #[test]
+    fn msa_throughput_scales_with_occupancy() {
+        assert_eq!(estimated_updates_per_sec(Kernel::Msa, 0), 0.0);
+        let cores = crate::iokit_gov::gpu_core_count().unwrap_or(10).max(1);
+        let (first_x, first_y) = MSA_OCCUPANCY_CURVE[0];
+        let first_groups = first_x * cores as f64;
+        for groups in 0..first_groups.ceil() as usize {
+            let expected = first_y * MSA_THROUGHPUT_SAFETY * groups as f64 / first_groups;
+            let actual = estimated_updates_per_sec(Kernel::Msa, groups);
+            assert!((actual - expected).abs() <= expected.max(1.0) * 1e-12);
+        }
+        let mut previous = 0.0;
+        for groups in 1..=cores * 2 {
+            let rate = estimated_updates_per_sec(Kernel::Msa, groups);
+            assert!(rate >= previous, "rate decreased at {groups} groups");
+            previous = rate;
+        }
+        assert_eq!(
+            estimated_updates_per_sec(Kernel::Msa, cores * 2),
+            MSA_OCCUPANCY_CURVE.last().unwrap().1 * MSA_THROUGHPUT_SAFETY
+        );
     }
 
     #[test]

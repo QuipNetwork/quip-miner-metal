@@ -97,17 +97,23 @@ const METAL_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adap
 /// reads. `min_sweeps = max_sweeps / 4`. Every accepted job is still bounded
 /// by `sampler::MAX_SWEEPS`.
 ///
-/// Measured 2026-09-15 on Apple M4 Max (40 GPU cores), 40 jobs, 4576-node
-/// degree-20 graph. SA at 2048 sweeps / 256 reads: 0.47 jobs/s. MSA at 128
+/// Measured 2026-09-15 on Apple M4 Max (40 GPU cores), using
+/// `tests/fixtures/advantage2-system1.edges`: 4577 nodes, 41515 edges, eight
+/// greedy colour classes. Each run used 40 jobs. SA at its production T=6,
+/// 2048 sweeps and 256 reads: 1.02 jobs/s. MSA at T=1, safety 0.2 and 128
 /// reads, mean best in milli:
 ///
 /// ```text
 /// S        jobs/s   mean best
-/// 2048     21.55    -15442350
-/// 4096     15.20    -15460150
-/// 8192      8.22    -15470200
-/// 16384     5.72    -15478300
+/// 2048     34.75    -14804550
+/// 4096     21.94    -14818500
+/// 8192     12.86    -14826600
+/// 16384     7.27    -14832850
 /// ```
+///
+/// The largest tested S meets the reference: 7.27 >= 1.02 jobs/s. Thus
+/// max_sweeps = 16384 and min_sweeps = 16384 / 4 = 4096. Envelope chunks
+/// peaked at 258 ms. `MAX_SWEEPS = 65536` still admits the advertised maximum.
 const METAL_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
     quip_solver_core::adapt::AdaptBounds {
         min_sweeps: 4096,

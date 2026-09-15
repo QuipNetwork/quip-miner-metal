@@ -204,19 +204,38 @@ commit, which bounds wasted work to about one chunk.
   32 KB cap), CSR degree at most 20 (`TooLarge`, so the coordinator routes
   the job elsewhere), and `N * 4 + static <= max_threadgroup_memory_length`
   on the opened device.
-- **Chunk rate.** `MSA_WORD_UPDATES_PER_SEC` with the same 0.7 safety factor
-  as SA. The 2026-09-15 run on Apple M4 Max measured 3.0e8 word-updates/s.
-  The largest `max_chunk_ms` after tuning was 199.
-- **Threadgroup budget.** `MSA_TG_PER_CORE` is 1.0. The 2026-09-15 run at 80
-  jobs measured 15.74, 8.93, 10.48, 10.31, 9.56 jobs/s at 1, 2, 4, 6, 8
-  tg/core. `batch_size_for_reads(Kernel::Msa, reads)` divides the budget by
-  `words`.
+- **Chunk rate.** `MSA_OCCUPANCY_CURVE` records word-updates/s at each
+  occupancy. It shares interpolation with the simulated annealing kernel.
+  The curve scales toward zero below its first point. It stays flat for
+  occupancies greater than its last point. The 2026-09-15 measurements used
+  Apple M4 Max with 40 GPU cores and `tests/fixtures/advantage2-system1.edges`.
+  This fixture has 4577 nodes, 41515 edges, and eight greedy classes.
+  At T=1 and 7392 sweeps,
+  calibration used 1, 2, 5, 10, and 40 jobs with 128 reads.
+  It also used 1 and 2 jobs with 256 reads. The curve points are
+  `(0.1, 2.6e8)`, `(0.2, 5.2e8)`, `(0.4, 1.0e9)`, `(0.5, 1.2e9)`, and
+  `(1.0, 1.2e9)`. Each pair gives threadgroups per core and word-updates/s.
+  Safety 0.7 produced a 580 ms chunk. Safety 0.4 reached 606 ms at 16384
+  sweeps. The factor is 0.2 to cover the measured sweep range.
+  Three verification rounds used T=1, 128 reads, and 7392 sweeps.
+  Each round covered 1, 2, 5, 10, and 40 jobs.
+  The largest chunk was 261 ms in a 40-job run.
+- **Threadgroup budget.** `MSA_TG_PER_CORE` is 1.0. On the same machine and
+  fixture, the 2026-09-15 runs used 80 jobs, 128 reads, and 7392 sweeps.
+  Rates were 13.64, 14.23, 12.16, 11.57, and 10.85 jobs/s at T=1, 2, 4, 6,
+  and 8. T=1 is the smallest within 10% of the peak at T=2.
+  `batch_size_for_reads(Kernel::Msa, reads)` divides the budget by `words`.
 - **Identity.** `METAL_MSA_IDENTITY`: backend `metal`, algorithm `msa`,
   `max_nodes = MSA_MAX_NODES`, features `streaming` and `governor`. Adapt
-  envelope `4096..16384` sweeps, `128` reads fixed (four words). MSA at 128
-  reads was at least the SA rate of 0.47 jobs/s at 2048 sweeps and 256
-  reads. At 16384 sweeps MSA ran at 5.72 jobs/s. `MAX_SWEEPS = 65536` still
-  bounds every accepted job.
+  envelope `4096..16384` sweeps, with `128` reads fixed at four words.
+  On the same fixture and machine, the 2026-09-15 reference reached 1.02
+  jobs/s at 2048 sweeps and 256 reads, using its production T=6.
+  The multi-spin kernel used T=1, safety 0.2, 40 jobs, and 128 reads.
+  It reached 34.75, 21.94, 12.86, and 7.27 jobs/s at 2048, 4096, 8192, and
+  16384 sweeps. The largest tested count meets the reference, so
+  `max_sweeps = 16384` and `min_sweeps = 16384 / 4 = 4096`.
+  The envelope chunks peaked at 258 ms. `MAX_SWEEPS = 65536` still bounds
+  every accepted job.
 - **Binary.** `quip-metal-msa`, same CLI as `quip-metal-sa`.
 
 ### Precondition on inputs
@@ -239,8 +258,10 @@ one unit of the CPU solver. This port keeps that coupling.
 - Diagnostic compile switches.
 - A `ulong` word variant with state in device memory, for a benchmark against
   the `uint` threadgroup design.
-- A Zephyr-specific four-colouring. Greedy colouring gives four colours on
-  Zephyr already.
+- A Zephyr four-coloring. Advantage2 System 1 has eight greedy
+  classes, with sizes 856, 840, 827, 742, 679, 472, 146, and 15.
+  A four-coloring would halve the barriers per sweep. This remains follow-up
+  work.
 
 ## Success criteria
 
@@ -250,11 +271,15 @@ one unit of the CPU solver. This port keeps that coupling.
    golden parity, chunk identity, and streaming tests.
 3. `quip-metal-msa --capabilities` advertises `"algorithm":"msa"` and
    `--check` succeeds.
-4. On a 4576-node, degree-20 bipartite graph at 128 reads, the multi-spin
-   miner completes more jobs per second than `quip-metal-sa` at the same
-   sweep count, with every read a valid `+-1` vector whose reported energy
-   equals `energy_milli`. The 2026-09-15 run used Chipset Model Apple M4 Max
-   with 40 GPU cores. At 40 jobs and 16384 sweeps, multi-spin ran at 5.72
-   jobs/s and SA ran at 0.13 jobs/s. The largest `max_chunk_ms` after tuning
-   was 199. The README records the numbers.
-5. The largest chunk stays under 500 ms at the tuned rate.
+4. Use `tests/fixtures/advantage2-system1.edges`, with 4577 nodes, 41515
+   edges, and eight greedy classes. Each read must contain only `+-1`
+   spins, with energy equal to `energy_milli`.
+   The multi-spin kernel at 128 reads must meet the simulated annealing
+   reference rate at 2048 sweeps and 256 reads.
+   Measurements on 2026-09-15 used Apple M4 Max with 40 GPU cores and 40 jobs.
+   At T=1 and 16384 sweeps, multi-spin reached 7.27 jobs/s.
+   The reference reached 1.02 jobs/s at its production T=6.
+   With safety 0.2, three rounds at 7392 sweeps peaked at 261 ms.
+   Each round covered 1, 2, 5, 10, and 40 jobs at 128 reads.
+   The envelope measurements peaked at 258 ms. The README records these results.
+5. The largest chunk stays at or below 400 ms at the tuned rate.
