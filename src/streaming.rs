@@ -48,8 +48,8 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
 /// Threadgroup budget per GPU core, per algorithm — the measured definition of
 /// "fully loaded" for this backend.
 ///
-/// The two kernels map to hardware differently, so a single problems-per-core
-/// constant means two different occupancies:
+/// The three kernels map to hardware differently, so a single problems-per-core
+/// constant means three different occupancies:
 ///
 /// ```text
 /// SA / sequential Gibbs:  threadgroups = P           (one per problem, R threads each)
