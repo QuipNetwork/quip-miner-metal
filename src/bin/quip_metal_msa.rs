@@ -18,6 +18,9 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
 struct Cli {
+    #[arg(long, hide = true,
+        conflicts_with_all = ["quip_coordinator", "capabilities", "check", "solve"])]
+    ane_worker: Option<u32>,
     #[command(flatten)]
     common: CommonArgs,
     /// Metal device index. Default 0 → miner id `metal-0`.
@@ -33,6 +36,9 @@ struct Cli {
 
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
+    if let Some(parent_pid) = cli.ane_worker {
+        return quip_miner_ane::worker_main(parent_pid);
+    }
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("metal-{}", cli.device));
     }

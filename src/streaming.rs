@@ -2,15 +2,15 @@
 //!
 //! Mirrors v0.2 `GPU/metal_sa.py::stream_read_split_batches` /
 //! `_dispatch_batch`: collect up to [`stream_width`] queued jobs that share a
-//! topology + sampling params, dispatch them as **one** command buffer with
-//! `num_problems = batch size` (one threadgroup per problem → one GPU core per
-//! problem, filling the GPU), wait, then host-score and emit one result per
-//! job. Command buffers run serially; each is internally maximal.
+//! topology, sampling params, and cancellation watermark. Each batch shares
+//! device buffers across chunks, then host-scores and emits one result per job.
+//! Two batches can run concurrently, with one committed chunk each.
+//! SA and sequential Gibbs use one threadgroup per problem; chromatic Gibbs
+//! uses one per read, and MSA uses one per 32-replica word.
 //!
 //! This is the throughput mechanism: on Metal the GPU is filled *inside* one
-//! dispatch (many threadgroups), not by committing many small command buffers
-//! to a single queue (which serialize). Driving one problem per dispatch leaves
-//! all but one core idle.
+//! dispatch (many threadgroups). Chunk submission checks cancellation before
+//! committing more work, while the next batch overlaps host preparation.
 //!
 //! # Threading
 //!
@@ -45,7 +45,7 @@ pub fn max_reads(_kernel: Kernel) -> u32 {
     sampler::MAX_READS as u32
 }
 
-/// Threadgroup budget per GPU core, per algorithm — the measured definition of
+/// Threadgroup budget per GPU core, per kernel — the measured definition of
 /// "fully loaded" for this backend.
 ///
 /// The three kernels map to hardware differently, so a single problems-per-core
@@ -175,9 +175,9 @@ fn scale_budget(nominal: usize, scale: f64) -> usize {
     scaled.max(1)
 }
 
-/// The width [`stream_width`] resolves to for `algorithm`, with no device.
+/// The width [`stream_width`] resolves to for `kernel`, with no device.
 ///
-/// A pure function of the algorithm — the device does not participate in the
+/// A pure function of the kernel — the device does not participate in the
 /// Metal width — split out so `Sampler::declared_stream_width` can advertise
 /// the same number without opening a device (`--capabilities` must not).
 ///
@@ -223,12 +223,15 @@ pub fn stream_width(_device: &MetalDevice, kernel: Kernel) -> usize {
 /// Structural + sampling identity a single dispatch batches over: same topology
 /// (so the shared CSR/coloring stay valid) and same reads/beta shape (one
 /// `num_reads`, `num_betas`, `beta_schedule` per dispatch).
+/// Jobs also share a watermark, so cancellation can stop their carry-over state
+/// together without removing a live problem from the device buffer layout.
 ///
 /// `edges` is borrowed from the seed job rather than cloned: at Advantage2
 /// scale that list is ~40k pairs (~640 KB), and an owned copy existed only to
 /// free the seed for `batch.push` while `fill_batch` still needed the key.
 /// Callers keep the seed live across `fill_batch`, then assemble `batch`.
 struct BatchKey<'a> {
+    watermark: Option<u64>,
     n: usize,
     edges: &'a [(usize, usize)],
     num_reads: usize,
@@ -240,6 +243,7 @@ struct BatchKey<'a> {
 impl<'a> BatchKey<'a> {
     fn from_job(job: &'a StreamJob) -> Self {
         Self {
+            watermark: job.watermark,
             n: job.graph.h.len(),
             edges: &job.graph.edges,
             num_reads: job.params.num_reads.clamp(1, sampler::MAX_READS),
@@ -250,7 +254,8 @@ impl<'a> BatchKey<'a> {
     }
 
     fn matches(&self, job: &StreamJob) -> bool {
-        self.n == job.graph.h.len()
+        self.watermark == job.watermark
+            && self.n == job.graph.h.len()
             && self.num_reads == job.params.num_reads.clamp(1, sampler::MAX_READS)
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
@@ -338,7 +343,7 @@ impl StreamCtx<'_> {
         }
         tracing::debug!("yield gate: pausing");
         let deadline = Instant::now() + THROTTLE_MAX_PAUSE;
-        while Instant::now() < deadline && self.gov.should_throttle() {
+        while !self.out.is_closed() && Instant::now() < deadline && self.gov.should_throttle() {
             std::thread::sleep(THROTTLE_PAUSE);
         }
     }
@@ -480,14 +485,21 @@ struct InFlight {
     jobs: Vec<StreamJob>,
 }
 
+impl InFlight {
+    fn commit_next(&mut self, cancel: &CancelToken) -> bool {
+        self.encoded.commit_next(|| {
+            self.jobs
+                .iter()
+                .any(|job| cancel.is_cancelled(job.watermark))
+        })
+    }
+}
+
 /// Drive the batched streaming loop for the lifetime of `jobs`.
 ///
-/// Double-buffered: each iteration forms and **commits** the next batch (host
-/// work — collect, build buffers, enqueue) while the previous batch is still
-/// executing on the GPU, then waits on and harvests the previous batch (its GPU
-/// compute overlaps this iteration's host work + the next batch's execution).
-/// The GPU stays continuously fed; host encode + parallel scoring are hidden
-/// behind GPU compute.
+/// Keep two batches in flight, with one committed chunk per batch. After each
+/// chunk completes, check cancellation before submitting its successor. Batch
+/// preparation and host scoring overlap the other batch's GPU execution.
 pub fn run_stream(
     device: &MetalDevice,
     kernel: Kernel,
@@ -506,36 +518,40 @@ pub fn run_stream(
         cancel,
     };
 
-    // Prime the pipeline with the first batch (blocking for its seed).
-    let mut inflight = form_and_commit(device, &mut ctx, Seed::Blocking);
-
-    while let Some(cur) = inflight.take() {
-        // Form + commit the next batch WITHOUT blocking, so it overlaps `cur`'s
-        // GPU compute. Never block here: `cur` is still un-harvested, and its
-        // results must flow (freeing coordinator credits) before more jobs come.
-        //
-        // Except while yielding. Double-buffering deliberately keeps a command
-        // buffer committed at all times, so the GPU is never idle — which means
-        // a pause taken *here* hides entirely behind `cur`'s execution and
-        // yields nothing to anyone else. To actually release the device we have
-        // to break the overlap: let `cur` finish, then pause with nothing in
-        // flight (the gate in `form_and_commit` below), then commit again.
-        let next = if ctx.gov.should_throttle() {
-            None
+    // Each batch owns at most one committed chunk. Alternate batches so host
+    // submission and scoring overlap the other batch's GPU execution.
+    let mut inflight = std::collections::VecDeque::with_capacity(2);
+    if let Some(batch) = form_and_commit(device, &mut ctx, Seed::Blocking) {
+        inflight.push_back(batch);
+    }
+    while let Some(mut current) = inflight.pop_front() {
+        // Never wait for another seed while a batch holds coordinator credits.
+        // During throttling, drain both batches before the next yield gate.
+        if inflight.is_empty() && !ctx.gov.should_throttle() {
+            if let Some(next) = form_and_commit(device, &mut ctx, Seed::NonBlocking) {
+                inflight.push_back(next);
+            }
+        }
+        current.encoded.wait_until_completed();
+        if ctx.out.is_closed() {
+            ctx.gov.record_gpu_busy_us(current.encoded.gpu_time_us());
+            for batch in inflight {
+                batch.encoded.wait_until_completed();
+                ctx.gov.record_gpu_busy_us(batch.encoded.gpu_time_us());
+            }
+            return;
+        }
+        if current.commit_next(ctx.cancel) {
+            inflight.push_back(current);
         } else {
-            form_and_commit(device, &mut ctx, Seed::NonBlocking)
-        };
-        // Wait on `cur`, host-score (rayon), emit. Its GPU compute overlapped
-        // the `next` form above and now overlaps `next`'s execution.
-        // Feed our own device time back to the governor: it is the term that
-        // turns whole-device utilization into external-only load.
-        ctx.gov.record_gpu_busy_us(finish_batch(cur, ctx.out));
-        inflight = match next {
-            Some(f) => Some(f),
-            // Nothing was queued to overlap; now that `cur` freed credits, block
-            // for the next batch (or exit when the channel closes).
-            None => form_and_commit(device, &mut ctx, Seed::Blocking),
-        };
+            ctx.gov
+                .record_gpu_busy_us(finish_batch(current, ctx.out, ctx.cancel));
+        }
+        if inflight.is_empty() {
+            if let Some(next) = form_and_commit(device, &mut ctx, Seed::Blocking) {
+                inflight.push_back(next);
+            }
+        }
     }
 }
 
@@ -547,10 +563,16 @@ pub fn run_stream(
 /// the in-flight batch before retrying with a blocking seed.
 fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<InFlight> {
     loop {
+        if ctx.out.is_closed() {
+            return None;
+        }
         // Yield before taking a seed, not after: once a job is dequeued it is ours
         // to answer, and holding it through a pause would stall the coordinator's
         // credit for no benefit.
         ctx.yield_gate();
+        if ctx.out.is_closed() {
+            return None;
+        }
         let seed_job = next_seed(ctx, seed)?;
         // Batch size follows the seed's read count: chromatic Gibbs spends
         // `num_reads` threadgroups per problem, so the same threadgroup budget is a
@@ -576,8 +598,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         // Last checkpoint before the GPU commits: filling a batch can take up to
         // `hard_cap`, and a `Cancel` arriving in that window would otherwise buy a
         // full dispatch of abandoned work. Re-check every job now that the batch is
-        // final; once committed, the dispatch runs to completion (Metal offers no
-        // mid-kernel abort).
+        // final. Each chunk also checks cancellation immediately before commit.
         if batch.iter().any(|j| ctx.cancel.is_cancelled(j.watermark)) {
             let (live, stale): (Vec<StreamJob>, Vec<StreamJob>) = batch
                 .into_iter()
@@ -595,17 +616,25 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         }
 
         // Scope `graphs` so its borrow of `batch` ends before `batch` moves.
+        if ctx.out.is_closed() {
+            return None;
+        }
         let encoded = {
             let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
-            sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel)
+            sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel, 2)
         };
         match encoded {
             Ok(enc) => {
-                tracing::debug!(batch = batch.len(), cap, chunks = enc.chunk_count(), seed = ?seed, "committed batch");
-                return Some(InFlight {
+                if ctx.out.is_closed() {
+                    return None;
+                }
+                tracing::debug!(batch = batch.len(), cap, chunks = enc.chunk_count(), seed = ?seed, "prepared batch");
+                let mut inflight = InFlight {
                     encoded: enc,
                     jobs: batch,
-                });
+                };
+                inflight.commit_next(ctx.cancel);
+                return Some(inflight);
             }
             Err(e) => {
                 // Every job in a batch shares the encode inputs that can be
@@ -630,7 +659,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
 /// job. `device_access_time_us` is the true GPU execution time
 /// (`GPUEndTime - GPUStartTime`), not the wall clock — the wall includes this
 /// batch's overlap with host work on either side.
-fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) -> u64 {
+fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>, cancel: &CancelToken) -> u64 {
     let InFlight { encoded, jobs } = inflight;
 
     encoded.wait_until_completed();
@@ -638,7 +667,7 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) -> u64 {
     // The watchdog judges a single command buffer, not the batch, so the max is
     // the number that matters for staying alive.
     tracing::debug!(
-        chunks = encoded.chunk_count(),
+        chunks = encoded.cmds.len(),
         max_chunk_ms = encoded.max_chunk_us() / 1000,
         total_ms = device_access_time_us / 1000,
         "batch complete"
@@ -663,6 +692,19 @@ fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) -> u64 {
         }
         // A failed batch still occupied the device; report it or the governor
         // would read the failure as idle time and size the next batch up.
+        return device_access_time_us;
+    }
+
+    if jobs.iter().any(|job| cancel.is_cancelled(job.watermark)) {
+        for job in jobs {
+            // Every job has the same watermark, so partial state is discarded
+            // without changing the layout or RNG identity of a live job.
+            let _ = out.blocking_send(StreamResult {
+                job_id: job.job_id,
+                outcome: StreamOutcome::Cancelled,
+                device_access_time_us,
+            });
+        }
         return device_access_time_us;
     }
 
@@ -735,10 +777,168 @@ mod tests {
         }
     }
 
-    /// Governor predicate for tests that are not about throttling.
+    #[test]
+    fn batch_key_separates_cancellation_watermarks() {
+        let graph = IsingGraph::new(vec![0.0], vec![], vec![]);
+        let mut first = job(b"first", graph.clone(), 32, 4, 1);
+        first.watermark = Some(1);
+        let mut second = job(b"second", graph, 32, 4, 1);
+        second.watermark = Some(2);
+        assert!(!BatchKey::from_job(&first).matches(&second));
+        second.watermark = None;
+        assert!(!BatchKey::from_job(&first).matches(&second));
+        second.watermark = Some(1);
+        assert!(BatchKey::from_job(&first).matches(&second));
+    }
+
+    #[test]
+    fn cancelling_inflight_batch_refunds_each_job_and_accounts_for_executed_work() {
+        let device = MetalDevice::open(0).unwrap();
+        let graph = IsingGraph::new(vec![1.0; 1024], vec![], vec![]);
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            for committed in [false, true] {
+                let mut first = job(b"first", graph.clone(), 128, 65536, 1);
+                first.watermark = Some(1);
+                let mut second = job(b"second", graph.clone(), 128, 65536, 1);
+                second.watermark = Some(1);
+                let encoded = sampler::encode_batch(
+                    &device,
+                    &[&first.graph, &second.graph],
+                    &first.params,
+                    kernel,
+                    2,
+                )
+                .unwrap();
+                assert!(encoded.chunk_count() > 1);
+                let mut inflight = InFlight {
+                    encoded,
+                    jobs: vec![first, second],
+                };
+                let cancel = CancelToken::default();
+                if committed {
+                    assert!(inflight.commit_next(&cancel));
+                }
+                cancel.cancel_through(1);
+                inflight.encoded.wait_until_completed();
+                assert!(!inflight.commit_next(&cancel));
+                assert_eq!(inflight.encoded.cmds.len(), usize::from(committed));
+                let expected_time = inflight.encoded.gpu_time_us();
+                assert_eq!(expected_time > 0, committed);
+                let (out, mut results) = tokio::sync::mpsc::channel(4);
+                assert_eq!(finish_batch(inflight, &out, &cancel), expected_time);
+                for id in [b"first".as_slice(), b"second".as_slice()] {
+                    let result = results.try_recv().unwrap();
+                    assert_eq!(result.job_id, id);
+                    assert!(matches!(result.outcome, StreamOutcome::Cancelled));
+                    assert_eq!(result.device_access_time_us, expected_time);
+                }
+                assert!(matches!(results.try_recv(), Err(TryRecvError::Empty)));
+            }
+        }
+    }
+
+    #[test]
+    fn run_stream_cancels_a_committed_batch_and_completes_the_live_watermark() {
+        struct CancelOnSecondBatch {
+            cancel: CancelToken,
+            batches: std::cell::Cell<usize>,
+            busy_us: std::cell::Cell<u64>,
+        }
+        impl GpuGovernor for CancelOnSecondBatch {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                self.batches.set(self.batches.get() + 1);
+                if self.batches.get() == 2 {
+                    // The stream commits the first chunk before collecting
+                    // this batch, so cancellation exercises the resume path.
+                    self.cancel.cancel_through(1);
+                }
+                1.0
+            }
+            fn record_gpu_busy_us(&self, us: u64) {
+                self.busy_us.set(self.busy_us.get() + us);
+            }
+        }
+        let device = MetalDevice::open(0).unwrap();
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            let graph = IsingGraph::new(vec![1.0; 1024], vec![], vec![]);
+            let mut stale = job(b"stale", graph.clone(), 128, 65536, 1);
+            stale.watermark = Some(1);
+            let mut live = job(b"live", graph, 32, 1, 1);
+            live.watermark = Some(2);
+            let (job_tx, job_rx) = tokio::sync::mpsc::channel(4);
+            job_tx.blocking_send(stale).unwrap();
+            job_tx.blocking_send(live).unwrap();
+            drop(job_tx);
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
+            let cancel = CancelToken::default();
+            let gov = CancelOnSecondBatch {
+                cancel: cancel.clone(),
+                batches: std::cell::Cell::new(0),
+                busy_us: std::cell::Cell::new(0),
+            };
+            run_stream(&device, kernel, job_rx, &out_tx, &gov, &cancel);
+            let stale = out_rx.try_recv().unwrap();
+            assert_eq!(stale.job_id, b"stale");
+            assert!(matches!(stale.outcome, StreamOutcome::Cancelled));
+            assert!(stale.device_access_time_us > 0);
+            let live = out_rx.try_recv().unwrap();
+            assert_eq!(live.job_id, b"live");
+            let StreamOutcome::Completed(Ok(samples)) = live.outcome else {
+                panic!("live watermark did not complete");
+            };
+            assert_eq!(samples.len(), 32);
+            assert!(samples.iter().all(|sample| sample.spins.len() == 1024));
+            assert_eq!(
+                gov.busy_us.get(),
+                stale.device_access_time_us + live.device_access_time_us
+            );
+            assert!(matches!(out_rx.try_recv(), Err(TryRecvError::Empty)));
+        }
+    }
+
+    #[test]
+    fn closed_result_channel_does_not_dispatch_queued_jobs() {
+        struct NoDispatch;
+        impl GpuGovernor for NoDispatch {
+            fn should_throttle(&self) -> bool {
+                panic!("closed result channel must stop before the dispatch gate");
+            }
+            fn budget_scale(&self) -> f64 {
+                panic!("closed result channel must not form a batch");
+            }
+            fn record_gpu_busy_us(&self, _: u64) {
+                panic!("no GPU work should run");
+            }
+        }
+        let device = MetalDevice::open(0).unwrap();
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(1);
+        job_tx
+            .blocking_send(job(
+                b"queued",
+                IsingGraph::new(vec![1.0], vec![], vec![]),
+                128,
+                16384,
+                1,
+            ))
+            .unwrap();
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(1);
+        drop(out_rx);
+        run_stream(
+            &device,
+            Kernel::Msa,
+            job_rx,
+            &out_tx,
+            &NoDispatch,
+            &CancelToken::default(),
+        );
+        assert!(job_tx.is_closed());
+    }
+
     /// A dispatch must never scale to zero problems: an empty batch makes no
-    /// progress and never frees the coordinator's credit, so the miner would
-    /// wedge instead of merely running slowly.
+    /// progress and never frees the coordinator's credit.
     #[test]
     fn scale_budget_never_reaches_zero() {
         assert_eq!(scale_budget(4, 0.0), 1);

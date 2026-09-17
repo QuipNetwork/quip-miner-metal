@@ -16,7 +16,7 @@ simulated annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015).
 | `kernels/msc.cu`: 64 replicas per `u64` word, integer Metropolis, bit-sliced neighbour count, colour-parallel updates in shared memory | Yes, with a different word width and threadgroup mapping | Apple GPUs cap threadgroup memory at 32 KB and have 32-bit ALUs (see below) |
 | `KernelKind::Msc` on the device, `AlgoState::Msc`, `launch_msc` | Yes, as a crate-wide `Kernel` enum | The Metal crate keys width and sizing on a type tag with no device, so the kernel must be a first-class value |
 | `cuda_msa_identity` with algorithm `"msa"` and an envelope of 7392 to 29568 sweeps at 128 reads | Yes, with a Metal envelope measured on Apple hardware | Throughput per threadgroup is unknown until measured |
-| Abort on cancel (`EXIT_NOW` peeked inside the sweep loop) | No | Metal cannot abort a committed command buffer. The Metal loop already drops cancelled jobs before commit and bounds a chunk to about 500 ms. A lazy chunk commit is a follow-up |
+| Stop on cancel: check `EXIT_NOW` inside the sweep loop | No | Metal cannot stop a committed command buffer. It checks cancellation before each chunk and uses a safety margin tuned for measured chunks below 400 ms. |
 | Parallel host scoring (`QUIP_SCORE_THREADS`) | Already present | `harvest_batch` scores problems on a rayon pool |
 | `QUIP_MSC_DIAG` compile switches | No | metal-rs 0.33 exposes no preprocessor defines. A follow-up can splice `#define` lines into the source string |
 
@@ -49,9 +49,10 @@ same buffer layout as the other two Metal kernels. The slot control plane of
 macOS aborts a command buffer that runs longer than a few seconds and freezes
 the machine while the GPU resets. Metal kernels take a
 `(beta_start, beta_count)` window and persist their carry-over state in device
-buffers between chunks. `chunk_plan` sizes chunks to land near 500 ms from a
-measured update rate. CUDA has no watchdog on a compute-only device and runs a
-whole model in one launch.
+buffers between chunks. `chunk_plan` sizes chunks toward a 500 ms planning
+ceiling from a measured update rate. The safety margin targets measured
+chunks below 400 ms. A compute-only device has no graphics watchdog, so
+the CUDA miner runs a whole model in one launch.
 
 Consequence: the multi-spin kernel persists its spin words and per-thread RNG
 state every chunk and reloads them when `beta_start > 0`. Chunk boundaries
@@ -139,12 +140,10 @@ threadgroup allocation, and the kernel takes `N` at run time.
 
 CUDA peeks `EXIT_NOW` every eight rungs and leaves mid-model. Metal checks
 the cancel token before committing a batch and cannot stop a committed
-command buffer. `encode_batch` commits every chunk of a batch as it encodes,
-so a cancelled batch runs to completion.
-
-Consequence: out of scope for this port. Follow-up: commit one chunk at a
-time behind a bounded in-flight window and check the token before each
-commit, which bounds wasted work to about one chunk.
+command buffer. The stream keeps at most two batches in flight, with one
+committed chunk per batch. It checks cancellation before encoding and
+committing each later chunk. A cancelled batch discards partial results
+and returns each job's credit after its committed chunk finishes.
 
 ## Design
 

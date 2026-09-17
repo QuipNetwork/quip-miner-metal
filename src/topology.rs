@@ -3,11 +3,9 @@
 //!
 //! Mirrors `GPU/sampler_utils.py::build_csr_structure_from_edges` /
 //! `build_edge_position_index` / `compute_color_blocks`, but computes a
-//! generic greedy coloring instead of the Zephyr-specific linear-index
-//! formula (`zephyr_four_color_linear`): the kernel takes `num_colors` as a
-//! runtime argument, so any valid coloring (same-color nodes non-adjacent)
-//! is correct, and a greedy coloring works for any topology, not just
-//! Zephyr.
+//! generic greedy coloring by default. The opt-in MSA candidate maps the
+//! audited Advantage2 System 1 compact labels back to physical labels and
+//! validates its four-color partition against every supplied edge.
 //!
 //! Consensus `h`/`J` are constrained to small integers by protocol design
 //! (`DEFAULT_ALLOWED_H = {-1,0,1}`, `DEFAULT_ALLOWED_J = {-1,1}`, milli
@@ -95,6 +93,11 @@ fn greedy_color(n: usize, row_ptr: &[i32], col_ind: &[i32]) -> ColorBlocks {
         }
     }
 
+    color_blocks(&color_of)
+}
+
+fn color_blocks(color_of: &[i32]) -> ColorBlocks {
+    let n = color_of.len();
     let num_colors = color_of.iter().copied().max().unwrap_or(-1) + 1;
     let mut groups: Vec<Vec<i32>> = vec![Vec::new(); num_colors.max(0) as usize];
     for (i, &c) in color_of.iter().enumerate() {
@@ -116,6 +119,57 @@ fn greedy_color(n: usize, row_ptr: &[i32], col_ind: &[i32]) -> ColorBlocks {
         nodes,
         num_colors,
     }
+}
+
+// Physical labels absent from the 2026-06-09 Advantage2 System 1 snapshot.
+// Compact IDs are positions in the sorted remaining labels, not Zephyr labels.
+// Source: quip-coordinator fixtures/drive/advantage2-system1.spec.json.
+// Source SHA-256: f72af98b2bd6c1217d6d3c6389b3ba3e2790274d9e97822945c9f65b701ff4d3.
+const ADVANTAGE2_MISSING_LABELS: [usize; 223] = [
+    21, 31, 76, 91, 93, 169, 181, 215, 234, 239, 249, 285, 316, 327, 328, 340, 348, 351, 354, 363,
+    364, 370, 373, 376, 380, 381, 400, 406, 441, 451, 465, 484, 495, 496, 510, 518, 530, 534, 544,
+    555, 556, 568, 570, 577, 585, 623, 630, 738, 753, 762, 769, 780, 790, 801, 817, 863, 880, 918,
+    972, 1008, 1018, 1020, 1031, 1139, 1173, 1218, 1268, 1276, 1281, 1283, 1308, 1395, 1413, 1436,
+    1537, 1549, 1590, 1598, 1674, 1702, 1842, 1844, 1845, 1866, 1871, 1895, 1913, 1979, 1993, 2002,
+    2004, 2049, 2072, 2111, 2123, 2149, 2171, 2230, 2355, 2377, 2386, 2403, 2491, 2516, 2550, 2587,
+    2612, 2641, 2642, 2659, 2680, 2682, 2756, 2758, 2759, 2782, 2795, 2838, 2911, 2912, 2926, 2927,
+    2940, 3060, 3108, 3110, 3112, 3122, 3198, 3205, 3206, 3212, 3218, 3225, 3240, 3252, 3253, 3264,
+    3265, 3266, 3267, 3268, 3277, 3278, 3280, 3281, 3289, 3290, 3298, 3309, 3312, 3325, 3382, 3434,
+    3437, 3458, 3467, 3534, 3545, 3546, 3551, 3651, 3698, 3705, 3722, 3792, 3796, 3827, 3888, 3953,
+    3961, 3985, 3997, 4058, 4071, 4082, 4083, 4119, 4120, 4121, 4132, 4133, 4134, 4155, 4172, 4177,
+    4186, 4189, 4199, 4202, 4220, 4226, 4237, 4259, 4270, 4279, 4334, 4350, 4374, 4386, 4388, 4393,
+    4412, 4424, 4447, 4450, 4476, 4508, 4575, 4579, 4604, 4608, 4641, 4650, 4684, 4686, 4720, 4723,
+    4725, 4761, 4768, 4778, 4780,
+];
+
+/// A candidate partition only: acceptance proves edge independence, not that
+/// an unfamiliar graph belongs to this hardware family. Coefficients do not
+/// affect the validation, including edges whose current coupling is zero.
+fn advantage2_color(graph: &IsingGraph) -> Option<ColorBlocks> {
+    if graph.h.len() != 4577 {
+        return None;
+    }
+    let mut missing = ADVANTAGE2_MISSING_LABELS.iter().peekable();
+    let mut color_of = Vec::with_capacity(4577);
+    for physical in 0..4800 {
+        if missing.peek() == Some(&&physical) {
+            missing.next();
+            continue;
+        }
+        let z = physical % 12;
+        let j = physical / 12 % 2;
+        let w = physical / (12 * 2 * 4) % 25;
+        let u = physical / (12 * 2 * 4 * 25);
+        color_of.push((j + ((w + 2 * (z + u) + j) & 2)) as i32);
+    }
+    if graph
+        .edges
+        .iter()
+        .any(|&(u, v)| u >= color_of.len() || v >= color_of.len() || color_of[u] == color_of[v])
+    {
+        return None;
+    }
+    Some(color_blocks(&color_of))
 }
 
 /// Fixed CSR topology shared by every nonce/slot in a self-feeding session.
@@ -166,6 +220,17 @@ pub struct SelfFeedingTopology {
 }
 
 impl SelfFeedingTopology {
+    /// Try the validated System 1 candidate, falling back to the default
+    /// partition on incompatible input. CSR layout and coefficient order stay
+    /// identical. A different partition changes seeded annealing trajectories.
+    pub(crate) fn build_with_advantage2_coloring(graph: &IsingGraph) -> Self {
+        let mut topology = Self::build(graph);
+        if let Some(colors) = advantage2_color(graph) {
+            topology.colors = colors;
+        }
+        topology
+    }
+
     /// Build CSR + coloring from a graph. `graph.edges` fixes the canonical
     /// edge order used by `edge_pos` (and thus by [`fill_h_j`] for this and
     /// every later job sharing this topology).
@@ -317,6 +382,97 @@ mod tests {
             vec![1.0, -1.0, 1.0, -1.0],
             vec![(0, 1), (1, 2), (2, 3), (3, 0)],
         )
+    }
+
+    fn advantage2_fixture() -> IsingGraph {
+        let edges: Vec<_> = include_str!("../tests/fixtures/advantage2-system1.edges")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let mut ids = line
+                    .split_whitespace()
+                    .map(|id| id.parse::<usize>().unwrap());
+                (ids.next().unwrap(), ids.next().unwrap())
+            })
+            .collect();
+        assert_eq!(edges.len(), 41515);
+        IsingGraph::new(vec![0.0; 4577], vec![1.0; edges.len()], edges)
+    }
+
+    fn labels(colors: &ColorBlocks) -> Vec<i32> {
+        let mut result = vec![-1; colors.nodes.len()];
+        for (color, (&start, &count)) in colors.starts.iter().zip(&colors.counts).enumerate() {
+            for &node in &colors.nodes[start as usize..(start + count) as usize] {
+                assert_eq!(result[node as usize], -1);
+                result[node as usize] = color as i32;
+            }
+        }
+        assert!(result.iter().all(|&color| color >= 0));
+        result
+    }
+
+    #[test]
+    fn advantage2_four_colors_cover_all_edges_and_preserve_csr() {
+        let graph = advantage2_fixture();
+        let greedy = SelfFeedingTopology::build(&graph);
+        let mut candidate = SelfFeedingTopology::build_with_advantage2_coloring(&graph);
+        assert_eq!(greedy.colors.num_colors, 8);
+        assert_eq!(candidate.colors.num_colors, 4);
+        assert_eq!(candidate.colors.counts, [1148, 1145, 1145, 1139]);
+        let colors = labels(&candidate.colors);
+        for &(u, v) in &graph.edges {
+            assert_ne!(colors[u], colors[v], "edge ({u}, {v})");
+        }
+        assert!(graph.edges.contains(&(880, 2695)));
+        candidate.colors = greedy.colors.clone();
+        assert_eq!(candidate, greedy);
+    }
+
+    #[test]
+    fn advantage2_candidate_ignores_coefficients_and_edge_order() {
+        let mut graph = advantage2_fixture();
+        let expected = advantage2_color(&graph).unwrap();
+        graph.j.fill(0.0);
+        graph.h.fill(-1.0);
+        graph.edges.reverse();
+        for edge in &mut graph.edges {
+            *edge = (edge.1, edge.0);
+        }
+        assert_eq!(advantage2_color(&graph), Some(expected));
+    }
+
+    #[test]
+    fn advantage2_candidate_checks_conflicts_even_with_zero_coupling() {
+        let mut graph = advantage2_fixture();
+        let colors = labels(&advantage2_color(&graph).unwrap());
+        let other = (1..colors.len())
+            .find(|&node| colors[node] == colors[0])
+            .unwrap();
+        graph.edges.push((0, other));
+        graph.j.push(0.0);
+        assert_eq!(advantage2_color(&graph), None);
+        assert_eq!(
+            SelfFeedingTopology::build_with_advantage2_coloring(&graph),
+            SelfFeedingTopology::build(&graph)
+        );
+    }
+
+    #[test]
+    fn advantage2_candidate_rejects_malformed_edges_and_wrong_size() {
+        assert_eq!(
+            SelfFeedingTopology::build_with_advantage2_coloring(&g()),
+            SelfFeedingTopology::build(&g())
+        );
+        for edge in [(0, 0), (0, 4577), (usize::MAX, 0)] {
+            let mut graph = advantage2_fixture();
+            graph.edges.push(edge);
+            graph.j.push(1.0);
+            assert_eq!(advantage2_color(&graph), None);
+            assert_eq!(
+                SelfFeedingTopology::build_with_advantage2_coloring(&graph),
+                SelfFeedingTopology::build(&graph)
+            );
+        }
     }
 
     #[test]

@@ -31,6 +31,7 @@ path = "src/bin/quip_metal_msa.rs"
 # one core. `quip-solver-core` re-exports `quip_proto` and `quip_protocol`, so
 # this one line covers all three.
 [dependencies]
+quip-miner-ane = { path = "crates/ane-miner" }
 quip-solver-core = "0.0.1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

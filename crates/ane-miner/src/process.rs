@@ -174,13 +174,30 @@ pub struct AneSampler {
 impl AneSampler {
     /// Verify a completed ANE dispatch before accepting sampling jobs.
     pub fn open(executable: PathBuf) -> Result<Self, OpenError> {
+        Self::open_with_cancel(executable, &|| false)
+    }
+
+    /// Verify startup while allowing the caller to abandon and reap its worker.
+    pub fn open_with_cancel(
+        executable: PathBuf,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<Self, OpenError> {
+        if should_stop() {
+            return Err(OpenError("ANE startup check cancelled".into()));
+        }
         let start = Instant::now();
         let worker = WorkerProcess::spawn(&executable, &WorkerRequest::Check)
             .map_err(|error| OpenError(error.to_string()))?;
         let reply = worker
-            .wait(&|| start.elapsed() >= Duration::from_secs(30))
+            .wait(&|| should_stop() || start.elapsed() >= Duration::from_secs(30))
             .map_err(|error| OpenError(error.to_string()))?
-            .ok_or_else(|| OpenError("ANE startup check exceeded 30 seconds".into()))?;
+            .ok_or_else(|| {
+                OpenError(if should_stop() {
+                    "ANE startup check cancelled".into()
+                } else {
+                    "ANE startup check exceeded 30 seconds".into()
+                })
+            })?;
         match reply.result {
             WorkerResult::Checked { dispatches: 1 } => Ok(Self {
                 executable,
@@ -402,6 +419,32 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success(), "worker {pid} remains alive");
+    }
+
+    #[test]
+    fn startup_cancellation_reaps_worker_and_cleans_artifacts() {
+        let fixture = tempfile::tempdir().unwrap();
+        let receipt = fixture.path().join("receipt");
+        let body = format!(
+            "printf '%s\\n%s\\n' \"$$\" \"$TMPDIR\" > '{}'\nexec /bin/sleep 30",
+            receipt.display()
+        );
+        let (_script_dir, path) = script(&body);
+        let start = Instant::now();
+        let result = AneSampler::open_with_cancel(path, &|| receipt.exists());
+        assert!(matches!(result, Err(OpenError(message)) if message.contains("cancelled")));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let text = std::fs::read_to_string(receipt).unwrap();
+        let mut lines = text.lines();
+        let pid = lines.next().unwrap().parse().unwrap();
+        let directory = PathBuf::from(lines.next().unwrap());
+        assert_gone(pid, &directory);
+    }
+
+    #[test]
+    fn cancelled_startup_does_not_launch_an_executable() {
+        let result = AneSampler::open_with_cancel(PathBuf::from("/no/such/worker"), &|| true);
+        assert!(matches!(result, Err(OpenError(message)) if message.contains("cancelled")));
     }
 
     #[test]

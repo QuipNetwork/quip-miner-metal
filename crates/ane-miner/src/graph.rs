@@ -458,6 +458,20 @@ mod tests {
     }
 
     #[test]
+    fn three_node_path_colors_center_first_by_descending_degree() {
+        // Nodes 0-1-2 with node 1 the degree-2 center (nodes 0 and 2 each
+        // have degree 1). Descending-degree coloring must visit the center
+        // first, so the color groups are [1] then [0, 2].
+        let graph = IsingGraph::new(vec![0.0, 0.0, 0.0], vec![1.0, 1.0], vec![(0, 1), (1, 2)]);
+        let prepared = prepare(&graph).unwrap();
+        assert_eq!(prepared.color_count, 2);
+        assert_eq!(prepared.tiles.len(), 2);
+        assert_eq!(prepared.tiles[0].nodes, vec![1]);
+        assert_eq!(prepared.tiles[1].nodes, vec![0, 2]);
+        assert_prepared_invariants(&prepared);
+    }
+
+    #[test]
     fn three_node_tile_matches_padded_weight_array() {
         let graph = IsingGraph::new(
             vec![1.0, -1.0, 0.0],

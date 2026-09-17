@@ -106,6 +106,7 @@ struct Run {
     wall_s: f64,
     best_energy: i64,
     mean_best: f64,
+    bests: Vec<i64>,
 }
 
 /// Stream `jobs` copies of one 4577-node problem through `kernel` and time
@@ -167,6 +168,7 @@ fn drive(
         wall_s,
         best_energy: bests.iter().copied().min().unwrap(),
         mean_best: bests.iter().map(|&e| e as f64).sum::<f64>() / bests.len() as f64,
+        bests,
     }
 }
 
@@ -179,6 +181,7 @@ fn report(label: &str, r: &Run, num_reads: usize, num_sweeps: usize) {
         r.best_energy,
         r.mean_best
     );
+    eprintln!("wall_seconds={:.6}; bests_milli={:?}", r.wall_s, r.bests);
 }
 
 #[test]
@@ -194,7 +197,12 @@ fn msa_vs_sa_throughput_at_advantage2_scale() {
     let jobs = env_usize("QUIP_BENCH_JOBS", 40);
     let sweeps = env_usize("QUIP_BENCH_SWEEPS", 7392);
     let reads = env_usize("QUIP_BENCH_READS", 128);
-    let graph = advantage2_system1(1);
+    let graph_seed = env_usize("QUIP_BENCH_GRAPH_SEED", 1) as u64;
+    let graph = advantage2_system1(graph_seed);
+    eprintln!(
+        "graph seed {graph_seed}; QUIP_METAL_MSA_FOUR_COLOR={:?}",
+        std::env::var("QUIP_METAL_MSA_FOUR_COLOR").ok()
+    );
     let colors = SelfFeedingTopology::build(&graph).colors;
     eprintln!(
         "Advantage2 System 1: {} greedy colour classes",

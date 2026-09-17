@@ -392,7 +392,7 @@ fn metal_sampler_sample_smoke() {
             assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
         }
 
-        // Stream width is a fixed positive budget for this device/algorithm.
+        // Stream width is a fixed positive budget for this device/kernel.
         assert!(sampler.stream_width() >= 1);
         assert_eq!(
             sampler.max_reads(),

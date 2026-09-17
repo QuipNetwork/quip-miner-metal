@@ -4,32 +4,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ==============================================================================
-// METAL MULTI-SPIN CODED SIMULATED ANNEALING
-// ==============================================================================
-// Port of quip-miner-cuda's kernels/msc.cu, itself a port of quip-miner-cpu's
-// sa_msc.rs (Isakov, Zintchenko, Ronnow, Troyer 2015). 32 replicas share the
-// bits of one 32-bit word per spin: bit r of state[i] is spin i of replica r,
-// 0 meaning +1 and 1 meaning -1 (the same convention as the packed output of
-// every kernel in this crate).
-//
-// Differences from msc.cu, all forced by Apple GPUs:
-// - 32-bit words, not 64-bit. Threadgroup memory is capped at 32 KB per
-//   threadgroup with no opt-in, so N * 8 bytes does not fit Advantage2's
-//   4577 spins, and Apple ALUs are 32-bit (64-bit integer ops are emulated).
-// - One threadgroup per (problem, word). A job of R reads dispatches R / 32
-//   independent threadgroups per problem; there is no `words` loop in-kernel.
-// - No slot control plane. The host dispatches explicit batches and chunks
-//   the beta ladder across command buffers (macOS GPU watchdog), so this
-//   kernel resumes from persistent buffers exactly as block_gibbs_parallel
-//   in kernels/gibbs.metal does.
-// - Thresholds are 32-bit: cut[m] = floor(exp(-2 beta m) * 2^32).
-//
-// Preconditions the host checks: J in {-1, 0, +1}, |h| <= 1, CSR degree
-// <= MSA_MAX_DEG. Energies are not computed here; the host rescores every
-// read with energy_milli.
+// Experimental 64-lane multi-spin SA. Spin words stay in device memory so
+// N * 8 bytes do not consume the 32 KB threadgroup allocation. Threshold
+// rows remain shared by all lanes of a word: 64 correlated replicas here,
+// compared with 32 in msa.metal. This is an isolated benchmark pipeline.
 
-#define MSA_LANES      32
+#define MSA_LANES      64
 #define MSA_PLANES     6
 #define MSA_MAX_COUNT  63
 #define MSA_MAX_FIELD  63
@@ -95,12 +75,12 @@ inline uint sweep_offset(uint base_seed, uint problem_id, uint word, int beta_id
 }
 
 // ==============================================================================
-// Bit-sliced arithmetic (32 lanes)
+// Bit-sliced arithmetic (64 lanes)
 // ==============================================================================
 
 // Carry-save adder: (h, l) = a + b + c per lane.
-inline void csa(thread uint &h, thread uint &l, uint a, uint b, uint c) {
-    uint u = a ^ b;
+inline void csa(thread ulong &h, thread ulong &l, ulong a, ulong b, ulong c) {
+    ulong u = a ^ b;
     h = (a & b) | (u & c);
     l = u ^ c;
 }
@@ -108,9 +88,9 @@ inline void csa(thread uint &h, thread uint &l, uint a, uint b, uint c) {
 // Per-lane popcount of 21 one-bit inputs (missing inputs are zero words)
 // into planes[0..5] = ones, twos, fours, eights, sixteens, 0. Harley-Seal
 // tree: about 100 ops instead of 21 x 18 for a ripple add.
-inline void popcount21(thread const uint* x, thread uint* planes) {
-    uint ones = 0, twos = 0, fours = 0, eights = 0;
-    uint tA, tB, fA, fB, eA, eB, sA, sB;
+inline void popcount21(thread const ulong* x, thread ulong* planes) {
+    ulong ones = 0, twos = 0, fours = 0, eights = 0;
+    ulong tA, tB, fA, fB, eA, eB, sA, sB;
     csa(tA, ones, ones, x[0], x[1]);   csa(tB, ones, ones, x[2], x[3]);   csa(fA, twos, twos, tA, tB);
     csa(tA, ones, ones, x[4], x[5]);   csa(tB, ones, ones, x[6], x[7]);   csa(fB, twos, twos, tA, tB);
     csa(eA, fours, fours, fA, fB);
@@ -128,20 +108,20 @@ inline void popcount21(thread const uint* x, thread uint* planes) {
     planes[2] = fours;
     planes[3] = eights;
     planes[4] = sA | sB;
-    planes[5] = 0u;
+    planes[5] = 0ul;
 }
 
 // Lanes whose 6-bit counter is <= limit (bit-serial compare, LSB first).
 // Branchless: the constant changes on every word update.
-inline uint le_constant(thread const uint* planes, int limit) {
+inline ulong le_constant(thread const ulong* planes, int limit) {
     int bound = limit + 1;
-    if (bound > MSA_MAX_COUNT) return 0xFFFFFFFFu;
-    uint ge = 0xFFFFFFFFu;
+    if (bound > MSA_MAX_COUNT) return ~ulong(0);
+    ulong ge = ~ulong(0);
     for (int k = 0; k < MSA_PLANES; ++k) {
-        uint set = 0u - uint((bound >> k) & 1);
-        uint p = planes[k];
-        uint both = p & ge;
-        uint either = p ^ ge;
+        ulong set = 0ul - ulong((bound >> k) & 1);
+        ulong p = planes[k];
+        ulong both = p & ge;
+        ulong either = p ^ ge;
         ge = both | (either & ~set);
     }
     return ~ge;
@@ -157,11 +137,7 @@ inline uint le_constant(thread const uint* planes, int limit) {
 // the Gibbs colour-block bindings, 19 carries `words`, and 21..24 match the
 // Gibbs chunk bindings.
 
-#ifdef QUIP_MSA_DIAGNOSTICS
-kernel void msa_anneal_diag(
-#else
-kernel void msa_anneal(
-#endif
+kernel void msa64_anneal(
     device const int* csr_row_ptr [[buffer(0)]],
     device const int* csr_col_ind [[buffer(1)]],
     device const int8_t* csr_J_vals [[buffer(2)]],
@@ -188,18 +164,13 @@ kernel void msa_anneal(
     device const int* color_block_counts [[buffer(17)]],
     device const int* color_node_indices [[buffer(18)]],
 
-    constant int& words [[buffer(19)]],                    // words per problem = num_reads / 32
+    constant int& words [[buffer(19)]],                    // words per problem = num_reads / 64
     constant int& num_colors [[buffer(20)]],
 
     constant int& beta_start [[buffer(21)]],               // first beta index this chunk (0 = init)
     constant int& beta_count [[buffer(22)]],               // betas to process this chunk
-    device uint* persistent_state [[buffer(23)]],          // [num_threadgroups * N] spin words
+    device ulong* persistent_state [[buffer(23)]],          // [num_threadgroups * N] spin words
     device uint* persistent_rng [[buffer(24)]],            // [num_threadgroups * group_size * 4]
-#ifdef QUIP_MSA_DIAGNOSTICS
-    device ulong* diag_accept_counts [[buffer(25)]],       // [num_threadgroups * group_size] per-thread flips
-    device int* diag_energy_partials [[buffer(26)]],       // [num_threadgroups * group_size * 32] per-(thread, lane)
-#endif
-    threadgroup uint* state [[threadgroup(0)]],            // [N] spin words, sized by the host
 
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
     uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
@@ -207,9 +178,6 @@ kernel void msa_anneal(
 ) {
     threadgroup uchar row[MSA_ROW];              // geometric draws M for the current rung
     threadgroup uint cut[MSA_MAX_FIELD + 1];     // cut[m] = floor(exp(-2 beta m) * 2^32)
-#ifdef QUIP_MSA_DIAGNOSTICS
-    ulong accept_count = 0;                      // per-thread flips across this chunk's sweeps
-#endif
 
     uint tg = threadgroup_pos.x;
     if (tg >= uint(num_threadgroups)) {
@@ -228,6 +196,7 @@ kernel void msa_anneal(
     device const int8_t* my_h_vals = &csr_h_vals[problem_id * uint(N)];
 
     int n = N;
+    device ulong* state = &persistent_state[tg * uint(n)];
     int packed_size = (n + 7) / 8;
 
     RngState rng;
@@ -235,22 +204,19 @@ kernel void msa_anneal(
         // First chunk: seed per (threadgroup, thread) and draw random words.
         rng = seed_rng((base_seed ? base_seed : 1u) ^ (tg * 2654435761u) ^ (tid * 2246822519u));
         for (uint var = tid; var < uint(n); var += gsz) {
-            state[var] = xoshiro128starstar(rng);
+            uint low = xoshiro128starstar(rng);
+            uint high = xoshiro128starstar(rng);
+            state[var] = ulong(low) | (ulong(high) << 32);
         }
     } else {
-        // Continuation chunk: threadgroup memory does not survive dispatches,
-        // so rebuild the words and the RNG stream from device memory.
+        // Spin words already reside in device memory. Restore only the RNG.
         device const uint* src_rng = &persistent_rng[(tg * gsz + tid) * 4];
         rng.s0 = src_rng[0];
         rng.s1 = src_rng[1];
         rng.s2 = src_rng[2];
         rng.s3 = src_rng[3];
-        device const uint* src_state = &persistent_state[tg * uint(n)];
-        for (uint var = tid; var < uint(n); var += gsz) {
-            state[var] = src_state[var];
-        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     int chunk_end = min(beta_start + beta_count, num_betas);
     for (int beta_idx = beta_start; beta_idx < chunk_end; beta_idx++) {
@@ -291,7 +257,7 @@ kernel void msa_anneal(
                     int h = my_h_vals[var];
 
                     // Prefetch every neighbour index and coupling before
-                    // touching threadgroup memory. Slots past the degree read
+                    // reading device spin words. Slots past the degree read
                     // node 0 with a zero coupling and contribute nothing.
                     int nb[MSA_MAX_DEG];
                     int jj[MSA_MAX_DEG];
@@ -303,108 +269,47 @@ kernel void msa_anneal(
                         jj[q] = ok ? int(my_csr_J_vals[p]) : 0;
                     }
 
-                    uint bi = state[var];
-                    uint x[MSA_MAX_DEG + 1];
+                    ulong bi = state[var];
+                    ulong x[MSA_MAX_DEG + 1];
                     int d = 0;
                     #pragma unroll
                     for (int q = 0; q < MSA_MAX_DEG; ++q) {
                         int J = jj[q];
-                        uint sj = state[nb[q]];
+                        ulong sj = state[nb[q]];
                         // Set on the replicas where bond q is satisfied.
-                        uint l = ((J < 0) ? 0xFFFFFFFFu : 0u) ^ bi ^ sj;
-                        x[q] = (J != 0) ? l : 0u;
+                        ulong l = ((J < 0) ? ~ulong(0) : 0ul) ^ bi ^ sj;
+                        x[q] = (J != 0) ? l : 0ul;
                         d += (J != 0);
                     }
                     // A field is one more bond to a spin pinned at +1.
-                    x[MSA_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0u;
+                    x[MSA_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0ul;
                     d += (h != 0);
 
-                    uint planes[MSA_PLANES];
+                    ulong planes[MSA_PLANES];
                     popcount21(x, planes);
 
                     // Metropolis: flip where L <= (d + M) / 2.
                     int m = row[(var + off) & MSA_ROW_MASK];
                     int limit = (d + m) >> 1;
-                    uint accept = (limit >= d) ? 0xFFFFFFFFu : le_constant(planes, limit);
+                    ulong accept = (limit >= d) ? ~ulong(0) : le_constant(planes, limit);
                     state[var] = bi ^ accept;
-#ifdef QUIP_MSA_DIAGNOSTICS
-                    accept_count += ulong(popcount(accept));
-#endif
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
             }
         }
     }
 
-    // Persist for the next chunk (always written; the host decides whether
-    // one follows). The barrier closing the last colour class already
-    // synchronised `state`, and each thread writes a disjoint stride.
+    // Persist the RNG for the next chunk. Device spin words are already live,
+    // and the last color barrier makes their writes visible to output packing.
     {
         device uint* dst_rng = &persistent_rng[(tg * gsz + tid) * 4];
         dst_rng[0] = rng.s0;
         dst_rng[1] = rng.s1;
         dst_rng[2] = rng.s2;
         dst_rng[3] = rng.s3;
-        device uint* dst_state = &persistent_state[tg * uint(n)];
-        for (uint var = tid; var < uint(n); var += gsz) {
-            dst_state[var] = state[var];
-        }
     }
 
-#ifdef QUIP_MSA_DIAGNOSTICS
-    // Per-replica chunk energy in milli, split over threads and lanes so the
-    // host sums i64 partials without atomics. Each thread walks its strided
-    // nodes for all 32 lanes: h*spin*1000 per node, and one directed CSR
-    // half-edge J*si*sj*500 (a self-loop is stored once, so it uses 1000).
-    // Purely diagnostic; compiled out when QUIP_MSA_DIAGNOSTICS is absent.
-    {
-        int ener[MSA_LANES];
-        #pragma unroll
-        for (int r = 0; r < MSA_LANES; ++r) {
-            ener[r] = 0;
-        }
-        for (uint var = tid; var < uint(n); var += gsz) {
-            int bi = int(state[var]);
-            int pstart = my_csr_row_ptr[var];
-            int pend = my_csr_row_ptr[var + 1];
-            int h = my_h_vals[var];
-            #pragma unroll
-            for (int r = 0; r < MSA_LANES; ++r) {
-                int spin = ((bi >> r) & 1) ? -1 : 1;
-                ener[r] += h * spin * 1000;
-            }
-            #pragma unroll
-            for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                int p = pstart + q;
-                if (p < pend) {
-                    int J = int(my_csr_J_vals[p]);
-                    if (J != 0) {
-                        int nb = my_csr_col_ind[p];
-                        int nbword = int(state[nb]);
-                        int coeff = (nb == var) ? 1000 : 500;
-                        #pragma unroll
-                        for (int r = 0; r < MSA_LANES; ++r) {
-                            int spin = ((bi >> r) & 1) ? -1 : 1;
-                            int sj = ((nbword >> r) & 1) ? -1 : 1;
-                            ener[r] += J * spin * sj * coeff;
-                        }
-                    }
-                }
-            }
-        }
-        device int* dst = &diag_energy_partials[(tg * gsz + tid) * MSA_LANES];
-        #pragma unroll
-        for (int r = 0; r < MSA_LANES; ++r) {
-            dst[r] = ener[r];
-        }
-    }
-
-    // Per-thread accepted-flip counter for this chunk (overwritten per chunk;
-    // no atomics, one disjoint write per thread).
-    diag_accept_counts[tg * gsz + tid] = accept_count;
-#endif
-
-    // Pack lane r of this word as read w * 32 + r (bit 1 == spin -1, LSB
+    // Pack lane r of this word as read w * 64 + r (bit 1 == spin -1, LSB
     // first per byte). (lane, byte) pairs are spread over the threadgroup;
     // each pair owns one output byte, so there are no write races.
     int total = MSA_LANES * packed_size;
@@ -420,7 +325,7 @@ kernel void msa_anneal(
         for (int bit = 0; bit < 8; ++bit) {
             int var = base + bit;
             if (var < n) {
-                byte |= ((state[var] >> uint(lane)) & 1u) << uint(bit);
+                byte |= uint((state[var] >> uint(lane)) & 1ul) << uint(bit);
             }
         }
         uint out = (problem_id * uint(num_reads) + uint(read)) * uint(packed_size) + uint(b);

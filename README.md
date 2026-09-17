@@ -62,6 +62,11 @@ quip-metal-sa --capabilities   # capabilities JSON
 quip-metal-sa --check          # probe the backend is runnable
 ```
 
+## Engine selection
+
+All binaries accept `enable_ane` and `enable_metal` in `backend_toml`. Both default to `true`.
+Only MSA implements ANE execution. See [engine selection](docs/combined-engines.md) for modes, limits, and invalid settings.
+
 ## Multi-spin kernel (`quip-metal-msa`)
 
 `kernels/msa.metal` is a Metal port of the multi-spin coded simulated

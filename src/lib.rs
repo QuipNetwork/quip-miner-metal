@@ -2,7 +2,7 @@
 //!
 //! Three binaries share this library:
 //! - `quip-metal-sa` — Metropolis simulated annealing on one Apple GPU
-//! - `quip-metal-msa` — multi-spin coded simulated annealing (32 replicas per word) on one Apple GPU
+//! - `quip-metal-msa` — multi-spin annealing on selected Metal and ANE engines
 //! - `quip-metal-gibbs` — single-site heat-bath Gibbs on one Apple GPU
 //!
 //! Kernels take **explicit per-job** CSR buffers from the host (no kernel-side
@@ -47,6 +47,8 @@ compile_error!(
 );
 
 pub mod sampler;
+
+mod combined;
 
 pub mod iokit_gov;
 pub mod metal_device;
@@ -194,9 +196,8 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
     algorithm: "msa",
-    // Same single-source rule as SA and Gibbs: the cap is the kernel's
-    // threadgroup-memory budget in `sampler::MSA_MAX_NODES`.
-    max_nodes: crate::sampler::MSA_MAX_NODES as u32,
+    // Union capacity. Routing still enforces each engine's own limits.
+    max_nodes: quip_miner_ane::ANE_MSA_IDENTITY.max_nodes,
     max_edges: DEFAULT_MAX_EDGES,
     features: &["streaming", "governor"],
     adapt: METAL_MSA_ADAPT,
@@ -238,13 +239,15 @@ struct MetalConfig {
     utilization: Option<u32>,
     /// Yield the GPU to siblings when util exceeds the ceiling.
     yielding: Option<bool>,
+    enable_ane: Option<bool>,
+    enable_metal: Option<bool>,
     #[serde(flatten)]
     unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 impl MetalSampler {
     /// Bind an opened [`crate::metal_device::MetalDevice`] and
-    /// [`crate::iokit_gov::UtilGovernor`] to an algorithm.
+    /// [`crate::iokit_gov::UtilGovernor`] to a kernel.
     ///
     /// # Examples
     ///
@@ -399,12 +402,11 @@ impl KernelTag for MsaTag {
     const KERNEL: Kernel = Kernel::Msa;
 }
 
-/// [`MetalSampler`] bound to its binary's kernel at the type level, so the
-/// associated `declared_stream_width` answers per kernel. [`run_metal`]
-/// constructs the inner sampler from `A::KERNEL`, keeping the tag and the
-/// runtime kernel equal by construction.
+/// Engine router bound to its binary's kernel. MSA has one ANE slot in
+/// addition to the Metal stream width. SA and Gibbs execute on Metal only.
+/// [`run_metal`] keeps the tag and runtime kernel equal by construction.
 pub struct TaggedSampler<A: KernelTag> {
-    inner: MetalSampler,
+    inner: combined::CombinedSampler,
     _kernel: std::marker::PhantomData<A>,
 }
 
@@ -430,11 +432,10 @@ impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
         self.inner.stream_width()
     }
 
-    /// What the live [`MetalSampler::stream_width`] resolves to for this
-    /// tag's kernel — the device does not participate in the Metal width,
-    /// so the advertised and live numbers agree by construction.
+    /// Combined admission bound, independent of which engines configuration
+    /// enables. Disabled slots remain unused rather than changing capabilities.
     fn declared_stream_width() -> u32 {
-        u32::try_from(streaming::declared_stream_width(A::KERNEL)).unwrap_or(u32::MAX)
+        u32::try_from(combined::stream_width(A::KERNEL)).unwrap_or(u32::MAX)
     }
 
     fn utilization(&self) -> f64 {
@@ -454,9 +455,9 @@ impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
     }
 }
 
-/// Run a Metal miner binary. macOS opens the GPU and governor; other platforms
-/// support `--capabilities`/`--version` but return `EnvIncompatible` for
-/// `--check` and session mode.
+/// Run one miner identity with the selected engines. Session engines open on
+/// first use, after backend configuration arrives. `--check` opens the default
+/// engines: Metal for every algorithm, plus ANE for MSA.
 ///
 /// # Examples
 ///
@@ -482,15 +483,13 @@ pub fn run_metal<A: KernelTag>(
     utilization: u32,
     yielding: bool,
 ) -> ExitCode {
-    use crate::iokit_gov::UtilGovernor;
-    use crate::metal_device::MetalDevice;
-    use quip_solver_core::OpenError;
     run(id, common, || {
-        let dev =
-            MetalDevice::open(device).map_err(|e| OpenError(format!("device {device}: {e}")))?;
-        let gov = UtilGovernor::start(device as u32, utilization, yielding);
+        let inner = combined::CombinedSampler::new(A::KERNEL, device, utilization, yielding);
+        if common.check {
+            inner.check()?;
+        }
         Ok(TaggedSampler::<A> {
-            inner: MetalSampler::new(dev, gov, A::KERNEL),
+            inner,
             _kernel: std::marker::PhantomData,
         })
     })
@@ -518,7 +517,7 @@ mod tests {
         );
         assert_eq!(
             TaggedSampler::<MsaTag>::declared_stream_width(),
-            u32::try_from(crate::streaming::declared_stream_width(Kernel::Msa)).unwrap_or(u32::MAX)
+            u32::try_from(crate::combined::stream_width(Kernel::Msa)).unwrap_or(u32::MAX)
         );
     }
 
@@ -527,7 +526,7 @@ mod tests {
         use super::{METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
         assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
         assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
-        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 6016);
+        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 16_384);
         assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
         // Reads are pinned to whole words.
         assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads % 32, 0);

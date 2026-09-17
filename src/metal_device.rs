@@ -26,7 +26,7 @@ const GIBBS_SRC: &str = include_str!("../kernels/gibbs.metal");
 /// Multi-spin coded SA, see `kernels/msa.metal`.
 const MSA_SRC: &str = include_str!("../kernels/msa.metal");
 
-/// Failure opening a Metal device or compiling its SA/Gibbs pipelines.
+/// Failure opening a Metal device or compiling its SA, Gibbs, or multi-spin pipelines.
 #[derive(Debug, Error)]
 pub enum MetalError {
     /// Driver refused pipeline-state creation for a compiled entry point.

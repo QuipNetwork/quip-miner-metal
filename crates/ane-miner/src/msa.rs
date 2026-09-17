@@ -295,7 +295,9 @@ mod tests {
 
         let prior = first.expand(64, 0, 0);
         first.begin_rung(0.75);
-        let next = first.expand(64, 1, 0);
+        // Reuse the same (rung, sweep) so the expansion offsets are identical;
+        // the next expansion must differ because the random streams advanced.
+        let next = first.expand(64, 0, 0);
         assert_ne!(prior, next);
     }
 
