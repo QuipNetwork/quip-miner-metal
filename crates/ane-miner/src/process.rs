@@ -255,7 +255,7 @@ impl AneSampler {
         let expected_programs = if params.num_sweeps == 0 || graph.h.is_empty() {
             0
         } else {
-            prepared.tiles.len()
+            1
         };
         drop(prepared);
         let worker = WorkerProcess::spawn(
@@ -335,9 +335,11 @@ fn validate_output(
     if u64::from(output.stats.programs) != expected_programs as u64 {
         return Err(fault("sampling reply", "wrong program count"));
     }
-    let dispatches = u64::from(output.stats.programs)
-        .checked_mul(params.num_sweeps as u64)
-        .ok_or_else(|| fault("sampling reply", "dispatch count overflow"))?;
+    let dispatches = if expected_programs == 0 {
+        0
+    } else {
+        params.num_sweeps.div_ceil(crate::native::BLOCK_SWEEPS) as u64
+    };
     if output.stats.dispatches != dispatches {
         return Err(fault("sampling reply", "wrong dispatch count"));
     }
@@ -615,14 +617,14 @@ mod tests {
             let output = RunOutput {
                 spins,
                 stats: RunStats {
-                    programs: 2,
-                    dispatches: 6,
+                    programs: 1,
+                    dispatches: 2,
                     ..RunStats::default()
                 },
             };
-            assert_fault(validate_output(&output, &graph, &params, 2));
+            assert_fault(validate_output(&output, &graph, &params, 1));
         }
-        for (programs, dispatches) in [(0, 0), (1, 3), (2, 5), (2, 7)] {
+        for (programs, dispatches) in [(0, 0), (1, 1), (1, 3), (2, 2)] {
             let output = RunOutput {
                 spins: vec![vec![1, -1]],
                 stats: RunStats {
@@ -631,17 +633,17 @@ mod tests {
                     ..RunStats::default()
                 },
             };
-            assert_fault(validate_output(&output, &graph, &params, 2));
+            assert_fault(validate_output(&output, &graph, &params, 1));
         }
         let output = RunOutput {
             spins: vec![vec![1, -1]],
             stats: RunStats {
-                programs: 2,
-                dispatches: 6,
+                programs: 1,
+                dispatches: 2,
                 ..RunStats::default()
             },
         };
-        assert!(validate_output(&output, &graph, &params, 2).is_ok());
+        assert!(validate_output(&output, &graph, &params, 1).is_ok());
     }
 
     #[test]
@@ -657,7 +659,7 @@ mod tests {
 
     #[test]
     fn parent_scores_valid_states_with_original_graph() {
-        let (_fixture, path) = script("printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[1,-1]],\"stats\":{\"programs\":2,\"dispatches\":6,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"");
+        let (_fixture, path) = script("printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[1,-1]],\"stats\":{\"programs\":1,\"dispatches\":2,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"");
         let sampler = AneSampler {
             executable: path,
             access: Mutex::new(()),
@@ -678,7 +680,7 @@ mod tests {
 
     #[test]
     fn sample_job_rejects_invalid_child_spins() {
-        let (_fixture, path) = script("printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[0]],\"stats\":{\"programs\":1,\"dispatches\":3,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"");
+        let (_fixture, path) = script("printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[0]],\"stats\":{\"programs\":1,\"dispatches\":2,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"");
         let sampler = AneSampler {
             executable: path,
             access: Mutex::new(()),
@@ -836,7 +838,13 @@ mod tests {
     }
 
     fn worker_binary() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/quip-ane-msa")
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("quip-ane-msa")
     }
 
     #[test]
@@ -987,14 +995,14 @@ mod tests {
             let WorkerResult::Solved { output } = reply.result else {
                 panic!("job {job} did not solve");
             };
-            validate_output(&output, &graph, &params, 4).unwrap();
+            validate_output(&output, &graph, &params, 1).unwrap();
             assert_eq!(output.spins, expected, "job {job}");
             programs += output.stats.programs;
             assert_gone(pid, &directory);
             eprintln!("job receipt: job={job}, pid={pid}, programs={}, dispatches={}, oracle_reads={}, directory_removed=true", output.stats.programs, output.stats.dispatches, output.spins.len());
         }
         assert_eq!(pids.len(), 64);
-        assert_eq!(programs, 256);
+        assert_eq!(programs, 64);
         eprintln!(
             "64-job receipt: distinct_pids={}, programs={programs}, oracle_reads=8192",
             pids.len()

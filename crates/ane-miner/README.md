@@ -166,7 +166,10 @@ Coloring sorts by descending degree, then ascending index.
 The solver walks colors in order.
 Each color is an independent set.
 A color splits into tiles of at most 4,096 outputs.
-Channel counts pad to the next 32-channel boundary.
+The static ANE graph applies all colors in order and repeats that sequence for two sweeps per dispatch.
+State rows follow color order, with padding only after the last node.
+Each convolution output pads to the next 32-channel boundary.
+Static slices remove that padding before spin updates.
 
 Requested reads may be 1 through 128.
 Execution always uses 128 physical lanes.
@@ -179,15 +182,17 @@ The parent keeps the coordinator connection.
 It starts one child process per job.
 The parent scores returned spins with the consensus scorer.
 
-The worker shares one neighbor input surface across its color programs.
-It uploads the full initial spin state once.
-Later updates upload only the rows changed by the prior tile.
-The worker reuses tile buffers throughout the anneal.
+The worker uploads the full initial spin state once.
+Two retained IOSurfaces alternate as the input and output state between fused dispatches.
+The host stages deterministic thresholds for each sweep and reads spins once after the final block.
+A final unused sweep receives a threshold that disables every flip.
+Node reordering preserves the original node and replica assignments for every random value.
 
 ## Memory
 
-Each program carries a dense FP16 weight matrix.
-One payload may use at most 128 MiB.
+One program carries all dense FP16 tile matrices in one weight file.
+Each matrix is a separate aligned chunk, reused across the two sweeps.
+Each tile matrix may use at most 128 MiB.
 The largest four-tile shape is four matrices of 16,384 by 4,096.
 That raw dense FP16 payload is 512 MiB.
 Padded worst-case payload stays below 544 MiB.
@@ -196,7 +201,7 @@ Those caps bound dense weight bytes.
 They are not a total ANE memory budget.
 Measured peak resident set size belongs to the test process.
 It excludes separate runtime and driver allocations.
-IOSurface buffers add one shared neighbor surface and per-program spin, threshold, and output surfaces.
+The program uses two state surfaces and two threshold surfaces, each with the full padded node count.
 Those surfaces align to 65,536 bytes.
 
 ## Follow-up work

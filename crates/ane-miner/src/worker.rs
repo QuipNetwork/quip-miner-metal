@@ -143,21 +143,19 @@ pub(crate) fn write_message<T: Serialize>(
 }
 
 fn check_device() -> Result<WorkerResult, AneError> {
-    let mut weights = vec![0; 32 * 32];
-    for channel in 0..32 {
-        weights[channel * 32 + channel] = 1;
-    }
-    let mut program = AneProgram::compile(32, 32, &weights, &[0; 32])?;
-    let (output, _) = program.evaluate(
-        &vec![-3; 32 * LANES],
-        &vec![1; 32 * LANES],
-        &vec![3; 32 * LANES],
-    )?;
-    let valid = output.len() == 32 * LANES && output.iter().all(|&spin| spin == -1);
+    let graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 1)]);
+    let prepared = crate::graph::prepare(&graph)?;
+    let mut program = AneProgram::compile(&prepared, crate::native::BLOCK_SWEEPS)?;
+    program.reset(&vec![1; 32 * LANES])?;
+    program.advance(&vec![0; 32 * LANES * crate::native::BLOCK_SWEEPS])?;
+    let mut output = vec![0; 32 * LANES];
+    program.read(&mut output)?;
+    let valid = output[..LANES].iter().all(|&spin| spin == -1)
+        && output[LANES..].iter().all(|&spin| spin == 1);
     program.close()?;
     if !valid {
         return Err(AneError::Runtime(
-            "startup dispatch returned invalid identity output".into(),
+            "startup fused dispatch returned invalid ordered spin updates".into(),
         ));
     }
     Ok(WorkerResult::Checked { dispatches: 1 })

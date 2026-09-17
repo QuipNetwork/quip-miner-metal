@@ -11,7 +11,7 @@ pub(crate) const MAX_EDGES: usize = 163_840;
 pub(crate) const MAX_DEGREE: usize = 20;
 pub(crate) const LANES: usize = 128;
 pub(crate) const TILE_CHANNELS: usize = 4_096;
-pub(crate) const MAX_PROGRAMS: usize = 24;
+pub(crate) const MAX_TILES: usize = 24;
 
 const FP16_BYTES: usize = 2;
 const FP16_PAYLOAD_LIMIT: usize = 128 * 1024 * 1024;
@@ -20,6 +20,7 @@ const SURFACE_ALIGNMENT: usize = 65_536;
 
 #[derive(Debug)]
 pub(crate) struct ColorTile {
+    #[cfg(test)]
     pub(crate) color: usize,
     pub(crate) nodes: Vec<usize>,
     pub(crate) output_channels: usize,
@@ -32,6 +33,7 @@ pub(crate) struct PreparedGraph {
     pub(crate) fields: Vec<i8>,
     pub(crate) neighbors: Vec<Vec<(usize, i8)>>,
     pub(crate) tiles: Vec<ColorTile>,
+    #[cfg(test)]
     pub(crate) color_count: usize,
 }
 
@@ -163,6 +165,7 @@ pub(crate) fn prepare(graph: &IsingGraph) -> Result<PreparedGraph, AneError> {
         let nodes: Vec<usize> = (0..n).filter(|&node| colors[node] == color).collect();
         for chunk in nodes.chunks(TILE_CHANNELS) {
             tiles.push(ColorTile {
+                #[cfg(test)]
                 color,
                 nodes: chunk.to_vec(),
                 output_channels: chunk.len().div_ceil(32) * 32,
@@ -170,9 +173,9 @@ pub(crate) fn prepare(graph: &IsingGraph) -> Result<PreparedGraph, AneError> {
         }
     }
 
-    if tiles.len() > MAX_PROGRAMS {
+    if tiles.len() > MAX_TILES {
         return Err(AneError::Capacity(format!(
-            "program count {} exceeds {MAX_PROGRAMS}",
+            "tile count {} exceeds {MAX_TILES}",
             tiles.len()
         )));
     }
@@ -184,11 +187,20 @@ pub(crate) fn prepare(graph: &IsingGraph) -> Result<PreparedGraph, AneError> {
         fields,
         neighbors,
         tiles,
+        #[cfg(test)]
         color_count,
     })
 }
 
 impl PreparedGraph {
+    pub(crate) fn storage_order(&self) -> Vec<usize> {
+        self.tiles
+            .iter()
+            .flat_map(|tile| tile.nodes.iter().copied())
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn tile_weights(&self, tile: &ColorTile) -> Result<Vec<i8>, AneError> {
         let len = tile
             .output_channels

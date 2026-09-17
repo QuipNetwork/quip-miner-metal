@@ -3,10 +3,11 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use crate::graph::{PreparedGraph, LANES};
 use crate::AneError;
 
-const LANES: usize = 128;
 const ERROR_BYTES: usize = 1024;
+pub(crate) const BLOCK_SWEEPS: usize = 2;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -17,8 +18,10 @@ pub(crate) struct EvalTimes {
 
 unsafe extern "C" {
     fn quip_ane_create(
-        input_channels: usize,
-        output_channels: usize,
+        channels: usize,
+        lengths: *const usize,
+        tile_count: usize,
+        sweeps: usize,
         weights: *const i8,
         weight_count: usize,
         fields: *const i8,
@@ -27,26 +30,25 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
-    fn quip_ane_share_input(
+    fn quip_ane_reset(
         program: *mut c_void,
-        source: *mut c_void,
+        spins: *const i8,
+        count: usize,
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
     fn quip_ane_evaluate(
         program: *mut c_void,
-        neighbors: *const i8,
-        neighbor_count: usize,
-        input_mode: u32,
-        changed_rows: *const usize,
-        changed_row_count: usize,
-        spins: *const i8,
-        spin_count: usize,
         thresholds: *const u8,
-        threshold_count: usize,
-        output: *mut i8,
-        output_count: usize,
+        count: usize,
         times: *mut EvalTimes,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+    fn quip_ane_read(
+        program: *mut c_void,
+        output: *mut i8,
+        count: usize,
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
@@ -54,14 +56,9 @@ unsafe extern "C" {
     fn quip_ane_parent_pid() -> u32;
 }
 
-pub(crate) enum NeighborUpdate<'a> {
-    Full,
-    Rows(&'a [usize]),
-}
-
 pub(crate) struct AneProgram {
-    input_channels: usize,
-    output_channels: usize,
+    channels: usize,
+    sweeps: usize,
     handle: Option<NonNull<c_void>>,
     _one_thread: PhantomData<Rc<()>>,
 }
@@ -76,59 +73,65 @@ fn native_error(bytes: &[u8; ERROR_BYTES]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-fn checked_bytes(elements: usize, weight_blob: bool) -> Result<usize, AneError> {
-    let payload = elements
-        .checked_mul(2)
-        .ok_or_else(|| AneError::Capacity("ANE tensor byte size overflow".to_owned()))?;
-    if payload > u32::MAX as usize {
-        return Err(AneError::Capacity(
-            "ANE tensor exceeds its 32-bit byte limit".to_owned(),
-        ));
-    }
-    let bytes = if weight_blob {
-        payload.checked_add(128)
-    } else {
-        payload
-            .checked_add(65535)
-            .map(|bytes| (bytes & !65535).max(65536))
-    };
-    bytes
-        .filter(|&bytes| {
-            bytes <= isize::MAX as usize && (weight_blob || bytes <= u32::MAX as usize)
-        })
-        .ok_or_else(|| AneError::Capacity("ANE allocation byte size overflow".to_owned()))
-}
-
 impl AneProgram {
-    pub(crate) fn compile(
-        input_channels: usize,
-        output_channels: usize,
+    pub(crate) fn compile(prepared: &PreparedGraph, sweeps: usize) -> Result<Self, AneError> {
+        let order = prepared.storage_order();
+        let mut position = vec![0; prepared.node_count];
+        for (row, &node) in order.iter().enumerate() {
+            position[node] = row;
+        }
+        let lengths: Vec<_> = prepared.tiles.iter().map(|tile| tile.nodes.len()).collect();
+        let count = prepared
+            .tiles
+            .iter()
+            .map(|tile| tile.output_channels * prepared.input_channels)
+            .sum();
+        let mut weights = Vec::new();
+        weights
+            .try_reserve_exact(count)
+            .map_err(|_| AneError::Runtime("ANE weights allocation failed".into()))?;
+        weights.resize(count, 0);
+        let mut offset = 0;
+        for tile in &prepared.tiles {
+            for (row, &node) in tile.nodes.iter().enumerate() {
+                for &(neighbor, coupling) in &prepared.neighbors[node] {
+                    weights[offset + row * prepared.input_channels + position[neighbor]] = coupling;
+                }
+            }
+            offset += tile.output_channels * prepared.input_channels;
+        }
+        let mut fields = vec![0; prepared.input_channels];
+        for (row, &node) in order.iter().enumerate() {
+            fields[row] = prepared.fields[node];
+        }
+        Self::compile_raw(prepared.input_channels, &lengths, sweeps, &weights, &fields)
+    }
+
+    fn compile_raw(
+        channels: usize,
+        lengths: &[usize],
+        sweeps: usize,
         weights: &[i8],
         fields: &[i8],
     ) -> Result<Self, AneError> {
-        if !(32..=16384).contains(&input_channels)
-            || !input_channels.is_multiple_of(32)
-            || !(32..=4096).contains(&output_channels)
-            || !output_channels.is_multiple_of(32)
+        if !(32..=16384).contains(&channels)
+            || !channels.is_multiple_of(32)
+            || lengths.is_empty()
+            || lengths.len() > 24
+            || lengths.iter().any(|&n| n == 0 || n > 4096)
+            || !(1..=8).contains(&sweeps)
         {
             return Err(AneError::Capacity(
-                "ANE channels require 32-channel padding, at most 16384 inputs and 4096 outputs"
-                    .to_owned(),
+                "Invalid ANE channel, tile, or sweep dimensions".into(),
             ));
         }
-        let weight_count = input_channels
-            .checked_mul(output_channels)
-            .ok_or_else(|| AneError::Capacity("ANE weight count overflow".to_owned()))?;
-        checked_bytes(weight_count, true)?;
-        for channels in [input_channels, output_channels] {
-            let count = channels
-                .checked_mul(LANES)
-                .ok_or_else(|| AneError::Capacity("ANE lane count overflow".to_owned()))?;
-            checked_bytes(count, false)?;
-        }
-        if weights.len() != weight_count || fields.len() != output_channels {
+        let count: usize = lengths.iter().map(|n| n.div_ceil(32) * 32 * channels).sum();
+        if lengths.iter().sum::<usize>() > channels
+            || fields.len() != channels
+            || weights.len() != count
+        {
             return Err(AneError::Runtime(
-                "ANE weight or field length mismatch".to_owned(),
+                "ANE weight, field, or tile length mismatch".into(),
             ));
         }
         if weights
@@ -137,18 +140,19 @@ impl AneProgram {
             .any(|&value| !(-1..=1).contains(&value))
         {
             return Err(AneError::Runtime(
-                "ANE weights and fields must be -1, 0, or 1".to_owned(),
+                "ANE weights and fields must be -1, 0, or 1".into(),
             ));
         }
         let mut handle = std::ptr::null_mut();
         let mut error = [u8::MAX; ERROR_BYTES];
-        // SAFETY: Slice lengths and byte limits were checked above. All arrays
-        // and out-pointers remain live for this blocking call. Native code copies
-        // constants and transfers exactly one retained handle on success.
+        // SAFETY: Dimensions and lengths are bounded above; all slices and output
+        // pointers live throughout this blocking call. Native code copies constants.
         let status = unsafe {
             quip_ane_create(
-                input_channels,
-                output_channels,
+                channels,
+                lengths.as_ptr(),
+                lengths.len(),
+                sweeps,
                 weights.as_ptr(),
                 weights.len(),
                 fields.as_ptr(),
@@ -162,31 +166,33 @@ impl AneProgram {
             return Err(AneError::Runtime(native_error(&error)));
         }
         let handle = NonNull::new(handle)
-            .ok_or_else(|| AneError::Runtime("ANE creation returned a null handle".to_owned()))?;
+            .ok_or_else(|| AneError::Runtime("ANE creation returned null".into()))?;
         Ok(Self {
-            input_channels,
-            output_channels,
+            channels,
+            sweeps,
             handle: Some(handle),
             _one_thread: PhantomData,
         })
     }
 
-    pub(crate) fn share_input(&mut self, source: &Self) -> Result<(), AneError> {
-        if self.input_channels != source.input_channels {
-            return Err(AneError::Runtime(
-                "ANE shared input shape mismatch".to_owned(),
-            ));
+    fn handle(&self) -> Result<*mut c_void, AneError> {
+        self.handle
+            .map(NonNull::as_ptr)
+            .ok_or_else(|| AneError::Runtime("ANE program is closed".into()))
+    }
+
+    pub(crate) fn reset(&mut self, spins: &[i8]) -> Result<(), AneError> {
+        if spins.len() != self.channels * LANES {
+            return Err(AneError::Runtime("ANE spin length mismatch".into()));
         }
-        let (Some(handle), Some(source)) = (self.handle, source.handle) else {
-            return Err(AneError::Runtime("ANE program is closed".to_owned()));
-        };
         let mut error = [u8::MAX; ERROR_BYTES];
-        // SAFETY: Both handles are live and confined to this thread. Native
-        // code retains the shared input owner and rebinds only that input.
+        // SAFETY: The live thread-confined handle and checked slice remain valid
+        // during the synchronous call. Native code validates every spin.
         let status = unsafe {
-            quip_ane_share_input(
-                handle.as_ptr(),
-                source.as_ptr(),
+            quip_ane_reset(
+                self.handle()?,
+                spins.as_ptr(),
+                spins.len(),
                 error.as_mut_ptr().cast(),
                 error.len(),
             )
@@ -197,78 +203,19 @@ impl AneProgram {
         Ok(())
     }
 
-    pub(crate) fn evaluate(
-        &mut self,
-        neighbors: &[i8],
-        spins: &[i8],
-        thresholds: &[u8],
-    ) -> Result<(Vec<i8>, EvalTimes), AneError> {
-        let mut output = vec![0; self.output_channels * LANES];
-        let times = self.evaluate_into(
-            neighbors,
-            NeighborUpdate::Full,
-            spins,
-            thresholds,
-            &mut output,
-        )?;
-        Ok((output, times))
-    }
-
-    pub(crate) fn evaluate_into(
-        &mut self,
-        neighbors: &[i8],
-        update: NeighborUpdate<'_>,
-        spins: &[i8],
-        thresholds: &[u8],
-        output: &mut [i8],
-    ) -> Result<EvalTimes, AneError> {
-        // These products and their FP16 allocation bounds were checked at creation.
-        let input_count = self.input_channels * LANES;
-        let output_count = self.output_channels * LANES;
-        if neighbors.len() != input_count
-            || spins.len() != output_count
-            || thresholds.len() != output_count
-            || output.len() != output_count
-        {
-            return Err(AneError::Runtime(
-                "ANE evaluation slice length mismatch".to_owned(),
-            ));
+    pub(crate) fn advance(&mut self, thresholds: &[u8]) -> Result<EvalTimes, AneError> {
+        if thresholds.len() != self.channels * LANES * self.sweeps {
+            return Err(AneError::Runtime("ANE threshold length mismatch".into()));
         }
-        let (input_mode, changed_rows) = match update {
-            NeighborUpdate::Full => (0, &[][..]),
-            NeighborUpdate::Rows(rows) => {
-                if rows.len() > self.input_channels
-                    || rows.iter().any(|&row| row >= self.input_channels)
-                {
-                    return Err(AneError::Runtime(
-                        "ANE changed rows outside input shape".to_owned(),
-                    ));
-                }
-                (1, rows)
-            }
-        };
-        let handle = self
-            .handle
-            .ok_or_else(|| AneError::Runtime("ANE program is closed".to_owned()))?;
-        let mut times = EvalTimes::default();
         let mut error = [u8::MAX; ERROR_BYTES];
-        // SAFETY: The owned handle is live and confined to one thread. Every
-        // buffer has the checked shape, remains live throughout the blocking
-        // call, and output/times/error are writable without aliasing inputs.
+        let mut times = EvalTimes::default();
+        // SAFETY: The handle is live, slice has the compiled shape, and mutable
+        // output pointers do not alias the input. Dispatch completes before return.
         let status = unsafe {
             quip_ane_evaluate(
-                handle.as_ptr(),
-                neighbors.as_ptr(),
-                neighbors.len(),
-                input_mode,
-                changed_rows.as_ptr(),
-                changed_rows.len(),
-                spins.as_ptr(),
-                spins.len(),
+                self.handle()?,
                 thresholds.as_ptr(),
                 thresholds.len(),
-                output.as_mut_ptr(),
-                output.len(),
                 &mut times,
                 error.as_mut_ptr().cast(),
                 error.len(),
@@ -278,6 +225,28 @@ impl AneProgram {
             return Err(AneError::Runtime(native_error(&error)));
         }
         Ok(times)
+    }
+
+    pub(crate) fn read(&mut self, output: &mut [i8]) -> Result<(), AneError> {
+        if output.len() != self.channels * LANES {
+            return Err(AneError::Runtime("ANE output length mismatch".into()));
+        }
+        let mut error = [u8::MAX; ERROR_BYTES];
+        // SAFETY: The live thread-confined handle and exclusive output buffer
+        // remain valid throughout the blocking, shape-checked read.
+        let status = unsafe {
+            quip_ane_read(
+                self.handle()?,
+                output.as_mut_ptr(),
+                output.len(),
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            return Err(AneError::Runtime(native_error(&error)));
+        }
+        Ok(())
     }
 
     pub(crate) fn close(mut self) -> Result<(), AneError> {
@@ -321,299 +290,141 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_malformed_dimensions_and_weights_before_runtime() {
-        for (inputs, outputs) in [
-            (0, 32),
-            (31, 32),
-            (32, 33),
-            (16416, 32),
-            (32, 4128),
-            (usize::MAX, 32),
-        ] {
-            assert!(AneProgram::compile(inputs, outputs, &[], &[]).is_err());
+    fn rejects_malformed_dimensions_and_constants_before_runtime() {
+        for channels in [0, 31, 33, 16416, usize::MAX] {
+            assert!(AneProgram::compile_raw(channels, &[32], 2, &[], &[]).is_err());
         }
-        assert!(AneProgram::compile(32, 32, &[0; 1023], &[0; 32]).is_err());
-        assert!(AneProgram::compile(32, 32, &[0; 1024], &[0; 31]).is_err());
-        assert!(AneProgram::compile(32, 32, &[2; 1024], &[0; 32]).is_err());
-        assert!(AneProgram::compile(32, 32, &[0; 1024], &[2; 32]).is_err());
+        for lengths in [&[][..], &[0][..], &[4097][..], &[1; 25][..], &[33][..]] {
+            assert!(AneProgram::compile_raw(32, lengths, 2, &[0; 1024], &[0; 32]).is_err());
+        }
+        for sweeps in [0, 9, usize::MAX] {
+            assert!(AneProgram::compile_raw(32, &[32], sweeps, &[0; 1024], &[0; 32]).is_err());
+        }
+        assert!(AneProgram::compile_raw(32, &[32], 2, &[0; 1023], &[0; 32]).is_err());
+        assert!(AneProgram::compile_raw(32, &[32], 2, &[0; 1024], &[0; 31]).is_err());
+        assert!(AneProgram::compile_raw(32, &[32], 2, &[2; 1024], &[0; 32]).is_err());
+        assert!(AneProgram::compile_raw(32, &[32], 2, &[0; 1024], &[2; 32]).is_err());
     }
 
     #[test]
-    fn changed_rows_reject_out_of_range_indices_before_runtime() {
-        let mut program = AneProgram {
-            input_channels: 32,
-            output_channels: 32,
-            handle: None,
-            _one_thread: PhantomData,
-        };
-        let mut output = vec![0; 32 * LANES];
-        for rows in [&[32][..], &[usize::MAX][..], &[0; 33][..]] {
-            let error = program
-                .evaluate_into(
-                    &[0; 32 * LANES],
-                    NeighborUpdate::Rows(rows),
-                    &[1; 32 * LANES],
-                    &[0; 32 * LANES],
-                    &mut output,
-                )
-                .unwrap_err();
-            assert!(error.to_string().contains("changed rows"), "{error}");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires Apple Silicon ANE"]
-    fn hardware_shared_input_rows_and_owner_lifetime() {
-        let mut weights = vec![0; 32 * 32];
-        for channel in 0..32 {
-            weights[channel * 32 + channel] = 1;
-        }
-        let mut first = AneProgram::compile(32, 32, &weights, &[0; 32]).unwrap();
-        // Different output shapes must retain their own spin and output surfaces.
-        let mut second = AneProgram::compile(32, 64, &vec![0; 32 * 64], &[0; 64]).unwrap();
-        second.share_input(&first).unwrap();
-        let mut third = AneProgram::compile(32, 32, &weights, &[0; 32]).unwrap();
-        third.share_input(&second).unwrap();
-        let mut neighbors = vec![-1; 32 * LANES];
-        let spins = vec![1; 32 * LANES];
-        let thresholds = vec![0; 32 * LANES];
-        let mut output = vec![0; 32 * LANES];
-        assert!(third
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Rows(&[]),
-                &spins,
-                &thresholds,
-                &mut output
-            )
-            .is_err());
-        first
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Full,
-                &spins,
-                &thresholds,
-                &mut output,
-            )
-            .unwrap();
-        assert!(output.iter().all(|&spin| spin == 1));
-        let mut wide_output = vec![0; 64 * LANES];
-        second
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Rows(&[]),
-                &[1; 64 * LANES],
-                &[0; 64 * LANES],
-                &mut wide_output,
-            )
-            .unwrap();
-        assert!(wide_output.iter().all(|&spin| spin == -1));
-        first.close().unwrap();
-        second.close().unwrap();
-        neighbors[LANES..2 * LANES].fill(1);
-        // Unchanged host rows are not copied or validated during a row update.
-        neighbors[0] = 127;
-        third
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Rows(&[1]),
-                &spins,
-                &thresholds,
-                &mut output,
-            )
-            .unwrap();
-        assert!(output[..LANES].iter().all(|&spin| spin == 1));
-        assert!(output[LANES..2 * LANES].iter().all(|&spin| spin == -1));
-        assert!(output[2 * LANES..].iter().all(|&spin| spin == 1));
-        assert!(third
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Full,
-                &spins,
-                &thresholds,
-                &mut output
-            )
-            .is_err());
-        neighbors[LANES] = 22;
-        assert!(third
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Rows(&[1]),
-                &spins,
-                &thresholds,
-                &mut output
-            )
-            .is_err());
-        third
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Rows(&[]),
-                &spins,
-                &thresholds,
-                &mut output,
-            )
-            .unwrap();
-        assert!(output[LANES..2 * LANES].iter().all(|&spin| spin == -1));
-        third.close().unwrap();
-    }
-
-    #[test]
-    #[ignore = "requires Apple Silicon ANE"]
-    fn hardware_native_changed_row_validation() {
-        let mut weights = vec![0; 32 * 32];
-        for channel in 0..32 {
-            weights[channel * 32 + channel] = 1;
-        }
-        let mut program = AneProgram::compile(32, 32, &weights, &[0; 32]).unwrap();
-        let mut other = AneProgram::compile(64, 32, &[0; 64 * 32], &[0; 32]).unwrap();
-        let mut error = [u8::MAX; ERROR_BYTES];
-        // SAFETY: Both handles are live. Different input shapes must be
-        // rejected before any request or surface is replaced.
-        let status = unsafe {
-            quip_ane_share_input(
-                other.handle.unwrap().as_ptr(),
-                program.handle.unwrap().as_ptr(),
-                error.as_mut_ptr().cast(),
-                error.len(),
-            )
-        };
-        assert_eq!(status, 1);
-        assert!(native_error(&error).contains("shape mismatch"));
-        assert!(other.share_input(&program).is_err());
-        other.close().unwrap();
-        let mut neighbors = vec![-1; 32 * LANES];
-        let spins = vec![1; 32 * LANES];
-        let thresholds = vec![0; 32 * LANES];
-        let mut output = vec![0; 32 * LANES];
-        program
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Full,
-                &spins,
-                &thresholds,
-                &mut output,
-            )
-            .unwrap();
-        neighbors[LANES..2 * LANES].fill(1);
-        let invalid_rows = [1, 32];
-        let excessive_rows = [0; 33];
-        let huge_row = [usize::MAX];
-        for (mode, rows, count, expected) in [
-            (1, std::ptr::null(), 1, "changed rows buffer"),
-            (1, excessive_rows.as_ptr(), 33, "changed rows buffer"),
-            (1, invalid_rows.as_ptr(), 2, "outside input shape"),
-            (1, huge_row.as_ptr(), 1, "outside input shape"),
-            (0, invalid_rows.as_ptr(), 1, "cannot specify changed rows"),
-            (2, std::ptr::null(), 0, "update mode"),
-        ] {
-            let mut times = EvalTimes::default();
-            error.fill(u8::MAX);
-            // SAFETY: All arrays are live with sufficient storage for their
-            // supplied counts. Invalid row metadata must fail before staging
-            // or indexing the neighbor array. Output and error are writable.
-            let status = unsafe {
-                quip_ane_evaluate(
-                    program.handle.unwrap().as_ptr(),
-                    neighbors.as_ptr(),
-                    neighbors.len(),
-                    mode,
-                    rows,
-                    count,
-                    spins.as_ptr(),
-                    spins.len(),
-                    thresholds.as_ptr(),
-                    thresholds.len(),
-                    output.as_mut_ptr(),
-                    output.len(),
-                    &mut times,
-                    error.as_mut_ptr().cast(),
-                    error.len(),
-                )
-            };
-            assert_eq!(status, 1);
-            assert!(
-                native_error(&error).contains(expected),
-                "{}",
-                native_error(&error)
-            );
-        }
-        // Even a valid row preceding an invalid index must not have been staged.
-        program
-            .evaluate_into(
-                &neighbors,
-                NeighborUpdate::Rows(&[]),
-                &spins,
-                &thresholds,
-                &mut output,
-            )
-            .unwrap();
-        assert!(output.iter().all(|&spin| spin == 1));
-        program.close().unwrap();
-    }
-
-    #[test]
-    fn error_buffer_requires_a_terminator() {
-        assert!(native_error(&[b'x'; 1024]).contains("unterminated"));
-        let mut bytes = [0; 1024];
-        bytes[..4].copy_from_slice(b"oops");
-        assert_eq!(native_error(&bytes), "oops");
-    }
-
-    #[test]
-    fn parent_process_does_not_need_a_program() {
+    fn error_buffer_and_parent_process() {
+        assert!(native_error(&[b'x'; ERROR_BYTES]).contains("unterminated"));
+        assert!(native_error(&[0; ERROR_BYTES]).contains("without an error"));
+        let mut error = [0; ERROR_BYTES];
+        error[..4].copy_from_slice(b"oops");
+        assert_eq!(native_error(&error), "oops");
         assert!(parent_pid() > 0);
     }
 
     #[test]
-    fn byte_sizes_reject_overflow_and_round_to_surface_pages() {
-        assert!(checked_bytes(usize::MAX, true).is_err());
-        assert!(checked_bytes(u32::MAX as usize, false).is_err());
-        assert_eq!(checked_bytes(32 * 128, false).unwrap(), 65536);
-        assert_eq!(checked_bytes(32769, false).unwrap(), 131072);
-        assert_eq!(checked_bytes(1024, true).unwrap(), 2176);
-    }
-
-    #[test]
-    fn native_boundary_rejects_missing_pointers_and_short_arrays() {
-        let weights = [0i8; 1024];
-        let fields = [0i8; 32];
-        for (inputs, weight_pointer, weight_count, field_pointer, field_count) in [
+    fn native_boundary_rejects_bad_create_buffers() {
+        let weights = [0; 1024];
+        let fields = [0; 32];
+        let lengths = [32];
+        for (
+            channels,
+            length_ptr,
+            tiles,
+            sweeps,
+            weight_ptr,
+            weight_count,
+            field_ptr,
+            field_count,
+        ) in [
             (
                 usize::MAX,
+                lengths.as_ptr(),
+                1,
+                2,
                 weights.as_ptr(),
-                weights.len(),
+                1024,
                 fields.as_ptr(),
-                fields.len(),
+                32,
             ),
             (
                 32,
                 std::ptr::null(),
-                weights.len(),
+                1,
+                2,
+                weights.as_ptr(),
+                1024,
                 fields.as_ptr(),
-                fields.len(),
+                32,
             ),
-            (32, weights.as_ptr(), 1023, fields.as_ptr(), fields.len()),
             (
                 32,
+                lengths.as_ptr(),
+                0,
+                2,
                 weights.as_ptr(),
-                weights.len(),
-                std::ptr::null(),
-                fields.len(),
+                1024,
+                fields.as_ptr(),
+                32,
             ),
-            (32, weights.as_ptr(), weights.len(), fields.as_ptr(), 31),
+            (
+                32,
+                lengths.as_ptr(),
+                1,
+                9,
+                weights.as_ptr(),
+                1024,
+                fields.as_ptr(),
+                32,
+            ),
+            (
+                32,
+                lengths.as_ptr(),
+                1,
+                2,
+                std::ptr::null(),
+                1024,
+                fields.as_ptr(),
+                32,
+            ),
+            (
+                32,
+                lengths.as_ptr(),
+                1,
+                2,
+                weights.as_ptr(),
+                1023,
+                fields.as_ptr(),
+                32,
+            ),
+            (
+                32,
+                lengths.as_ptr(),
+                1,
+                2,
+                weights.as_ptr(),
+                1024,
+                std::ptr::null(),
+                32,
+            ),
+            (
+                32,
+                lengths.as_ptr(),
+                1,
+                2,
+                weights.as_ptr(),
+                1024,
+                fields.as_ptr(),
+                31,
+            ),
         ] {
             let mut error = [u8::MAX; ERROR_BYTES];
             let mut handle = std::ptr::null_mut();
-            // SAFETY: Non-null arrays are live and at least as long as their
-            // supplied counts. Invalid/null arguments must fail before reads;
-            // the handle and error output storage are valid for this call.
+            // SAFETY: Non-null buffers cover the supplied counts. Invalid
+            // dimensions and pointers must fail before runtime initialization.
             let status = unsafe {
                 quip_ane_create(
-                    inputs,
-                    32,
-                    weight_pointer,
+                    channels,
+                    length_ptr,
+                    tiles,
+                    sweeps,
+                    weight_ptr,
                     weight_count,
-                    field_pointer,
+                    field_ptr,
                     field_count,
                     &mut handle,
                     error.as_mut_ptr().cast(),
@@ -624,268 +435,249 @@ mod tests {
             assert!(handle.is_null());
             assert!(error.contains(&0));
         }
-        let mut share_error = [u8::MAX; ERROR_BYTES];
-        // SAFETY: Null handles are rejected before dereference and the error
-        // buffer is writable for the supplied capacity.
-        let status = unsafe {
-            quip_ane_share_input(
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                share_error.as_mut_ptr().cast(),
-                share_error.len(),
-            )
-        };
-        assert_eq!(status, 1);
-        assert!(native_error(&share_error).contains("Missing ANE sharing handle"));
-        let mut error = [u8::MAX; 1];
-        // SAFETY: A missing handle is explicitly rejected without dereference;
-        // the one-byte error buffer is writable and tests bounded termination.
+        let mut error = [255u8];
+        // SAFETY: Null is rejected before dereference; the one-byte error buffer
+        // checks bounded termination on failure.
         let status = unsafe {
             quip_ane_destroy(std::ptr::null_mut(), error.as_mut_ptr().cast(), error.len())
         };
         assert_eq!(status, 1);
-        assert_eq!(error[0], 0);
-    }
-
-    #[test]
-    #[ignore = "requires Apple Silicon ANE"]
-    fn hardware_weight_only_identity_and_field_only_effect() {
-        let mut positive = [0; 1024];
-        positive[0] = 1;
-        let mut negative = positive;
-        negative[0] = -1;
-        let mut fields = [0; 32];
-        fields[0] = 1;
-        // Same fields and geometry: omitting the unique MIL identity makes
-        // the second model reuse the first model's coupling blob.
-        let mut first = AneProgram::compile(32, 32, &positive, &fields).unwrap();
-        let mut second = AneProgram::compile(32, 32, &negative, &fields).unwrap();
-        let neighbors = vec![2; 4096];
-        let spins = vec![1; 4096];
-        let thresholds = vec![0; 4096];
-        let (a, _) = first.evaluate(&neighbors, &spins, &thresholds).unwrap();
-        let (b, _) = second.evaluate(&neighbors, &spins, &thresholds).unwrap();
-        assert!(a.iter().all(|&spin| spin == -1));
-        assert!(b[..128].iter().all(|&spin| spin == 1));
-        first.close().unwrap();
-        second.close().unwrap();
-
-        fields[0] = -1;
-        let mut field_only = AneProgram::compile(32, 32, &[0; 1024], &fields).unwrap();
-        let (output, _) = field_only
-            .evaluate(&neighbors, &spins, &thresholds)
-            .unwrap();
-        assert!(output[..128].iter().all(|&spin| spin == 1));
-        assert!(output[128..].iter().all(|&spin| spin == -1));
-        field_only.close().unwrap();
-        eprintln!("weight_only_identity_and_field_only_successful_dispatches=3 explicit_closes=3");
+        assert_eq!(error, [0]);
     }
 
     #[test]
     #[ignore = "requires Apple Silicon ANE"]
     fn hardware_exhaustive_integer_acceptance() {
-        let mut weights = vec![0; 32 * 32];
-        for channel in 0..32 {
-            weights[channel * 32 + channel] = 1;
-        }
-        let mut cases = Vec::new();
-        for degree in 0i8..=21 {
-            for satisfied in 0..=degree {
-                for threshold in 0u8..=63 {
-                    for spin in [-1i8, 1] {
-                        let neighbor = (degree - 2 * satisfied) * spin;
-                        let expected = if i16::from(satisfied)
-                            <= (i16::from(degree) + i16::from(threshold)) / 2
-                        {
-                            -spin
-                        } else {
-                            spin
-                        };
-                        cases.push((neighbor, spin, threshold, expected));
+        let mut checked = 0;
+        let mut dispatches = 0;
+        // Each target has its own 21 fixed auxiliary channels. Even/odd local
+        // sums need 20/21 nonzero terms because spin inputs are always +/-1.
+        for degree_parity in [0i8, 1] {
+            let terms = 20 + degree_parity as usize;
+            let channels = 704;
+            let mut weights = vec![0; 32 * channels];
+            for target in 0..32 {
+                for term in 0..terms {
+                    weights[target * channels + 32 + target * 21 + term] = 1;
+                }
+            }
+            let mut cases = Vec::new();
+            for degree in 0i8..=21 {
+                if degree % 2 != degree_parity {
+                    continue;
+                }
+                for satisfied in 0..=degree {
+                    for threshold in 0u8..=63 {
+                        for spin in [-1i8, 1] {
+                            let field = (degree - 2 * satisfied) * spin;
+                            let expected = if i16::from(satisfied)
+                                <= (i16::from(degree) + i16::from(threshold)) / 2
+                            {
+                                -spin
+                            } else {
+                                spin
+                            };
+                            cases.push((field, spin, threshold, expected));
+                        }
                     }
                 }
             }
-        }
-        assert_eq!(cases.len(), 32384);
-        let mut program = AneProgram::compile(32, 32, &weights, &[0; 32]).unwrap();
-        let mut completed = 0;
-        for chunk in cases.chunks(32 * 128) {
-            let mut batch = chunk.to_vec();
-            batch.resize(32 * 128, *chunk.last().unwrap());
-            let neighbors: Vec<_> = batch.iter().map(|case| case.0).collect();
-            let spins: Vec<_> = batch.iter().map(|case| case.1).collect();
-            let thresholds: Vec<_> = batch.iter().map(|case| case.2).collect();
-            let (output, _) = program.evaluate(&neighbors, &spins, &thresholds).unwrap();
-            completed += 1;
-            for (index, (&actual, case)) in output.iter().zip(&batch).enumerate() {
-                assert_eq!(
-                    actual, case.3,
-                    "batch {completed}, element {index}: {case:?}"
-                );
+            let mut program =
+                AneProgram::compile_raw(channels, &[32], 2, &weights, &vec![0; channels]).unwrap();
+            for chunk in cases.chunks(32 * LANES) {
+                let mut state = vec![1; channels * LANES];
+                let mut thresholds = vec![255; channels * LANES * 2];
+                for (index, &(field, spin, threshold, _)) in chunk.iter().enumerate() {
+                    state[index] = spin;
+                    thresholds[index] = threshold;
+                    let target = index / LANES;
+                    let lane = index % LANES;
+                    let positive = (terms as i16 + i16::from(field)) / 2;
+                    for term in 0..terms {
+                        state[(32 + target * 21 + term) * LANES + lane] =
+                            if (term as i16) < positive { 1 } else { -1 };
+                    }
+                }
+                program.reset(&state).unwrap();
+                program.advance(&thresholds).unwrap();
+                let mut output = vec![0; state.len()];
+                program.read(&mut output).unwrap();
+                for (index, case) in chunk.iter().enumerate() {
+                    assert_eq!(output[index], case.3, "case={case:?}");
+                }
+                assert_eq!(output[32 * LANES..], state[32 * LANES..]);
+                checked += chunk.len();
+                dispatches += 1;
             }
+            program.close().unwrap();
         }
-        assert_eq!(completed, 8);
+        assert_eq!(checked, 32384);
+        eprintln!("integer_cases={checked} mismatches=0 successful_dispatches={dispatches}");
+    }
+
+    #[test]
+    #[ignore = "requires Apple Silicon ANE"]
+    fn hardware_retained_state_and_skipped_tail() {
+        let mut program = AneProgram::compile_raw(32, &[32], 2, &[0; 1024], &[0; 32]).unwrap();
+        let initial: Vec<_> = (0..32 * LANES)
+            .map(|i| if i % 3 == 0 { -1 } else { 1 })
+            .collect();
+        let mut one_sweep = vec![255; 32 * LANES * 2];
+        one_sweep[..32 * LANES].fill(0);
+        let mut output = vec![0; initial.len()];
+        assert!(program.read(&mut output).is_err());
+        assert!(program.advance(&one_sweep).is_err());
+        program.reset(&initial).unwrap();
+        for _ in 0..3 {
+            program.advance(&one_sweep).unwrap();
+        }
+        program.read(&mut output).unwrap();
+        assert_eq!(output, initial.iter().map(|spin| -spin).collect::<Vec<_>>());
+        program.advance(&vec![255; one_sweep.len()]).unwrap();
+        let mut skipped = vec![0; output.len()];
+        program.read(&mut skipped).unwrap();
+        assert_eq!(skipped, output);
+        program.reset(&initial).unwrap();
+        program.read(&mut output).unwrap();
+        assert_eq!(output, initial);
         program.close().unwrap();
-        eprintln!("integer_cases=32384 mismatches=0 successful_dispatches={completed}");
     }
 
     #[test]
     #[ignore = "requires Apple Silicon ANE"]
     fn hardware_distinct_weights_fields_and_owned_close() {
-        let mut weights = vec![0; 32 * 32];
-        weights[0] = 1;
-        let mut fields = [0; 32];
-        fields[0] = 1;
-        let mut first = AneProgram::compile(32, 32, &weights, &fields).unwrap();
-        weights[0] = -1;
-        fields[0] = -1;
-        let mut second = AneProgram::compile(32, 32, &weights, &fields).unwrap();
-        let neighbors = vec![1; 32 * 128];
-        let spins = vec![1; 32 * 128];
-        let thresholds = vec![0; 32 * 128];
-        let (positive, _) = first.evaluate(&neighbors, &spins, &thresholds).unwrap();
-        let (negative, _) = second.evaluate(&neighbors, &spins, &thresholds).unwrap();
-        assert!(positive.iter().all(|&spin| spin == -1));
-        assert!(negative[..128].iter().all(|&spin| spin == 1));
-        assert!(negative[128..].iter().all(|&spin| spin == -1));
+        let mut weights = [0; 1024];
+        weights[1] = 1;
+        let mut first = AneProgram::compile_raw(32, &[1], 2, &weights, &[0; 32]).unwrap();
+        weights[1] = -1;
+        let mut second = AneProgram::compile_raw(32, &[1], 2, &weights, &[0; 32]).unwrap();
+        let mut thresholds = vec![255; 32 * LANES * 2];
+        thresholds[..32 * LANES].fill(0);
+        let initial = vec![1; 32 * LANES];
+        let mut a = vec![0; initial.len()];
+        let mut b = a.clone();
+        first.reset(&initial).unwrap();
+        second.reset(&initial).unwrap();
+        first.advance(&thresholds).unwrap();
+        second.advance(&thresholds).unwrap();
+        first.read(&mut a).unwrap();
+        second.read(&mut b).unwrap();
+        assert!(a[..LANES].iter().all(|&spin| spin == -1));
+        assert_eq!(b, initial);
         first.close().unwrap();
+        second.advance(&thresholds).unwrap();
+        second.read(&mut b).unwrap();
+        assert_eq!(b, initial);
         second.close().unwrap();
-        eprintln!(
-            "distinct_programs=2 singleton_padding=31 successful_dispatches=2 explicit_closes=2"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires Apple Silicon ANE"]
-    fn hardware_zero_weights_and_invalid_evaluation_inputs() {
-        let mut program = AneProgram::compile(64, 32, &[0; 64 * 32], &[0; 32]).unwrap();
-        let mut neighbors = vec![-21; 64 * 128];
-        let mut spins = vec![1; 32 * 128];
-        spins[..128].fill(-1);
-        let mut thresholds = vec![0; 32 * 128];
-        let mut native_output = vec![0; spins.len()];
-        let mut times = EvalTimes::default();
-        let mut error = [u8::MAX; ERROR_BYTES];
-        // SAFETY: The program owns a live handle. Each non-null buffer has
-        // sufficient storage. The deliberately short count and null pointer
-        // must be rejected by C before input access or dispatch.
-        unsafe {
-            let handle = program.handle.unwrap().as_ptr();
-            assert_eq!(
-                quip_ane_evaluate(
-                    handle,
-                    neighbors.as_ptr(),
-                    neighbors.len() - 1,
-                    0,
-                    std::ptr::null(),
-                    0,
-                    spins.as_ptr(),
-                    spins.len(),
-                    thresholds.as_ptr(),
-                    thresholds.len(),
-                    native_output.as_mut_ptr(),
-                    native_output.len(),
-                    &mut times,
-                    error.as_mut_ptr().cast(),
-                    error.len()
-                ),
-                1
-            );
-            assert!(error.contains(&0));
-            error.fill(u8::MAX);
-            assert_eq!(
-                quip_ane_evaluate(
-                    handle,
-                    neighbors.as_ptr(),
-                    neighbors.len(),
-                    0,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                    spins.len(),
-                    thresholds.as_ptr(),
-                    thresholds.len(),
-                    native_output.as_mut_ptr(),
-                    native_output.len(),
-                    &mut times,
-                    error.as_mut_ptr().cast(),
-                    error.len()
-                ),
-                1
-            );
-            assert!(error.contains(&0));
-        }
-        assert!(program
-            .evaluate(&neighbors[..neighbors.len() - 1], &spins, &thresholds)
-            .is_err());
-        assert!(program
-            .evaluate(&neighbors, &spins[1..], &thresholds)
-            .is_err());
-        assert!(program
-            .evaluate(&neighbors, &spins, &thresholds[1..])
-            .is_err());
-        neighbors[0] = 22;
-        assert!(program.evaluate(&neighbors, &spins, &thresholds).is_err());
-        neighbors[0] = -21;
-        spins[0] = 0;
-        assert!(program.evaluate(&neighbors, &spins, &thresholds).is_err());
-        spins[0] = -1;
-        thresholds[0] = 64;
-        assert!(program.evaluate(&neighbors, &spins, &thresholds).is_err());
-        thresholds[0] = 0;
-        let (output, _) = program.evaluate(&neighbors, &spins, &thresholds).unwrap();
-        assert!(output[..128].iter().all(|&spin| spin == 1));
-        assert!(output[128..].iter().all(|&spin| spin == -1));
-        program.close().unwrap();
-        eprintln!("zero_weights_successful_dispatches=1 invalid_inputs_rejected=8");
-    }
-
-    #[test]
-    #[ignore = "requires Apple Silicon ANE"]
-    fn hardware_rectangular_row_major_weights() {
-        let mut weights = vec![0; 64 * 32];
-        weights[2 * 64 + 3] = -1;
-        weights[4 * 64 + 5] = 1;
         let mut fields = [0; 32];
-        fields[2] = 1;
-        let mut program = AneProgram::compile(64, 32, &weights, &fields).unwrap();
-        let mut neighbors = vec![0; 64 * 128];
-        neighbors[3 * 128..4 * 128].fill(2);
-        neighbors[5 * 128..6 * 128].fill(-2);
-        let mut spins = vec![1; 32 * 128];
-        spins[4 * 128..5 * 128].fill(-1);
-        let (output, times) = program
-            .evaluate(&neighbors, &spins, &[0; 32 * 128])
-            .unwrap();
-        for (channel, lanes) in output.chunks(128).enumerate() {
-            let expected = if channel == 2 || channel == 4 { 1 } else { -1 };
-            assert!(
-                lanes.iter().all(|&spin| spin == expected),
-                "channel {channel}"
-            );
-        }
-        program.close().unwrap();
-        eprintln!(
-            "rectangular_successful_dispatches=1 staging_us={} dispatch_us={}",
-            times.staging_us, times.dispatch_us
-        );
+        fields[0] = -1;
+        let mut field_only = AneProgram::compile_raw(32, &[32], 2, &[0; 1024], &fields).unwrap();
+        field_only.reset(&initial).unwrap();
+        field_only.advance(&thresholds).unwrap();
+        field_only.read(&mut a).unwrap();
+        assert!(a[..LANES].iter().all(|&spin| spin == 1));
+        assert!(a[LANES..].iter().all(|&spin| spin == -1));
+        field_only.close().unwrap();
     }
 
     #[test]
     #[ignore = "requires Apple Silicon ANE"]
-    fn hardware_input_binding_and_acceptance_ties() {
-        let mut weights = vec![0i8; 32 * 32];
-        for channel in 0..32 {
-            weights[channel * 32 + channel] = 1;
+    fn hardware_rejects_invalid_buffers_without_mutating_state() {
+        let mut program = AneProgram::compile_raw(32, &[32], 2, &[0; 1024], &[0; 32]).unwrap();
+        let initial = vec![1; 32 * LANES];
+        let thresholds = vec![0; 32 * LANES * 2];
+        let mut output = vec![0; initial.len()];
+        program.reset(&initial).unwrap();
+        assert!(program.reset(&initial[1..]).is_err());
+        assert!(program.reset(&vec![0; initial.len()]).is_err());
+        assert!(program.advance(&thresholds[1..]).is_err());
+        assert!(program.advance(&vec![64; thresholds.len()]).is_err());
+        assert!(program.read(&mut output[1..]).is_err());
+        let mut error = [u8::MAX; ERROR_BYTES];
+        let mut times = EvalTimes::default();
+        let handle = program.handle().unwrap();
+        // SAFETY: The live handle and all non-null arrays have sufficient
+        // storage. Invalid counts/null pointers must fail before access.
+        unsafe {
+            assert_eq!(
+                quip_ane_reset(
+                    handle,
+                    std::ptr::null(),
+                    initial.len(),
+                    error.as_mut_ptr().cast(),
+                    error.len()
+                ),
+                1
+            );
+            assert_eq!(
+                quip_ane_reset(
+                    handle,
+                    initial.as_ptr(),
+                    initial.len() - 1,
+                    error.as_mut_ptr().cast(),
+                    error.len()
+                ),
+                1
+            );
+            assert_eq!(
+                quip_ane_evaluate(
+                    handle,
+                    std::ptr::null(),
+                    thresholds.len(),
+                    &mut times,
+                    error.as_mut_ptr().cast(),
+                    error.len()
+                ),
+                1
+            );
+            assert_eq!(
+                quip_ane_evaluate(
+                    handle,
+                    thresholds.as_ptr(),
+                    thresholds.len() - 1,
+                    &mut times,
+                    error.as_mut_ptr().cast(),
+                    error.len()
+                ),
+                1
+            );
+            assert_eq!(
+                quip_ane_evaluate(
+                    handle,
+                    thresholds.as_ptr(),
+                    thresholds.len(),
+                    std::ptr::null_mut(),
+                    error.as_mut_ptr().cast(),
+                    error.len()
+                ),
+                1
+            );
+            assert_eq!(
+                quip_ane_read(
+                    handle,
+                    std::ptr::null_mut(),
+                    output.len(),
+                    error.as_mut_ptr().cast(),
+                    error.len()
+                ),
+                1
+            );
+            assert_eq!(
+                quip_ane_read(
+                    handle,
+                    output.as_mut_ptr(),
+                    output.len() - 1,
+                    error.as_mut_ptr().cast(),
+                    error.len()
+                ),
+                1
+            );
         }
-        let mut program = AneProgram::compile(32, 32, &weights, &[0; 32]).unwrap();
-        let neighbors = vec![-3; 32 * 128];
-        let spins = vec![1; 32 * 128];
-        let mut thresholds = vec![2; 32 * 128];
-        thresholds[0] = 3;
-        let (output, _) = program.evaluate(&neighbors, &spins, &thresholds).unwrap();
-        assert_eq!(output[0], -1);
-        assert!(output[1..].iter().all(|&spin| spin == 1));
+        program.read(&mut output).unwrap();
+        assert_eq!(output, initial);
+        program.advance(&thresholds).unwrap();
+        program.read(&mut output).unwrap();
+        assert_eq!(output, initial);
         program.close().unwrap();
     }
 }
