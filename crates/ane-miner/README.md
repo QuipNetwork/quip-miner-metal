@@ -206,8 +206,11 @@ Those surfaces align to 65,536 bytes.
 
 ## Follow-up work
 
-Engine selection is bead `quip-miner-metal-7zk`.
-Optimization is bead `quip-miner-metal-djn`.
-Both are separate work and remain open.
+Engine selection closed as bead `quip-miner-metal-7zk`. The combined router in
+`src/combined.rs` sends separate jobs to Metal and to the ANE under one miner
+identity.
+Optimization closed as bead `quip-miner-metal-djn`. The dense path stays in
+production. Fused local routing measured 3.4 to 3.6 times slower than matched
+dense work. `docs/perf/2026-09-16-ane-local-routing.md` records that result.
 
 See `docs/validation.md` for host, hardware, capacity, lifetime, and protocol receipts.
