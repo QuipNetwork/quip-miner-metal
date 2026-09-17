@@ -18,7 +18,7 @@ simulated annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015).
 | `cuda_msa_identity` with algorithm `"msa"` and an envelope of 7392 to 29568 sweeps at 128 reads | Yes, with a Metal envelope measured on Apple hardware | Throughput per threadgroup is unknown until measured |
 | Stop on cancel: check `EXIT_NOW` inside the sweep loop | No | Metal cannot stop a committed command buffer. It checks cancellation before each chunk and uses a safety margin tuned for measured chunks below 400 ms. |
 | Parallel host scoring (`QUIP_SCORE_THREADS`) | Already present | `harvest_batch` scores problems on a rayon pool |
-| `QUIP_MSC_DIAG` compile switches | No | metal-rs 0.33 exposes no preprocessor defines. A follow-up can splice `#define` lines into the source string |
+| `QUIP_MSC_DIAG` compile switches | Yes, in tests only | metal-rs 0.33 exposes no preprocessor defines, so `tests/diagnostics.rs` prepends `#define QUIP_MSA_DIAGNOSTICS` to the kernel source. That build renames the entry point to `msa_anneal_diag` and adds a flip counter at buffer 25 and energy parts at buffer 26. No production code compiles it |
 
 ## Architecture comparison, CUDA versus Metal
 
