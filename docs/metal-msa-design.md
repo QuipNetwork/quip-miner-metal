@@ -254,8 +254,10 @@ one unit of the CPU solver. This port keeps that coupling.
 ## Deferred at port time, built since
 
 The first port deferred the four items below. Each one now has code on this
-branch. Two of them stay behind a switch, because measurement did not support a
-new default.
+branch. Two of them stay behind a switch, for unrelated reasons. The
+diagnostic build stays test-only because the Metal compiler API exposes no
+way to set a build switch from production code. The four-colouring stays
+opt-in because measurement did not support a new default.
 
 - Lazy chunk commit for cancellation. In the production path in
   `src/streaming.rs`. Each batch commits one chunk at a time and checks
