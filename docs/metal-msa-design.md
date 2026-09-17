@@ -276,11 +276,12 @@ new default.
   classes, with sizes 856, 840, 827, 742, 679, 472, 146, and 15. The four
   classes hold 1148, 1145, 1145, and 1139 nodes. Two graph seeds gave no clear
   throughput result: seed 1 gained 4.18 percent in jobs per second, and seed 3
-  took 8.44 percent longer. On seed 1 the largest logged chunk was 439 ms under greedy and 277 ms under
-  four colours, so only the four-colour arm held the 400 ms bound of success
-  criterion 5. Seed 3 has no logged chunk maxima. Mean lowest energy was worse under four colours by
-  1400 and 250 milli on the two seeds, and no run separates that from noise.
-  A failed edge check selects the greedy scheme.
+  took 8.44 percent longer. On seed 1 the largest logged chunk was 439 ms
+  under greedy and 277 ms under four colours, so only the four-colour arm
+  held the 400 ms bound of success criterion 5. Seed 3 has no logged chunk
+  maxima. Mean lowest energy was worse under four colours by 1400 and 250
+  milli on the two seeds, and no run separates that from noise. A failed
+  edge check selects the greedy scheme.
 
 ## Success criteria
 
