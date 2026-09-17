@@ -251,16 +251,36 @@ and CUDA kernels share one across 64. Replicas start independent and see
 different `L`, so they separate. The CUDA MR measured a median energy within
 one unit of the CPU solver. This port keeps that coupling.
 
-## Out of scope
+## Deferred at port time, built since
 
-- Lazy chunk commit for cancellation.
-- Diagnostic compile switches.
-- A `ulong` word variant with state in device memory, for a benchmark against
-  the `uint` threadgroup design.
-- A Zephyr four-coloring. Advantage2 System 1 has eight greedy
-  classes, with sizes 856, 840, 827, 742, 679, 472, 146, and 15.
-  A four-coloring would halve the barriers per sweep. This remains follow-up
-  work.
+The first port deferred the four items below. Each one now has code on this
+branch. Two of them stay behind a switch, because measurement did not support a
+new default.
+
+- Lazy chunk commit for cancellation. In the production path in
+  `src/streaming.rs`. Each batch commits one chunk at a time and checks
+  cancellation before it encodes and commits each later chunk. The planner
+  accounts for the two batches that overlap.
+- Diagnostic compile switches. In tests only. `tests/diagnostics.rs` prepends
+  `#define QUIP_MSA_DIAGNOSTICS` to the kernel source, which renames the entry
+  point to `msa_anneal_diag` and adds a flip counter and energy parts. No
+  production code compiles it.
+- A `ulong` word variant with state in device memory. An isolated experiment in
+  `kernels/msa64.metal` and `tests/msa64_experiment.rs`. At equal group counts
+  the paired speed ratios ranged from 1.20 to 1.50, with a median of 1.44. The
+  raw driver excludes the miner channel, the governor, and result scoring, so
+  this is not a production speed claim. No file under `src/` refers to it.
+- A Zephyr four-colouring. Opt-in behind `QUIP_METAL_MSA_FOUR_COLOR=1` at
+  `src/sampler.rs:401`, and off by default while bead `quip-miner-metal-fjo`
+  settles whether it becomes the default. Advantage2 System 1 has eight greedy
+  classes, with sizes 856, 840, 827, 742, 679, 472, 146, and 15. The four
+  classes hold 1148, 1145, 1145, and 1139 nodes. Two graph seeds gave no clear
+  throughput result: seed 1 gained 4.18 percent in jobs per second, and seed 3
+  took 8.44 percent longer. The largest logged chunk was 439 ms under greedy and
+  277 ms under four colours, so only the four-colour arm held the 400 ms bound
+  of success criterion 5. Mean lowest energy was worse under four colours by
+  1400 and 250 milli on the two seeds, and no run separates that from noise.
+  A failed edge check selects the greedy scheme.
 
 ## Success criteria
 
