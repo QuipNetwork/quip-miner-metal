@@ -825,10 +825,68 @@ hold inside a narrow band, 1.0970 to 1.1589 ms per sweep, with no trend
 toward the round-trip savings the task brief expected. A second slope
 estimate, fit through the `T2048` and `T8192` points instead of `T512` and
 `T2048`, gives 1.128, 1.161, 1.157, and 1.098 ms per sweep for `BLOCK_SWEEPS`
-1, 2, 4, and 8, the same narrow band from an independent pair of points.
-Fewer dispatches does not measurably lower the real per-sweep cost on this
-host. Only the fixed cost changes, and it rises with `BLOCK_SWEEPS` instead
-of falling.
+1, 2, 4, and 8: a band of 1.098 to 1.161 ms per sweep. That band overlaps
+the first almost entirely, though its upper end, 1.161, sits just past the
+first band's own upper end, 1.1589, so the two are not identical.
+Both are narrow, about a 6% spread across a 4x change in `BLOCK_SWEEPS`,
+and neither shows any trend. Fewer dispatches does not measurably lower the
+real per-sweep cost on this host. Only the fixed cost changes, and it rises
+with `BLOCK_SWEEPS` instead of falling.
+
+### Repetition spread
+
+The Stage and Totals tables report medians only. This table publishes the
+repetition-level `--solve` wall time behind those medians, so a reader can
+check directly, from this document rather than from the raw files under
+`/tmp/quip-ane-throughput-0917/`, the claim the recommendation rests on:
+that the gap between `BLOCK_SWEEPS` values exceeds the spread within a
+single value.
+
+| BLOCK_SWEEPS | Sweeps | Reps | Min, ms | Median, ms | Max, ms | Range, ms | Range excl. known outlier, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 512 | 4 | 970.0 | 980.0 | 1,420.0 | 450.0 | — |
+| 1 | 2,048 | 4 | 2,730.0 | 2,750.0 | 2,760.0 | 30.0 | — |
+| 1 | 8,192 | 3 | 9,670.0 | 9,680.0 | 9,810.0 | 140.0 | — |
+| 2 | 512 | 4 | 1,100.0 | 1,115.0 | 1,530.0 | 430.0 | — |
+| 2 | 2,048 | 4 | 2,840.0 | 2,865.0 | 4,400.0 | 1,560.0 | 40.0 |
+| 2 | 8,192 | 5 | 9,810.0 | 10,000.0 | 15,470.0 | 5,660.0 | 190.0 |
+| 4 | 512 | 4 | 1,420.0 | 1,465.0 | 1,860.0 | 440.0 | — |
+| 4 | 2,048 | 4 | 3,180.0 | 3,245.0 | 5,310.0 | 2,130.0 | 70.0 |
+| 4 | 8,192 | 2 | 10,320.0 | 10,355.0 | 10,390.0 | 70.0 | — |
+| 8 | 512 | 4 | 2,050.0 | 2,060.0 | 2,400.0 | 350.0 | — |
+| 8 | 2,048 | 4 | 3,710.0 | 3,745.0 | 3,760.0 | 50.0 | — |
+| 8 | 8,192 | 2 | 10,480.0 | 10,490.0 | 10,500.0 | 20.0 | — |
+
+The last column excludes the three wall-clock spikes "Noise on this host"
+documents below, all at `BLOCK_SWEEPS` 2: one at 2,048 sweeps, two at 8,192
+sweeps. Excluding them narrows `BLOCK_SWEEPS` 2's own range a great deal,
+from 1,560.0 ms to 40.0 ms at 2,048 sweeps and from 5,660.0 ms to 190.0 ms
+at 8,192 sweeps, since a single anomalous repetition otherwise dominates an
+average-of-four or average-of-five range. `BLOCK_SWEEPS` 4's own single
+outlier, at 2,048 sweeps (5,310 ms against a 3,245 ms median, not at 8,192
+sweeps, where its two repetitions already agree), gets the same
+treatment: 2,130.0 ms narrows to 70.0 ms.
+
+This table settles the question it exists to answer. At 2,048 sweeps,
+`BLOCK_SWEEPS` 1's range is 30.0 ms and `BLOCK_SWEEPS` 2's clean range is
+40.0 ms, both well under the 115.0 ms gap between their medians (4.0%, from
+the Totals table below). The between-value gap runs about three times the
+larger of the two within-value ranges. The same holds at 8,192 sweeps: a
+140.0 ms range for `BLOCK_SWEEPS` 1 and a 190.0 ms clean range for
+`BLOCK_SWEEPS` 2, both under the 320.0 ms gap between their medians (3.2%).
+
+Every value's 512-sweep row shows a wider range than its 2,048 or 8,192-sweep
+row, 350.0 to 450.0 ms, and in every case the highest value is that value's
+first repetition. This is a distinct pattern from the three known spikes
+just described: it appears once per `BLOCK_SWEEPS` value, always on the
+first `--solve` invocation after copying that value's freshly built binary,
+and recovers on the next repetition. It matches the cold first-load pattern
+`load_ms` showed in Task 1's Stage table (16.556 ms on that probe's first
+run against 3.0 to 4.1 ms on the other four), extended here to the larger,
+whole-process scale a full `--solve` job's first invocation pays. None of
+this task's conclusions, fitted from `T512` and `T2048`, or measured
+directly at `T8192`, rest on the 512-sweep row alone: the 2,048 and
+8,192-sweep rows, where the ranking gets decided, do not show this pattern.
 
 ### Totals
 

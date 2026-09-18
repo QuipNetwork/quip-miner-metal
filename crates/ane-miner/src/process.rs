@@ -647,13 +647,18 @@ mod tests {
     fn response_states_and_dispatch_receipts_are_validated() {
         use crate::solver::RunStats;
         let graph = IsingGraph::new(vec![0.0, 1.0], vec![1.0], vec![(0, 1)]);
-        // num_sweeps is 1 so the correct dispatch count is 1 no matter what
-        // BLOCK_SWEEPS is: div_ceil(1, n) is 1 for every n from 1 through 8.
         let params = SampleParams {
             num_reads: 1,
-            num_sweeps: 1,
+            num_sweeps: 3,
             ..SampleParams::default()
         };
+        // The correct dispatch count is computed from the live constant,
+        // not hardcoded, so this test stays correct at every BLOCK_SWEEPS
+        // from 1 through 8. At the current value, 1, div_ceil(3, 1) is 3,
+        // so this still exercises validate_output's multi-dispatch success
+        // path, same as it did against the original num_sweeps: 3,
+        // BLOCK_SWEEPS: 2 pairing this replaces.
+        let correct = params.num_sweeps.div_ceil(crate::native::BLOCK_SWEEPS) as u64;
         for spins in [
             vec![],
             vec![vec![1]],
@@ -664,13 +669,18 @@ mod tests {
                 spins,
                 stats: RunStats {
                     programs: 1,
-                    dispatches: 1,
+                    dispatches: correct,
                     ..RunStats::default()
                 },
             };
             assert_fault(validate_output(&output, &graph, &params, 1));
         }
-        for (programs, dispatches) in [(0, 0), (1, 0), (1, 2), (2, 1)] {
+        for (programs, dispatches) in [
+            (0, 0),
+            (1, correct.saturating_sub(1)),
+            (1, correct + 1),
+            (2, correct),
+        ] {
             let output = RunOutput {
                 spins: vec![vec![1, -1]],
                 stats: RunStats {
@@ -685,7 +695,7 @@ mod tests {
             spins: vec![vec![1, -1]],
             stats: RunStats {
                 programs: 1,
-                dispatches: 1,
+                dispatches: correct,
                 ..RunStats::default()
             },
         };
@@ -705,16 +715,23 @@ mod tests {
 
     #[test]
     fn parent_scores_valid_states_with_original_graph() {
-        // num_sweeps is 1 so the correct dispatch count is 1 no matter what
-        // BLOCK_SWEEPS is: div_ceil(1, n) is 1 for every n from 1 through 8.
-        let (_fixture, path) = script("printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[1,-1]],\"stats\":{\"programs\":1,\"dispatches\":1,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"");
+        // num_sweeps is 3, and the expected dispatch count is computed from
+        // the live BLOCK_SWEEPS rather than hardcoded, so this test stays
+        // correct at every value from 1 through 8. At BLOCK_SWEEPS 1 and 2
+        // it still exercises the multi-dispatch success path this test
+        // covered before Task 5 (div_ceil(3, 1) is 3, div_ceil(3, 2) is 2).
+        let num_sweeps: usize = 3;
+        let dispatches = num_sweeps.div_ceil(crate::native::BLOCK_SWEEPS);
+        let template = "printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[1,-1]],\"stats\":{\"programs\":1,\"dispatches\":DISPATCHES,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"";
+        let body = template.replace("DISPATCHES", &dispatches.to_string());
+        let (_fixture, path) = script(&body);
         let sampler = AneSampler {
             executable: path,
             access: Mutex::new(()),
         };
         let graph = IsingGraph::new(vec![1.0, -1.0], vec![1.0], vec![(0, 1)]);
         let params = SampleParams {
-            num_sweeps: 1,
+            num_sweeps,
             ..SampleParams::default()
         };
         assert_eq!(
@@ -728,11 +745,15 @@ mod tests {
 
     #[test]
     fn parent_scores_valid_states_with_multiple_dispatches() {
-        // num_sweeps is 9, more than the largest BLOCK_SWEEPS this crate
-        // accepts (8), so this always exercises more than one dispatch,
-        // unlike the num_sweeps: 1 case above. The expected dispatch count
-        // is computed from the live constant, not hardcoded, so this test
-        // does not need updating if BLOCK_SWEEPS changes again.
+        // The test above, at num_sweeps: 3, only exercises multiple
+        // dispatches while BLOCK_SWEEPS is 1 or 2 (div_ceil(3, n) is 1 for
+        // every n from 3 through 8). num_sweeps here is 9, more than the
+        // largest BLOCK_SWEEPS this crate accepts (8), so this test always
+        // exercises more than one dispatch, at every value from 1 through
+        // 8, not just 1 and 2. The expected dispatch count is computed from
+        // the live constant, not hardcoded, and the assertion below fails
+        // loudly rather than silently degrading to single-dispatch coverage
+        // if compile_raw's accepted range ever grows past 8.
         let num_sweeps: usize = 9;
         let dispatches = num_sweeps.div_ceil(crate::native::BLOCK_SWEEPS);
         assert!(dispatches > 1, "test no longer exercises multiple dispatches");
