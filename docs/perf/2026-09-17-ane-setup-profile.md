@@ -668,6 +668,58 @@ separate finding on whether production jobs' fields (`h`) can differ from
 the fields used to compile a program, are in
 `.superpowers/sdd/2026-09-17-ane-throughput/task-4-report.md`.
 
+## Concurrency
+
+Task 2 tested whether the Apple Neural Engine (ANE) runs more than one
+program at a time. Archived reverse-engineering notes describe a
+single-pending-queue scheduler and a measured 1.04 times serialization
+factor for two concurrent submission threads.
+
+**Concurrent `evaluateWithQoS:` dispatch gives a modest, real throughput
+gain on this host, at production shape.** Two concurrent processes reach
+1.16 times a single process's rate. Four reach 1.29 times. Neither figure
+matches the archived notes' near-1.0 prediction, and neither is the 2x an
+uncorrected first measurement in this task originally reported. That
+number came from summing each process's own throughput over its own time
+window. Those windows only partly overlap, and summing rates over windows
+that do not fully overlap overstates a group's real throughput even with
+no engine contention at all. Corrected by computing throughput over the
+window the group actually shared, total calls divided by the span from the
+first process's start to the last process's end, the factors are 1.16 and
+1.29.
+
+| Shape | N | `R1`, calls/s | Corrected group rate, calls/s | Corrected factor |
+| --- | --- | ---: | ---: | ---: |
+| small, 512 channels, 1 tile | 2 | 5,434.192 | 5,345.735 | 0.984 |
+| small, 512 channels, 1 tile | 4 | 5,434.192 | 4,573.729 | 0.842 |
+| production, 4,608 channels, 8 tiles | 2 | 464.516 | 540.692 | 1.165 |
+| production, 4,608 channels, 8 tiles | 4 | 464.516 | 600.807 | 1.293 |
+
+Production shape, the real per-job topology and compile cost, governs this
+verdict. The small shape used to keep compile short is 13 times cheaper
+per dispatch, 0.164 ms versus 2.15 ms, and its corrected factors sit at or
+below 1.0, matching the archived notes. It characterizes round-trip
+overhead rather than engine behavior under the load a job actually
+applies. The task report keeps it for Task 5 rather than using it here.
+
+The gain shows early diminishing returns. Four processes add about 13
+percentage points over two, not another 16. Per-process latency also rises
+with N. Production N=4 loop-start timestamps also stagger by close to
+258-288 ms between consecutive process starts, near the 283.887 ms
+`compile_ms` median reported earlier in this document. That is consistent
+with `compileWithQoS:` serializing across concurrent processes even where
+`evaluateWithQoS:` does not. This task did not time compile in isolation to
+confirm that. Compile is most of a job's fixed cost, and this task's
+200-call loop measures only the cheap part, so this task does not extend
+its verdict to real per-job throughput with more than one worker. The
+remaining levers already identified in this document, fewer dispatches and
+more work per dispatch, both still reduce that compile-dominated fixed
+cost regardless of how that question resolves.
+
+Full method, the arithmetic-trap analysis, per-process latencies, exact
+commands, and the compile-serialization data is in
+`.superpowers/sdd/2026-09-17-ane-throughput/task-2-report.md`.
+
 ## Platform
 
 The host is an Apple M4 Max running macOS 26.5.2, build 25F84, Darwin 25.5.0
