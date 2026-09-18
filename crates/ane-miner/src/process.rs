@@ -771,7 +771,10 @@ mod tests {
         // if compile_raw's accepted range ever grows past 8.
         let num_sweeps: usize = 9;
         let dispatches = num_sweeps.div_ceil(crate::native::BLOCK_SWEEPS);
-        assert!(dispatches > 1, "test no longer exercises multiple dispatches");
+        assert!(
+            dispatches > 1,
+            "test no longer exercises multiple dispatches"
+        );
         let template = "printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[1,-1]],\"stats\":{\"programs\":1,\"dispatches\":DISPATCHES,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"";
         let body = template.replace("DISPATCHES", &dispatches.to_string());
         let (_fixture, path) = script(&body);
