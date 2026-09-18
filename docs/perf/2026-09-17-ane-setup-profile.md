@@ -72,9 +72,11 @@ production compile call uses, `--solve` included. The Stage table below
 records a run from when `BLOCK_SWEEPS` was 2, so a rerun of the probe as it
 stands now reports a lower `compile_ms`.
 
-No shared device guard exists in this repository or in `/tmp`. The five runs
+No shared device guard existed when this report was measured. The five runs
 below ran one at a time, with a 3-second sleep between runs, in place of a
-guard.
+guard. The two later sections that repeat this note describe the same gap.
+`scripts/ane-guard` now provides the guard, so a rerun of any measurement in
+this report should go through it.
 
 ### Commands
 

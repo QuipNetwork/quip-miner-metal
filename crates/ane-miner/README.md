@@ -132,10 +132,11 @@ cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --test protocol
 
 That command passes 4 tests and ignores 4 hardware tests.
 
-Run hardware protocol tests with the release binary:
+Run hardware protocol tests with the release binary, through the device
+guard described below:
 
 ```sh
-cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --release --test protocol -- --ignored --test-threads=1 --nocapture
+scripts/ane-guard -- cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --release --test protocol -- --ignored --test-threads=1 --nocapture
 ```
 
 The hardware command must include `--release`.
@@ -146,6 +147,36 @@ Those times are whole-process wall times for `--solve`.
 Threshold generation is the dominant debug cost.
 The diagnostic did not isolate that operation.
 They are not a Metal comparison.
+
+### Device guard
+
+The host has one Apple Neural Engine. Concurrent users of it corrupt each
+other's measurements, whether that is two probes or a probe and a hardware
+test. Concurrency measurements are the worst case, because contention there
+is indistinguishable from the result.
+
+Run every command that touches the device through `scripts/ane-guard`:
+
+```sh
+scripts/ane-guard -- ./setup-profile
+scripts/ane-guard -t 600 -- cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --release --test protocol -- --ignored --test-threads=1
+```
+
+The guard takes a lock and runs the command under it. After the command
+finishes, the guard keeps the lock through a settling interval and only then
+releases it. That ordering is deliberate. A release before the device is
+quiet lets the next holder start against a busy engine.
+
+Options are `-t SECONDS` for how long to wait, default 300, and `-s SECONDS`
+for the settling interval, default 3. Set `QUIP_ANE_LOCK` to move the lock
+directory, which defaults to `/tmp/quip-ane-device.lock`.
+
+The guard exits with the command's own status, 64 for a bad invocation, and
+75 when the wait times out. A timeout fails on purpose. A contended run
+produces a number nobody can trust, so it must stop rather than publish one.
+
+The guard breaks a lock whose owning process is gone, so a killed probe does
+not block later runs.
 
 ## Limits
 
@@ -229,12 +260,14 @@ Four-coloring chunk balance is open as bead `quip-miner-metal-fjo`. This
 task appends the ANE-side argument, that the smallest color classes are too
 small to amortize a dispatch, to that bead's existing Metal-side numbers.
 
-A shared device guard is open as bead `quip-miner-metal-c7l`. No guard
-script exists in this repository or in `/tmp`, and every task in this plan
-substituted its own serialization for device access.
+A shared device guard closed as bead `quip-miner-metal-c7l`. Every task in
+the throughput plan substituted its own serialization for device access,
+because no guard existed. `scripts/ane-guard` now provides one. See Device
+guard above.
 
-The wall-clock assertion in `crates/ane-miner/src/process.rs:482` is open as
-bead `quip-miner-metal-erz`. The assertion is flaky by construction under
-parallel load.
+The wall-clock assertion in `crates/ane-miner/src/process.rs:482` closed as
+bead `quip-miner-metal-erz`. The test now bounds cancellation against the
+child process's own sleep, because the property under test is that
+cancellation returns without waiting for the child.
 
 See `docs/validation.md` for host, hardware, capacity, lifetime, and protocol receipts.
