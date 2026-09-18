@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANE Sweep Roofline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground: #f2f4f2;
+    --panel: #ffffff;
+    --ink: #1a1f1d;
+    --muted: #5d6663;
+    --rule: #d3d9d5;
+    --grid: #e2e6e3;
+    --stream: #b5602a;
+    --stream-soft: #eed6c4;
+    --compute: #1c7f78;
+    --compute-soft: #c6e4e0;
+    --kernel: #8a9390;
+    --warn: #a63d2f;
+    --bar: #d9dedb;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #141718;
+      --panel: #1c2022;
+      --ink: #e6ebe8;
+      --muted: #9aa5a0;
+      --rule: #2f3538;
+      --grid: #262c2e;
+      --stream: #e0894c;
+      --stream-soft: #4a3222;
+      --compute: #43b8ad;
+      --compute-soft: #1d3d3a;
+      --kernel: #78837f;
+      --warn: #e07a6a;
+      --bar: #2a3134;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #141718;
+    --panel: #1c2022;
+    --ink: #e6ebe8;
+    --muted: #9aa5a0;
+    --rule: #2f3538;
+    --grid: #262c2e;
+    --stream: #e0894c;
+    --stream-soft: #4a3222;
+    --compute: #43b8ad;
+    --compute-soft: #1d3d3a;
+    --kernel: #78837f;
+    --warn: #e07a6a;
+    --bar: #2a3134;
+    color-scheme: dark;
+  }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "Source Sans 3", "Helvetica Neue", Arial, sans-serif;
+    font-size: 17px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding-block: 40px 64px; padding-inline: 20px; }
+  .eyebrow { font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-family: "Archivo", "Helvetica Neue", Arial, sans-serif; font-weight: 700; font-size: clamp(30px, 4.6vw, 46px); line-height: 1.05; letter-spacing: -0.01em; margin: 6px 0 14px; text-wrap: balance; }
+  h2 { font-family: "Archivo", "Helvetica Neue", Arial, sans-serif; font-weight: 500; font-size: 22px; margin: 0 0 12px; text-wrap: balance; }
+  p { max-width: 68ch; margin: 0 0 12px; }
+  .lede { font-size: 19px; max-width: 62ch; }
+  section { margin-top: 44px; }
+  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 26px; }
+  .tile { background: var(--panel); border: 1px solid var(--rule); padding: 14px 16px 12px; }
+  .tile .k { font-size: 13px; color: var(--muted); }
+  .tile .v { font-family: "IBM Plex Mono", monospace; font-size: 30px; font-weight: 500; line-height: 1.1; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .tile .v small { font-size: 14px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+  .tile .n { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .tile.stream .v { color: var(--stream); }
+  .tile.compute .v { color: var(--compute); }
+  figure { margin: 0; background: var(--panel); border: 1px solid var(--rule); padding: 16px 12px 8px; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 14px; color: var(--muted); padding: 8px 6px 4px; max-width: none; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 14px; color: var(--muted); padding: 0 6px 6px; }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+  .legend .fp::before { background: var(--stream); }
+  .legend .sp::before { background: var(--compute); }
+  .legend .kn::before { background: transparent; border: 2px solid var(--kernel); width: 8px; height: 8px; }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule); background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 15px; }
+  th, td { text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  th { font-family: "IBM Plex Mono", monospace; font-weight: 500; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child, th.l, td.l { text-align: left; }
+  td.num { font-family: "IBM Plex Mono", monospace; font-size: 14px; }
+  tr.group td { background: var(--ground); color: var(--muted); font-size: 13px; letter-spacing: 0.04em; text-transform: uppercase; text-align: left; }
+  tr.prod td { font-weight: 600; }
+  .bar { display: inline-block; height: 9px; width: 90px; background: var(--bar); vertical-align: middle; margin-right: 8px; position: relative; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; }
+  .bar.mac i { background: var(--compute); }
+  .bar.str i { background: var(--stream); }
+  .bar.gain i { background: var(--muted); }
+  .flag { color: var(--warn); font-family: "IBM Plex Mono", monospace; font-size: 12px; }
+  .note { font-size: 15px; color: var(--muted); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  ul { margin: 0 0 12px; padding-left: 20px; max-width: 68ch; }
+  li { margin-bottom: 6px; }
+  code { font-family: "IBM Plex Mono", monospace; font-size: 0.9em; }
+  @media (max-width: 720px) {
+    .tiles { grid-template-columns: repeat(2, 1fr); }
+    .cols { grid-template-columns: 1fr; }
+    .tile .v { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div class="eyebrow">quip-miner-metal · Apple M4 Max Neural Engine · 2026-09-18</div>
+  <h1>ANE Sweep Roofline</h1>
+  <p class="lede" id="lede"></p>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <h2>Where each sweep sits against the chip's two ceilings</h2>
+    <figure>
+      <svg id="roofline" viewBox="0 0 960 560" role="img" aria-label="Roofline chart: achieved MAC rate against MAC per weight byte, with the measured compute and weight-stream ceilings"></svg>
+      <div class="legend">
+        <span class="fp">fp16 couplings, by read count</span>
+        <span class="sp">sparse couplings, by read count</span>
+        <span class="kn">bare convolutions used to find the ceilings</span>
+      </div>
+      <figcaption id="caption"></figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>Utilization and power per configuration</h2>
+    <div class="tablewrap">
+      <table id="table">
+        <thead>
+          <tr>
+            <th class="l">Configuration</th><th>Reads</th><th>ms / sweep</th><th>TMAC/s</th><th class="l">MAC array</th><th>GB/s</th><th class="l">Weight stream</th><th>ANE W</th><th>mJ / sweep</th><th>J / 16k job</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="note" id="tablenote"></p>
+  </section>
+
+  <section>
+    <h2>Models in flight</h2>
+    <p class="note" id="concnote"></p>
+    <div class="tablewrap">
+      <table id="conc">
+        <thead><tr><th class="l">Model</th><th>Processes</th><th>Sweeps / s, all</th><th class="l">Against one process</th><th>ms / sweep each</th><th>ANE W</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="cols">
+    <div>
+      <h2>Power per model</h2>
+      <div id="power"></div>
+    </div>
+    <div>
+      <h2>How this was measured</h2>
+      <ul>
+        <li>Probe: <code>crates/ane-miner/probes/utilization.m</code>, which builds the production sweep text with the read layout and the weight encoding lifted out, and bare 1×1 convolutions for the ceilings.</li>
+        <li>Each point is the fastest clean window over three rounds. A window is contaminated by another client's program creation in the <code>aned</code> log (5-second lead included), by ANE power above 0.05 W in the idle gap before it, or by GPU power above 1 W inside it. Rounds and clean rounds are shown in the table.</li>
+        <li>Fresh compiles of one program vary by about 15%: six sparse compiles at 128 reads ran 0.42–0.52 ms, six fp16 compiles 0.64–0.78 ms. The two sparse points at 64 and 128 reads come from the concurrency grid's single-process launches, the cleanest runs of those points.</li>
+        <li>Power: <code>macmon</code> at 250 ms, samples inside each timing window, first sample dropped. ANE power idles at 0 W.</li>
+        <li>Every encoding and layout at a given read count hashes to the same output surface, so the speed differences carry no change in results.</li>
+        <li>Rates are dispatch cost only; the production path adds threshold staging per sweep.</li>
+      </ul>
+    </div>
+  </section>
+</div>
+
+<script id="data" type="application/json">{"idle": {"samples": 5, "ane_w": 0.0, "ram_w": 2.1013575553894044}, "peak_tmac_s": 7.094428965972909, "peak_weight_gb_s": 90.56798464491364, "rows": [{"round": 3, "kind": "roofline", "name": "compute_1024x1024_h32", "encoding": "fp16", "k": 1024, "c": 1024, "h": 32, "w": 128, "reads": 4096, "calls": 4126, "compile_ms": 26.212, "ms_per_call": 0.7272, "mac_per_call": 4294967296, "weight_bytes": 2097152, "loop_start_us": 747871115733, "loop_end_us": 747874116011, "wall_start_us": 1789738301877375, "wall_end_us": 1789738304877662, "output_hash": "b5afdf5f40a59a24", "non_spin": 4194304, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.12328433462729056, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 0.7272, "ms_per_call_max": 0.7272, "tmac_s": 5.906170649064906, "weight_gb_s": 2.883872387238724, "mac_per_weight_byte": 2048.0, "samples": 9, "ane_w": 5.474568261040582, "ram_w": 1.7237489223480225, "mj_per_call": 3.981106039428711, "mj_per_call_with_ram": 3.7065090414810173, "mac_utilization": 0.8325082508250826, "stream_utilization": 0.031842073096198506}, {"round": 3, "kind": "roofline", "name": "compute_2048x2048_h32", "encoding": "fp16", "k": 2048, "c": 2048, "h": 32, "w": 128, "reads": 4096, "calls": 1173, "compile_ms": 34.62, "ms_per_call": 2.5592, "mac_per_call": 17179869184, "weight_bytes": 8388608, "loop_start_us": 747874239228, "loop_end_us": 747877241197, "wall_start_us": 1789738305000879, "wall_end_us": 1789738308002857, "output_hash": "336da787e74d3609", "non_spin": 8388608, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.07227426196914166, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 2.5592, "ms_per_call_max": 2.5592, "tmac_s": 6.712984207564864, "weight_gb_s": 3.2778243201000308, "mac_per_weight_byte": 2048.0, "samples": 8, "ane_w": 6.157362937927246, "ram_w": 1.8941703140735626, "mj_per_call": 15.757923230743408, "mj_per_call_with_ram": 15.227689642767908, "mac_utilization": 0.9462331978743358, "stream_utilization": 0.03619186551352852}, {"round": 3, "kind": "roofline", "name": "compute_2048x2048_h64", "encoding": "fp16", "k": 2048, "c": 2048, "h": 64, "w": 128, "reads": 8192, "calls": 620, "compile_ms": 33.961, "ms_per_call": 4.8432, "mac_per_call": 34359738368, "weight_bytes": 8388608, "loop_start_us": 747877406244, "loop_end_us": 747880409047, "wall_start_us": 1789738308167904, "wall_end_us": 1789738311170715, "output_hash": "8fe118b2eecf271e", "non_spin": 16777216, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.09418729030423695, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 4.8432, "ms_per_call_max": 4.8432, "tmac_s": 7.094428965972909, "weight_gb_s": 1.7320383217707298, "mac_per_weight_byte": 4096.0, "samples": 9, "ane_w": 6.486756589677599, "ram_w": 3.1733207437727184, "mj_per_call": 31.41665951512655, "mj_per_call_with_ram": 36.60839162910462, "mac_utilization": 1.0, "stream_utilization": 0.01912417868810336}, {"round": 3, "kind": "roofline", "name": "compute_4096x4096_h8", "encoding": "fp16", "k": 4096, "c": 4096, "h": 8, "w": 128, "reads": 1024, "calls": 638, "compile_ms": 73.501, "ms_per_call": 4.7035, "mac_per_call": 17179869184, "weight_bytes": 33554432, "loop_start_us": 747880633552, "loop_end_us": 747883634401, "wall_start_us": 1789738311395220, "wall_end_us": 1789738314396078, "output_hash": "2deb66346d415fec", "non_spin": 4194304, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.19471025746315718, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 4.7035, "ms_per_call_max": 4.7035, "tmac_s": 3.6525713158286384, "weight_gb_s": 7.133928351227809, "mac_per_weight_byte": 512.0, "samples": 8, "ane_w": 3.93063223361969, "ram_w": 1.9538919627666473, "mj_per_call": 18.48772871083021, "mj_per_call_with_ram": 17.794124295929073, "mac_utilization": 0.5148506431380887, "stream_utilization": 0.07876876557646197}, {"round": 3, "kind": "roofline", "name": "stream_4608x4608_w32", "encoding": "fp16", "k": 4608, "c": 4608, "h": 1, "w": 32, "reads": 32, "calls": 6398, "compile_ms": 44.219, "ms_per_call": 0.4689, "mac_per_call": 679477248, "weight_bytes": 42467328, "loop_start_us": 747883887197, "loop_end_us": 747886887328, "wall_start_us": 1789738314648875, "wall_end_us": 1789738317649014, "output_hash": "8d9d78cf3a4f6c7a", "non_spin": 147456, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.28408919367939234, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 0.4689, "ms_per_call_max": 0.4689, "tmac_s": 1.4490877543186182, "weight_gb_s": 90.56798464491364, "mac_per_weight_byte": 16.0, "samples": 8, "ane_w": 1.6260413080453873, "ram_w": 4.017920583486557, "mj_per_call": 0.762450769342482, "mj_per_call_with_ram": 1.6611271732172368, "mac_utilization": 0.20425713771593096, "stream_utilization": 1.0}, {"round": 3, "kind": "roofline", "name": "stream_4608x4608_w128", "encoding": "fp16", "k": 4608, "c": 4608, "h": 1, "w": 128, "reads": 128, "calls": 6029, "compile_ms": 45.195, "ms_per_call": 0.4976, "mac_per_call": 2717908992, "weight_bytes": 42467328, "loop_start_us": 747887018745, "loop_end_us": 747890018862, "wall_start_us": 1789738317780432, "wall_end_us": 1789738320780557, "output_hash": "b3cdbf7409462e65", "non_spin": 589824, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.11698403861373663, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 0.4976, "ms_per_call_max": 0.4976, "tmac_s": 5.46203575562701, "weight_gb_s": 85.34430868167203, "mac_per_weight_byte": 64.0, "samples": 9, "ane_w": 4.987777339087592, "ram_w": 3.865993711683485, "mj_per_call": 2.481918003929986, "mj_per_call_with_ram": 3.36000095530192, "mac_utilization": 0.769904918609325, "stream_utilization": 0.9423231511254019}, {"round": 3, "kind": "sweep", "name": "sweep", "encoding": "fp16", "k": 4608, "c": 4608, "h": 1, "w": 32, "reads": 32, "calls": 6214, "compile_ms": 97.192, "ms_per_call": 0.4828, "mac_per_call": 679477248, "weight_bytes": 42467328, "loop_start_us": 747890152771, "loop_end_us": 747893152931, "wall_start_us": 1789738320914467, "wall_end_us": 1789738323914635, "output_hash": "45d63cbc72727603", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.022173094970639795, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 0.4828, "ms_per_call_max": 0.4828, "tmac_s": 1.4073679536039767, "weight_gb_s": 87.96049710024855, "mac_per_weight_byte": 16.0, "samples": 8, "ane_w": 0.7919440641999245, "ram_w": 3.951805502176285, "mj_per_call": 0.38235059419572354, "mj_per_call_with_ram": 1.2757468629044295, "mac_utilization": 0.19837649518434136, "stream_utilization": 0.9712096106048052}, {"round": 3, "kind": "sweep", "name": "sweep", "encoding": "fp16", "k": 4608, "c": 4608, "h": 1, "w": 64, "reads": 64, "calls": 5634, "compile_ms": 120.051, "ms_per_call": 0.5326, "mac_per_call": 1358954496, "weight_bytes": 42467328, "loop_start_us": 747893293320, "loop_end_us": 747896293832, "wall_start_us": 1789738324055024, "wall_end_us": 1789738327055545, "output_hash": "941f0fe91e110383", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.005026559520047158, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 0.5326, "ms_per_call_max": 0.5326, "tmac_s": 2.5515480585805483, "weight_gb_s": 79.73587683064214, "mac_per_weight_byte": 32.0, "samples": 8, "ane_w": 0.654491662979126, "ram_w": 3.349501997232437, "mj_per_call": 0.3485822597026825, "mj_per_call_with_ram": 1.0133439894282816, "mac_utilization": 0.35965517039053707, "stream_utilization": 0.8803980473150582}, {"round": 3, "kind": "sweep", "name": "sweep", "encoding": "fp16", "k": 4608, "c": 4608, "h": 1, "w": 128, "reads": 128, "calls": 4706, "compile_ms": 102.389, "ms_per_call": 0.6376, "mac_per_call": 2717908992, "weight_bytes": 42467328, "loop_start_us": 747896430647, "loop_end_us": 747899431169, "wall_start_us": 1789738327192360, "wall_end_us": 1789738330192891, "output_hash": "9f41c56a68a51b03", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.14471428386039203, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 0.6376, "ms_per_call_max": 0.6376, "tmac_s": 4.262717992471769, "weight_gb_s": 66.6049686323714, "mac_per_weight_byte": 64.0, "samples": 9, "ane_w": 0.9220418069097731, "ram_w": 3.231023655997382, "mj_per_call": 0.5878938560856712, "mj_per_call_with_ram": 1.3081689618333177, "mac_utilization": 0.6008542777603514, "stream_utilization": 0.7354140526976161}, {"round": 3, "kind": "sweep", "name": "sweep", "encoding": "fp16", "k": 4608, "c": 4608, "h": 2, "w": 128, "reads": 256, "calls": 1169, "compile_ms": 171.058, "ms_per_call": 2.5663, "mac_per_call": 5435817984, "weight_bytes": 42467328, "loop_start_us": 747899640154, "loop_end_us": 747902640163, "wall_start_us": 1789738330401876, "wall_end_us": 1789738333401893, "output_hash": "832d241bd2d5be83", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.049784456146880984, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 2.5663, "ms_per_call_max": 2.5663, "tmac_s": 2.1181537559911154, "weight_gb_s": 16.54807621868059, "mac_per_weight_byte": 128.0, "samples": 8, "ane_w": 0.9986336752772331, "ram_w": 2.1105910539627075, "mj_per_call": 2.5627936008639636, "mj_per_call_with_ram": 2.5864895282526312, "mac_utilization": 0.2985657853719363, "stream_utilization": 0.18271441374741842}, {"round": 3, "kind": "sweep", "name": "sweep", "encoding": "fp16", "k": 4608, "c": 4608, "h": 4, "w": 128, "reads": 512, "calls": 639, "compile_ms": 184.131, "ms_per_call": 4.6992, "mac_per_call": 10871635968, "weight_bytes": 42467328, "loop_start_us": 747902886757, "loop_end_us": 747905889577, "wall_start_us": 1789738333648488, "wall_end_us": 1789738336651317, "output_hash": "e8bc39b39b696403", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.06458768103038892, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 4.6992, "ms_per_call_max": 4.6992, "tmac_s": 2.3135078243105207, "weight_gb_s": 9.03713993871297, "mac_per_weight_byte": 256.0, "samples": 8, "ane_w": 1.0473877862095833, "ram_w": 1.7708968967199326, "mj_per_call": 4.9218846849560745, "mj_per_call_with_ram": 3.368983957736492, "mac_utilization": 0.3261020492849847, "stream_utilization": 0.09978294177732376}, {"round": 3, "kind": "sweep", "name": "sweep", "encoding": "fp16", "k": 4608, "c": 4608, "h": 8, "w": 128, "reads": 1024, "calls": 332, "compile_ms": 199.476, "ms_per_call": 9.057, "mac_per_call": 21743271936, "weight_bytes": 42467328, "loop_start_us": 747906163624, "loop_end_us": 747909170536, "wall_start_us": 1789738336925364, "wall_end_us": 1789738339932285, "output_hash": "c3a93143d6e7f783", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.0068741608411073685, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 9.057, "ms_per_call_max": 9.057, "tmac_s": 2.400714578337198, "weight_gb_s": 4.68889566081484, "mac_per_weight_byte": 512.0, "samples": 8, "ane_w": 1.074709713459015, "ram_w": 1.7747751325368881, "mj_per_call": 9.733645874798299, "mj_per_call_with_ram": 6.7757888710230585, "mac_utilization": 0.33839433587280565, "stream_utilization": 0.0517721099701888}, {"round": 2, "kind": "sweep", "name": "sweep", "encoding": "fp16", "k": 4608, "c": 4608, "h": 1, "w": 256, "reads": 256, "calls": 1169, "compile_ms": 160.939, "ms_per_call": 2.5665, "mac_per_call": 5435817984, "weight_bytes": 42467328, "loop_start_us": 747829832018, "loop_end_us": 747832832295, "wall_start_us": 1789738260593544, "wall_end_us": 1789738263593830, "output_hash": "832d241bd2d5be83", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 7.679045498371124, "clean": false, "rounds": 3, "clean_rounds": 0, "ms_per_call_median": 2.6402, "ms_per_call_max": 2.7073, "tmac_s": 2.1179886943308004, "weight_gb_s": 16.54678667445938, "mac_per_weight_byte": 128.0, "samples": 8, "ane_w": 0.9606082290410995, "ram_w": 2.123786449432373, "mj_per_call": 2.465401019833982, "mj_per_call_with_ram": 2.522964776395261, "mac_utilization": 0.29854251899473994, "stream_utilization": 0.18270017533606075}, {"round": 2, "kind": "sweep", "name": "sweep", "encoding": "fp16", "k": 4608, "c": 4608, "h": 1, "w": 512, "reads": 512, "calls": 638, "compile_ms": 165.834, "ms_per_call": 4.7074, "mac_per_call": 10871635968, "weight_bytes": 42467328, "loop_start_us": 747833053358, "loop_end_us": 747836056673, "wall_start_us": 1789738263814894, "wall_end_us": 1789738266818217, "output_hash": "e8bc39b39b696403", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.47554849355947226, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 4.7074, "ms_per_call_max": 4.7074, "tmac_s": 2.309477836597697, "weight_gb_s": 9.021397799209755, "mac_per_weight_byte": 256.0, "samples": 8, "ane_w": 1.0323808565735817, "ram_w": 1.6320235282182693, "mj_per_call": 4.859829644234479, "mj_per_call_with_ram": 2.650486644729077, "mac_utilization": 0.32553399966010965, "stream_utilization": 0.09960912605684666}, {"round": 1, "kind": "sweep", "name": "sweep", "encoding": "sparse", "k": 4608, "c": 4608, "h": 1, "w": 32, "reads": 32, "calls": 16690, "compile_ms": 915.046, "ms_per_call": 0.1798, "mac_per_call": 679477248, "weight_bytes": 2820264, "loop_start_us": 747750733000, "loop_end_us": 747753733128, "wall_start_us": 1789738181494306, "wall_end_us": 1789738184494442, "output_hash": "45d63cbc72727603", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0018115942366421223, "gpu_w": 5.8054243723551435, "clean": false, "rounds": 3, "clean_rounds": 0, "ms_per_call_median": 0.2099, "ms_per_call_max": 0.2249, "tmac_s": 3.7790725695216913, "weight_gb_s": 15.685561735261404, "mac_per_weight_byte": 240.92682387180776, "samples": 9, "ane_w": 0.9985000491142273, "ram_w": 2.569281233681573, "mj_per_call": 0.17953030883073806, "mj_per_call_with_ram": 0.2636629861876699, "mac_utilization": 0.5326817123192438, "stream_utilization": 0.17319102105185594}, {"round": 2, "kind": "sweep", "name": "sweep", "encoding": "sparse", "k": 4608, "c": 4608, "h": 1, "w": 64, "reads": 64, "calls": 11743, "compile_ms": 850.464, "ms_per_call": 0.18974999999999997, "mac_per_call": 1358954496, "weight_bytes": 2820264, "loop_start_us": 747840826451, "loop_end_us": 747843826480, "wall_start_us": 1789738271588009, "wall_end_us": 1789738274588046, "output_hash": "941f0fe91e110383", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0, "gpu_w": 0.004835873635278808, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 0.2555, "ms_per_call_max": 0.2555, "tmac_s": 7.1618155256917, "weight_gb_s": 14.863051383399212, "mac_per_weight_byte": 481.8536477436155, "samples": 9, "ane_w": 1.103000547322962, "ram_w": 1.1940233442518446, "mj_per_call": 0.20929435385453202, "mj_per_call_with_ram": 0.003520455422004117, "mac_utilization": 1.0094985177865614, "stream_utilization": 0.16410933114689696, "source": "concurrency grid, single process, median of 2"}, {"round": 2, "kind": "sweep", "name": "sweep", "encoding": "sparse", "k": 4608, "c": 4608, "h": 1, "w": 128, "reads": 128, "calls": 5684, "compile_ms": 796.234, "ms_per_call": 0.4178, "mac_per_call": 2717908992, "weight_bytes": 2820264, "loop_start_us": 747844648334, "loop_end_us": 747847648770, "wall_start_us": 1789738275409902, "wall_end_us": 1789738278410347, "output_hash": "9f41c56a68a51b03", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0035211266949772835, "gpu_w": 0.010103524481463764, "clean": true, "rounds": 3, "clean_rounds": 2, "ms_per_call_median": 0.5826, "ms_per_call_max": 0.6373, "tmac_s": 6.505287199617041, "weight_gb_s": 6.750272857826711, "mac_per_weight_byte": 963.707295487231, "samples": 9, "ane_w": 1.0029215990669198, "ram_w": 1.5341033736864726, "mj_per_call": 0.4190206440901591, "mj_per_call_with_ram": 0.10661421974625845, "mac_utilization": 0.9169571266156056, "stream_utilization": 0.07453266056755312, "source": "concurrency grid, single process, median of 2"}, {"round": 2, "kind": "sweep", "name": "sweep", "encoding": "sparse", "k": 4608, "c": 4608, "h": 2, "w": 128, "reads": 256, "calls": 3575, "compile_ms": 1622.408, "ms_per_call": 0.8393, "mac_per_call": 5435817984, "weight_bytes": 2820264, "loop_start_us": 747849307579, "loop_end_us": 747852308200, "wall_start_us": 1789738280069160, "wall_end_us": 1789738283069789, "output_hash": "832d241bd2d5be83", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.027685882232617587, "gpu_w": 0.14369082657503895, "clean": true, "rounds": 3, "clean_rounds": 1, "ms_per_call_median": 0.8393, "ms_per_call_max": 0.8393, "tmac_s": 6.476609059930895, "weight_gb_s": 3.360257357321577, "mac_per_weight_byte": 1927.414590974462, "samples": 8, "ane_w": 1.07929128408432, "ram_w": 1.8146137371659279, "mj_per_call": 0.9058491747319699, "mj_per_call_with_ram": 0.665185088097006, "mac_utilization": 0.9129147801739547, "stream_utilization": 0.03710204406663135}, {"round": 2, "kind": "sweep", "name": "sweep", "encoding": "sparse", "k": 4608, "c": 4608, "h": 4, "w": 128, "reads": 512, "calls": 2044, "compile_ms": 1598.064, "ms_per_call": 1.4681, "mac_per_call": 10871635968, "weight_bytes": 2820264, "loop_start_us": 747853943639, "loop_end_us": 747856944525, "wall_start_us": 1789738284705234, "wall_end_us": 1789738287706128, "output_hash": "e8bc39b39b696403", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.001482479798141867, "gpu_w": 0.0561729590408504, "clean": true, "rounds": 3, "clean_rounds": 2, "ms_per_call_median": 1.47515, "ms_per_call_max": 1.4822, "tmac_s": 7.405242127920442, "weight_gb_s": 1.921029902595191, "mac_per_weight_byte": 3854.829181948924, "samples": 8, "ane_w": 1.1581639349460602, "ram_w": 2.293524369597435, "mj_per_call": 1.700300472894311, "mj_per_call_with_ram": 1.9824205728331206, "mac_utilization": 1.0438108780055857, "stream_utilization": 0.021210915867531974}, {"round": 2, "kind": "sweep", "name": "sweep", "encoding": "sparse", "k": 4608, "c": 4608, "h": 8, "w": 128, "reads": 1024, "calls": 1070, "compile_ms": 1646.949, "ms_per_call": 2.8049, "mac_per_call": 21743271936, "weight_bytes": 2820264, "loop_start_us": 747858649399, "loop_end_us": 747861650667, "wall_start_us": 1789738289411007, "wall_end_us": 1789738292412283, "output_hash": "c3a93143d6e7f783", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.0017605633474886417, "gpu_w": 0.08841361022657818, "clean": true, "rounds": 3, "clean_rounds": 2, "ms_per_call_median": 2.81685, "ms_per_call_max": 2.8288, "tmac_s": 7.751888458055546, "weight_gb_s": 1.0054775571321617, "mac_per_weight_byte": 7709.658363897848, "samples": 9, "ane_w": 1.2110940880245633, "ram_w": 1.8337065643734403, "mj_per_call": 3.3969978075000977, "mj_per_call_with_ram": 2.64626354279942, "mac_utilization": 1.0926726443010448, "stream_utilization": 0.011101909367579486}, {"round": 2, "kind": "sweep", "name": "sweep", "encoding": "sparse", "k": 4608, "c": 4608, "h": 1, "w": 256, "reads": 256, "calls": 3519, "compile_ms": 1625.489, "ms_per_call": 0.8526, "mac_per_call": 5435817984, "weight_bytes": 2820264, "loop_start_us": 747863347271, "loop_end_us": 747866347419, "wall_start_us": 1789738294108892, "wall_end_us": 1789738297109048, "output_hash": "832d241bd2d5be83", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.03965343092568219, "gpu_w": 0.06345663103275001, "clean": true, "rounds": 3, "clean_rounds": 2, "ms_per_call_median": 0.85805, "ms_per_call_max": 0.8635, "tmac_s": 6.375578212526389, "weight_gb_s": 3.3078395496129485, "mac_per_weight_byte": 1927.414590974462, "samples": 8, "ane_w": 1.0737715661525726, "ram_w": 1.4027200490236282, "mj_per_call": 0.9154976373016834, "mj_per_call_with_ram": 0.3198392993742227, "mac_utilization": 0.89867390921886, "stream_utilization": 0.03652327654835057}, {"round": 3, "kind": "sweep", "name": "sweep", "encoding": "sparse", "k": 4608, "c": 4608, "h": 1, "w": 512, "reads": 512, "calls": 2148, "compile_ms": 1600.42, "ms_per_call": 1.3969, "mac_per_call": 10871635968, "weight_bytes": 2820264, "loop_start_us": 747947565712, "loop_end_us": 747950566226, "wall_start_us": 1789738378327568, "wall_end_us": 1789738381328090, "output_hash": "e8bc39b39b696403", "non_spin": 0, "external_creations": 0, "gap_ane_w": 0.04437420074827969, "gpu_w": 0.029242271919631295, "clean": true, "rounds": 3, "clean_rounds": 2, "ms_per_call_median": 1.4060000000000001, "ms_per_call_max": 1.4151, "tmac_s": 7.782687356288926, "weight_gb_s": 2.0189448063569335, "mac_per_weight_byte": 3854.829181948924, "samples": 9, "ane_w": 1.1699624723858304, "ram_w": 1.8387700451744928, "mj_per_call": 1.6343205776757666, "mj_per_call_with_ram": 1.2675120846565566, "mac_utilization": 1.0970139236881669, "stream_utilization": 0.02229203635559002}], "concurrency": [{"config": "fp16 1x128", "n": 1, "gain": 1.0, "sweeps_per_s": 1535.689559972831, "ms_each": 0.65115, "ane_w": 0.9120330876774259}, {"config": "fp16 1x128", "n": 2, "gain": 1.2309148205308775, "sweeps_per_s": 1890.3030391050995, "ms_each": 1.0246, "ane_w": 1.0390300750732422}, {"config": "fp16 1x128", "n": 4, "gain": 1.2317516710331475, "sweeps_per_s": 1891.5881816846936, "ms_each": 1.92695, "ane_w": 1.0170010149478912}, {"config": "sparse 1x64", "n": 1, "gain": 1.0, "sweeps_per_s": 5271.369746391871, "ms_each": 0.18974999999999997, "ane_w": 1.103000547322962}, {"config": "sparse 1x64", "n": 2, "gain": 0.8037188481350064, "sweeps_per_s": 4236.699220663795, "ms_each": 0.368025, "ane_w": 0.9359406795014035}, {"config": "sparse 1x64", "n": 4, "gain": 0.7201571160945074, "sweeps_per_s": 3796.2144344294043, "ms_each": 0.6463, "ane_w": 0.8835311128812677}, {"config": "sparse 1x128", "n": 1, "gain": 1.0, "sweeps_per_s": 2397.796513277651, "ms_each": 0.4178, "ane_w": 1.0029215990669198}, {"config": "sparse 1x128", "n": 2, "gain": 1.2246179348993977, "sweeps_per_s": 2936.384614399053, "ms_each": 0.5342499999999999, "ane_w": 1.1648917089809072}, {"config": "sparse 1x128", "n": 4, "gain": 1.3014450602524814, "sweeps_per_s": 3120.600427695822, "ms_each": 0.7137374999999999, "ane_w": 1.201700140009908}, {"config": "sparse 8x128", "n": 1, "gain": 1.0, "sweeps_per_s": 343.70411336442794, "ms_each": 2.9095500000000003, "ane_w": 1.169289824863275}, {"config": "sparse 8x128", "n": 2, "gain": 1.0363862560345847, "sweeps_per_s": 356.21021923344597, "ms_each": 3.6177, "ane_w": 1.2194403537682126}, {"config": "sparse 8x128", "n": 4, "gain": 1.0540697888135981, "sweeps_per_s": 362.28812218840756, "ms_each": 4.292475, "ane_w": 1.2252209335565567}], "repeat": {"sparse": [0.425, 0.433, 0.447, 0.469, 0.473, 0.515], "fp16": [0.639, 0.643, 0.661, 0.684, 0.722, 0.782]}, "production": {"fp16": [16.46, 16.54, 16.78], "sparse": [13.59, 13.61, 13.77]}}</script>
+<script>
+(function () {
+  const data = JSON.parse(document.getElementById("data").textContent);
+  const rows = data.rows.filter(r => r.tmac_s !== undefined);
+  const peakT = data.peak_tmac_s, peakS = data.peak_weight_gb_s;
+  const sweeps = rows.filter(r => r.kind === "sweep");
+  const kernels = rows.filter(r => r.kind === "roofline");
+  const prod = sweeps.find(r => r.encoding === "fp16" && r.h === 1 && r.w === 128);
+  const sparse128 = sweeps.find(r => r.encoding === "sparse" && r.h === 1 && r.w === 128);
+  const fmt = (x, d) => x.toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+  const pct = x => Math.round(100 * x) + "%";
+  const label = r => `${r.encoding} ${r.h}×${r.w}`;
+  const jobJ = r => r.mj_per_call !== undefined ? r.mj_per_call * 16384 / 1000 : null;
+  const statistics = xs => xs.reduce((a, b) => a + b, 0) / xs.length;
+
+  document.getElementById("lede").textContent =
+    `The production sweep (fp16 couplings, 128 reads) runs at ${pct(prod.mac_utilization)} of the MAC ceiling and ${pct(prod.stream_utilization)} of the weight-stream ceiling at once, so one model fills the chip: a second model can only take the remainder. Storing the couplings sparse cuts the stream to ${fmt(sparse128.weight_bytes / 1e6, 1)} MB, drops the sweep to ${fmt(sparse128.ms_per_call, 2)} ms, and lets reads scale to 1,024 per model at a flat cost per read.`;
+
+  const tiles = [
+    { c: "compute", k: "MAC ceiling, measured", v: fmt(peakT, 2), u: "TMAC/s", n: `${fmt(2 * peakT, 1)} TFLOP/s fp16, bare 2048×2048 conv` },
+    { c: "stream", k: "Weight-stream ceiling, measured", v: fmt(peakS, 0), u: "GB/s", n: "bare 4608×4608 conv, 128 positions" },
+    { c: "", k: "Production sweep, fp16 × 128 reads", v: fmt(prod.ms_per_call, 3), u: "ms", n: `${pct(prod.mac_utilization)} MAC · ${pct(prod.stream_utilization)} stream · ${fmt(prod.ane_w, 1)} W` },
+    { c: "compute", k: "Sparse sweep, 128 reads", v: fmt(sparse128.ms_per_call, 3), u: "ms", n: `${fmt(prod.ms_per_call / sparse128.ms_per_call, 2)}× faster, same output hash` },
+  ];
+  document.getElementById("tiles").innerHTML = tiles.map(t =>
+    `<div class="tile ${t.c}"><div class="k">${t.k}</div><div class="v">${t.v}<small>${t.u}</small></div><div class="n">${t.n}</div></div>`).join("");
+
+  // Roofline, log-log. x: MAC per weight byte. y: TMAC/s.
+  const W = 960, H = 560, m = { l: 74, r: 24, t: 20, b: 58 };
+  const xmin = 8, xmax = 20000, ymin = 0.2, ymax = 12;
+  const lx = v => m.l + (Math.log10(v) - Math.log10(xmin)) / (Math.log10(xmax) - Math.log10(xmin)) * (W - m.l - m.r);
+  const ly = v => H - m.b - (Math.log10(v) - Math.log10(ymin)) / (Math.log10(ymax) - Math.log10(ymin)) * (H - m.t - m.b);
+  const svg = document.getElementById("roofline");
+  const el = (n, a, txt) => { const e = document.createElementNS("http://www.w3.org/2000/svg", n); for (const k in a) e.setAttribute(k, a[k]); if (txt !== undefined) e.textContent = txt; svg.appendChild(e); return e; };
+  const css = getComputedStyle(document.documentElement);
+  const col = n => css.getPropertyValue(n).trim();
+  const ticks = (lo, hi) => { const t = []; for (let d = Math.floor(Math.log10(lo)); d <= Math.ceil(Math.log10(hi)); d++) for (const k of [1, 2, 5]) { const v = k * 10 ** d; if (v >= lo && v <= hi) t.push(v); } return t; };
+  for (const v of ticks(xmin, xmax)) {
+    el("line", { x1: lx(v), x2: lx(v), y1: m.t, y2: H - m.b, stroke: col("--grid"), "stroke-width": 1 });
+    el("text", { x: lx(v), y: H - m.b + 20, "text-anchor": "middle", "font-size": 12, "font-family": "IBM Plex Mono, monospace", fill: col("--muted") }, v >= 1000 ? (v / 1000) + "k" : v);
+  }
+  for (const v of ticks(ymin, ymax)) {
+    el("line", { x1: m.l, x2: W - m.r, y1: ly(v), y2: ly(v), stroke: col("--grid"), "stroke-width": 1 });
+    el("text", { x: m.l - 10, y: ly(v) + 4, "text-anchor": "end", "font-size": 12, "font-family": "IBM Plex Mono, monospace", fill: col("--muted") }, v);
+  }
+  el("text", { x: (m.l + W - m.r) / 2, y: H - 14, "text-anchor": "middle", "font-size": 13, fill: col("--muted") }, "MAC per weight byte (log)");
+  el("text", { x: 18, y: (m.t + H - m.b) / 2, "text-anchor": "middle", "font-size": 13, fill: col("--muted"), transform: `rotate(-90 18 ${(m.t + H - m.b) / 2})` }, "TMAC/s achieved (log)");
+  // Ceilings: y = peakS/1000 * x until the ridge, then flat at peakT.
+  const ridge = peakT * 1000 / peakS;
+  el("line", { x1: lx(xmin), y1: ly(peakS / 1000 * xmin), x2: lx(ridge), y2: ly(peakT), stroke: col("--stream"), "stroke-width": 2.5 });
+  el("line", { x1: lx(ridge), y1: ly(peakT), x2: lx(xmax), y2: ly(peakT), stroke: col("--compute"), "stroke-width": 2.5 });
+  el("text", { x: lx(xmax) - 6, y: ly(peakT) - 8, "text-anchor": "end", "font-size": 13, fill: col("--compute"), "font-weight": 600 }, `MAC ceiling ${fmt(peakT, 2)} TMAC/s`);
+  el("text", { x: lx(xmin) + 8, y: ly(peakS / 1000 * xmin) - 10, "text-anchor": "start", "font-size": 13, fill: col("--stream"), "font-weight": 600, transform: `rotate(-32 ${lx(xmin) + 8} ${ly(peakS / 1000 * xmin) - 10})` }, `weight stream ${fmt(peakS, 0)} GB/s`);
+  el("line", { x1: lx(ridge), x2: lx(ridge), y1: ly(peakT), y2: H - m.b, stroke: col("--rule"), "stroke-dasharray": "3 4" });
+  el("text", { x: lx(ridge) + 6, y: H - m.b - 8, "font-size": 12, fill: col("--muted"), "font-family": "IBM Plex Mono, monospace" }, `ridge ${fmt(ridge, 0)} MAC/B`);
+  const point = (r, fill, stroke, dx, dy, anchor) => {
+    const x = lx(r.mac_per_weight_byte), y = ly(r.tmac_s);
+    const g = el("g", {});
+    const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("r", 6); c.setAttribute("fill", fill); c.setAttribute("stroke", stroke); c.setAttribute("stroke-width", 2);
+    const t = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    t.textContent = `${r.name === "sweep" ? label(r) : r.name}: ${fmt(r.ms_per_call, 3)} ms, ${fmt(r.tmac_s, 2)} TMAC/s, ${fmt(r.mac_per_weight_byte, 0)} MAC/B, ${fmt(r.weight_gb_s, 1)} GB/s`;
+    c.appendChild(t); g.appendChild(c);
+    const lab = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    lab.setAttribute("x", x + dx); lab.setAttribute("y", y + dy); lab.setAttribute("font-size", 12); lab.setAttribute("text-anchor", anchor); lab.setAttribute("fill", col("--ink")); lab.setAttribute("font-family", "IBM Plex Mono, monospace");
+    lab.textContent = r.name === "sweep" ? `${r.h * r.w}` : r.name.replace(/^(compute|stream)_/, "").replace("x", "×").replace("_", " ");
+    g.appendChild(lab);
+  };
+  for (const r of kernels) point(r, "none", col("--kernel"), 10, 4, "start");
+  const placed = {};
+  for (const r of sweeps.filter(r => r.h === 1 || r.w === 128).sort((a, b) => a.h * a.w - b.h * b.w)) {
+    const isSparse = r.encoding === "sparse";
+    // One label per read count per encoding; H×W variants at the same read count overlap.
+    const key = r.encoding + ":" + (r.h * r.w);
+    if (placed[key]) { point(r, isSparse ? col("--compute") : col("--stream"), col("--panel"), 0, 0, "start"); continue; }
+    placed[key] = 1;
+    point(r, isSparse ? col("--compute") : col("--stream"), col("--panel"), isSparse ? 10 : -10, isSparse ? -8 : 16, isSparse ? "start" : "end");
+  }
+  document.getElementById("caption").textContent =
+    `Each sweep multiplies the padded 4,608×4,608 coupling matrix by the state, ${fmt(prod.mac_per_call / 1e9, 2)} GMAC at 128 reads. fp16 couplings weigh ${fmt(prod.weight_bytes / 1e6, 1)} MB, so the sweep needs ${fmt(prod.mac_per_weight_byte, 0)} MAC per byte and sits just left of the ridge, on the stream ceiling. Sparse couplings weigh ${fmt(sparse128.weight_bytes / 1e6, 1)} MB; the engine also skips the zero weights, so their dense-equivalent rate can sit above the dense MAC ceiling. Above 128 reads the fp16 points fall away from the roof because the compiler re-streams the weights per 128-position tile; the sparse points hold.`;
+
+  // Table.
+  const tbody = document.querySelector("#table tbody");
+  const order = [
+    { title: "Bare convolutions (ceilings)", items: kernels },
+    { title: "Production sweep, fp16 couplings", items: sweeps.filter(r => r.encoding === "fp16").sort((a, b) => a.h * a.w - b.h * b.w || a.h - b.h) },
+    { title: "Production sweep, sparse couplings", items: sweeps.filter(r => r.encoding === "sparse").sort((a, b) => a.h * a.w - b.h * b.w || a.h - b.h) },
+  ];
+  const bar = (cls, v) => `<span class="bar ${cls}"><i style="width:${Math.min(100, Math.round(100 * v))}%"></i></span>${pct(v)}`;
+  let html = "";
+  for (const g of order) {
+    html += `<tr class="group"><td colspan="10">${g.title}</td></tr>`;
+    for (const r of g.items) {
+      const isProd = r === prod;
+      const name = r.kind === "sweep" ? `${r.encoding}, layout ${r.h}×${r.w}` : r.name.replace(/_/g, " ").replace("x", "×");
+      const flag = r.clean_rounds < r.rounds ? ` <span class="flag" title="rounds with another ANE client active were excluded">${r.clean_rounds}/${r.rounds} clean</span>` : "";
+      html += `<tr class="${isProd ? "prod" : ""}"><td class="l">${name}${isProd ? " (production)" : ""}${flag}</td><td class="num">${r.kind === "sweep" ? r.h * r.w : r.h * r.w + " pos"}</td><td class="num">${fmt(r.ms_per_call, 3)}</td><td class="num">${fmt(r.tmac_s, 2)}</td><td class="l">${bar("mac", r.mac_utilization)}</td><td class="num">${fmt(r.weight_gb_s, 1)}</td><td class="l">${bar("str", r.stream_utilization)}</td><td class="num">${r.ane_w !== undefined ? fmt(r.ane_w, 2) : "–"}</td><td class="num">${r.mj_per_call !== undefined ? fmt(r.mj_per_call, 3) : "–"}</td><td class="num">${r.kind === "sweep" && jobJ(r) !== null ? fmt(jobJ(r), 1) : "–"}</td></tr>`;
+    }
+  }
+  tbody.innerHTML = html;
+  document.getElementById("tablenote").textContent =
+    `MAC array: achieved dense-equivalent TMAC/s over the ${fmt(peakT, 2)} TMAC/s ceiling. Weight stream: weight bytes per sweep over sweep time, against ${fmt(peakS, 0)} GB/s. Sparse rows can exceed 100% of the MAC array because the engine skips zero weights. J / 16k job is ANE energy for 16,384 sweeps at that rate, dispatch only.`;
+
+  // Models in flight.
+  const conc = data.concurrency || [];
+  const cbody = document.querySelector("#conc tbody");
+  const order2 = ["fp16 1x128", "sparse 1x64", "sparse 1x128", "sparse 8x128"];
+  const cname = k => { const [enc, hw] = k.split(" "); const [h, w] = hw.split("x").map(Number); return `${enc}, ${h * w} reads`; };
+  cbody.innerHTML = order2.filter(k => conc.some(x => x.config === k)).map(k => conc.filter(x => x.config === k).sort((a, b) => a.n - b.n).map(x =>
+    `<tr><td class="l">${x.n === 1 ? cname(k) : ""}</td><td class="num">${x.n}</td><td class="num">${fmt(x.sweeps_per_s, 0)}</td><td class="l"><span class="bar gain"><i style="width:${Math.min(100, Math.round(100 * x.gain / 1.4))}%"></i></span>${fmt(x.gain, 2)}×</td><td class="num">${fmt(x.ms_each, 3)}</td><td class="num">${fmt(x.ane_w, 2)}</td></tr>`).join("")).join("");
+  const c64 = conc.find(x => x.config === "sparse 1x64" && x.n === 2), c128 = conc.find(x => x.config === "sparse 1x128" && x.n === 2), c1024 = conc.find(x => x.config === "sparse 8x128" && x.n === 2);
+  document.getElementById("concnote").textContent =
+    `The engine executes one program at a time and overlaps only the request pipeline around it, so a second process adds ${c128 ? fmt(100 * (c128.gain - 1), 0) : "–"}% at 128 reads, ${c1024 ? fmt(100 * (c1024.gain - 1), 0) : "–"}% at 1,024, and at 64 reads two sparse models are slower than one (${c64 ? fmt(c64.gain, 2) : "–"}×). Total sweeps of all processes over the union of their timing windows, median of two launches each.`;
+
+  // Power.
+  const p = document.getElementById("power");
+  const rows2 = [prod, sparse128, sweeps.find(r => r.encoding === "sparse" && r.h === 8 && r.w === 128)].filter(Boolean);
+  p.innerHTML = `<p>ANE power is the same ${fmt(prod.ane_w, 1)}–${fmt(Math.max(...rows2.map(r => r.ane_w || 0)), 1)} W whichever encoding runs, because the chip idles at 0 W and a sweep over 99.6%-zero weights barely switches the MAC array; a dense kernel at the same MAC rate draws ${fmt(Math.max(...kernels.map(r => r.ane_w || 0)), 1)} W. What changes with the encoding is how many sweeps each joule buys.</p>` +
+    `<div class="tablewrap"><table><thead><tr><th class="l">Model in flight</th><th>ANE W</th><th>s / 16k job</th><th>J / job</th><th>jobs / Wh</th></tr></thead><tbody>` +
+    rows2.map(r => `<tr><td class="l">${label(r)}, ${r.h * r.w} reads</td><td class="num">${fmt(r.ane_w, 2)}</td><td class="num">${fmt(r.ms_per_call * 16.384, 1)}</td><td class="num">${fmt(jobJ(r), 1)}</td><td class="num">${fmt(3600 / jobJ(r), 0)}</td></tr>`).join("") +
+    `</tbody></table></div><p class="note">One model in flight draws about ${fmt(prod.ane_w, 1)} W on the ANE, so a model-hour costs about ${fmt(prod.ane_w, 1)} Wh on the engine itself. DRAM draws ${fmt((prod.ram_w || 0) - (data.idle.ram_w || 0), 1)} W above idle while the fp16 stream runs and stays at idle under sparse. Dispatch-only figures above; on the production path a 16,384-sweep job takes ${fmt(statistics(data.production.fp16), 1)} s with fp16 couplings and ${fmt(statistics(data.production.sparse), 1)} s with sparse (three runs each), the host's threshold work between dispatches making up the difference from the dispatch-only rate.</p>`;
+})();
+</script>
+
+</body>
+</html>

@@ -222,6 +222,10 @@ are the same computation. 128 reads hash `9f41c56a68a51b03`. 256 reads hash
 `832d241bd2d5be83` for 1×256, 2×128 and 4×64 under both encodings. 512
 reads hash `e8bc39b39b696403`.
 
+`2026-09-18-ane-roofline.html` beside this report draws the roofline, the
+ceiling-fraction and power table, and the models-in-flight table from
+these measurements. Open it in a browser.
+
 `crates/ane-miner/probes/utilization.sh` runs the grid ROUNDS times
 with `macmon` sampling and dumps the `aned` log.
 `utilization_concurrency.sh` launches the concurrency grid.
