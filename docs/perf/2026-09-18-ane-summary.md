@@ -140,6 +140,14 @@ winner-beating proofs, and 1.40 against 1.21 proofs per second under a
 ran on the GPU. `2026-09-18-testnet-sweeps-study.md` and
 `2026-09-18-testnet-sweeps-intermediates.md`.
 
+One account mined the testnet with a quantum annealer and stopped winning
+at qblock 1,308, when the target passed its best energy. The Metal solver
+beats its winning proofs on 60 of 60 by a median 30,000 milli, and every
+block of that era is reachable, so those blocks cannot test a filter. The
+solver's own quarter-budget energy predicts its outcome on the recent
+blocks and abandoning the poor jobs there yields up to 1.29 times the
+valid proofs per unit of compute. `2026-09-18-testnet-annealer-blocks.md`.
+
 The testnet mines zero-field problems on the Advantage2 graph with one
 read below target as a valid proof. Winners self-report 1.0 to 3.9 s of
 compute. `2026-09-18-testnet-reads-study.md` carries the fetch, the
