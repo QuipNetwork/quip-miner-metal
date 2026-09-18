@@ -44,8 +44,9 @@ static const size_t kProdChannels = 4608;
 static const size_t kProdLengths[8] = {857, 849, 817, 740, 685, 480, 136, 13};
 static const size_t kProdTiles = 8;
 
-// BLOCK_SWEEPS in crates/ane-miner/src/native.rs: every production compile
-// call, --solve included, builds the program with exactly this many sweeps.
+// 2 was the value of BLOCK_SWEEPS in crates/ane-miner/src/native.rs when
+// Task 2 measured. The constant is held at 2 here so those measurements
+// stay reproducible, even though BLOCK_SWEEPS has since changed.
 static const size_t kSweeps = 2;
 static const size_t kDefaultCalls = 200;
 

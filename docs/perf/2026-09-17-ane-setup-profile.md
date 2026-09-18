@@ -66,9 +66,11 @@ colors it. This gives eight tiles with lengths 857, 849, 817, 740, 685, 480,
 asserts these lengths sum to 4,577 and fails otherwise. `channels` is 4,608,
 the next multiple of 32 that is at least 4,577. The probe asserts this length
 too.
-Couplings are `{-1, 1}` from seed 123. Fields are zero. Sweeps is 2, matching
+Couplings are `{-1, 1}` from seed 123. Fields are zero. Sweeps is 1, matching
 `BLOCK_SWEEPS` in `crates/ane-miner/src/native.rs:10`, the sweep count every
-production compile call uses, `--solve` included.
+production compile call uses, `--solve` included. The Stage table below
+records a run from when `BLOCK_SWEEPS` was 2, so a rerun of the probe as it
+stands now reports a lower `compile_ms`.
 
 No shared device guard exists in this repository or in `/tmp`. The five runs
 below ran one at a time, with a 3-second sleep between runs, in place of a
@@ -167,6 +169,11 @@ draft summed `graph_prep_ms` into the figure checked against the budget,
 number is not trustworthy: it credits the budget with 56.065 ms of work the
 probe never actually measured. The 39.1% figure is the honest one. Either
 way the gap is real and exceeds the 15% check.
+
+The 520.000 ms baseline fixed setup in the preceding table, and the 39.1%
+gap derived from it, are `BLOCK_SWEEPS`-2 measurements. Task 5's Stage
+table, further down in this document, supersedes them with a 390.0 ms fixed
+setup and a 155.016 ms compile at `BLOCK_SWEEPS` 1.
 
 `solve_with_block`, `crates/ane-miner/src/solver.rs:45` through
 `solver.rs:71`, sets `stats.setup_us`, the metric behind the 520 ms baseline.
@@ -318,6 +325,12 @@ this figure over the other two: a single direct measurement beats a sum of
 measurements taken in different processes. Even this figure stays far over
 the 15% check, 76.224 ms.
 
+The 340.423 ms `setup_us` median and the 33.0% gap it produces are
+`BLOCK_SWEEPS`-2 measurements: the 520 ms baseline that sets the budget is
+itself a `BLOCK_SWEEPS`-2 figure. Task 5's Stage table, further down in
+this document, supersedes that baseline with a 390.0 ms fixed setup and a
+155.016 ms compile at `BLOCK_SWEEPS` 1.
+
 The gap does not close under any of the three ways to compute it. Two places
 hold the rest, named here rather than estimated by assertion:
 
@@ -363,6 +376,12 @@ inside four file-and-line-named spots this section bounds but does not
 directly instrument. The redone total still misses the 508.162 ms budget,
 by 110.069 ms, 21.7% of budget, over the 15% check in the task brief. See
 Gap accounting below for both ways to compute this, and why they differ.
+
+The 508.162 ms budget this section measures comes from the 520 ms
+`BLOCK_SWEEPS`-2 baseline, so the preceding 110.069 ms gap and 21.7% figure
+are also `BLOCK_SWEEPS`-2 measurements. Task 5's Stage table, further down
+in this document, supersedes that baseline with a 390.0 ms fixed setup and
+a 155.016 ms compile at `BLOCK_SWEEPS` 1.
 
 ### Harness cost, bounded
 
@@ -546,6 +565,11 @@ measurement instead of summing two methods with a known 31 ms disagreement
 between them. Either way, the gap stays open past the 15% check, though it
 has narrowed from Task 7's 33.0% best figure to 21.7%.
 
+The 508.162 ms budget in the preceding table, and so the 21.7% gap, are
+`BLOCK_SWEEPS`-2 measurements, derived from the 520 ms baseline. Task 5's
+Stage table, further down in this document, supersedes that baseline with a
+390.0 ms fixed setup and a 155.016 ms compile at `BLOCK_SWEEPS` 1.
+
 Four spots hold part of the remaining 110.069 ms, named here rather than
 estimated by assertion. This section did not instrument any of the four
 directly. It bounds the four together with one arithmetic check. Add
@@ -622,6 +646,11 @@ from Task 1's stage table, for a combined saving of 284.918 ms per job. If
 it does not, the saving stays at 1.031 ms. State which figure you use, and
 why, alongside Task 4's result.
 
+That 283.887 ms `compile_ms` median is a `BLOCK_SWEEPS`-2 measurement. Task
+5's Stage table, further down in this document, supersedes it with a
+155.016 ms compile at `BLOCK_SWEEPS` 1, the value now live in
+`crates/ane-miner/src/native.rs:10`.
+
 ## Weight swap
 
 Task 4 tested whether overwriting `weights/weight_data.bin` in the staging
@@ -642,6 +671,14 @@ fixed-setup budget. Nothing in this section changes it.
 | unload_ms | 0.777 |
 | reload_ms | 2.662 |
 | compile_ms this task's outcome fails to remove | 283.887 |
+
+The 283.887 ms `compile_ms` figure in the preceding table is a
+`BLOCK_SWEEPS`-2 measurement. Bead `quip-miner-metal-yba` bases its size on
+this figure, but Task 5's Stage table, further down in this document,
+supersedes it: at the `BLOCK_SWEEPS` value now live in
+`crates/ane-miner/src/native.rs:10`, `compile_ms` is 155.016 ms. In plain
+words, the compile time a persistent worker still needs to remove is now
+about 155 ms, not 284 ms.
 
 The unload-plus-reload time, 3.439 ms at the median, is far below
 `compile_ms`. That speed is moot: outcome 3 means the reload path produces
