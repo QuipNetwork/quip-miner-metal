@@ -237,7 +237,10 @@ The topology is `tests/fixtures/advantage2-system1.edges`, the same 4,577
 nodes and 41,515 edges the probe uses. Fields are zero. Couplings are `{-1,
 1}` from a seeded xorshift64 generator with seed 7, the same generator
 `tests/msa_bench.rs` already uses for this fixture in this repository's
-top-level test suite. `num_reads` is 128, `num_sweeps` is 512, matching the
+top-level test suite. Task 1's probe used coupling seed 123 instead. The two
+differ because each follows its own side's convention, and the difference does
+not affect timing: coupling values change neither buffer sizes nor branching
+anywhere on this path. `num_reads` is 128, `num_sweeps` is 512, matching the
 `--solve` sweep count this task's brief specifies, `sweeps_per_beta` is 1,
 and `beta_range` is unset. `seed`, the solve-time pseudorandom source, is
 123.
@@ -275,9 +278,12 @@ following four. The median absorbs it here as it did there.
 
 `setup_us` is `AneProgram::compile` plus all five measured counters. Summing
 the five counters and subtracting from the `setup_us` median leaves 334.776
-ms for `AneProgram::compile` alone in this run, more than the probe's
-309.462 ms native stage sum. See the following Gap accounting section for
-what that 25.3 ms difference most likely is.
+ms for `AneProgram::compile` alone, more than the probe's 309.462 ms native
+stage sum. That 334.776 ms figure is a composite across the five runs, not
+one run's measurement: each term in it is its own per-stage median, and those
+medians do not all come from the same run. Run 4 taken alone gives 334.798 ms,
+which is close but not identical. See the following Gap accounting section for
+what the 25.3 ms difference most likely is.
 
 ### Gap accounting
 
