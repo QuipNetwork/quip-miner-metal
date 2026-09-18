@@ -18,7 +18,7 @@ fresh nonces against the full job at Spearman +0.95, and keeping the
 deepest 1 in 8 by that probe holds 38 of the 40 deepest nonces. On one M4
 Max that screen is worth about 3.7 times the valid proofs per second of an
 unscreened miner, from the measured rates. The 50,000-nonce follow-up in
-`2026-09-18-probe-screen-at-scale.md` measures 15.6 times with a shorter
+`2026-09-18-probe-screen-at-scale.md` measures 16.2 times with a shorter
 probe on the streaming path, and supersedes the rate arithmetic here.
 
 The annealer's energy on a nonce ranks nonces the same way. On the 60 most
@@ -35,8 +35,8 @@ short.
 The bar the annealer has to clear is the solver's own probe, and
 `2026-09-18-probe-screen-at-scale.md` raised that bar after this report was
 written. On 50,000 fresh nonces through the batched streaming path, a
-512-sweep probe screens 232 nonces per second at Spearman +0.923 and a
-1,024-sweep probe 144 per second at +0.942. At the schedule the chain
+512-sweep probe screens 247 nonces per second at Spearman +0.923 and a
+1,024-sweep probe 152 per second at +0.942. At the schedule the chain
 records, 34.8 to 46.1 ms per nonce, one annealer screens 22 to 29 nonces per
 second. A QPU screen pays only if its call costs well under 5 ms of access
 time with the signal intact, or if its ranking beats +0.92 by enough to

@@ -8,14 +8,15 @@ the target?
 
 ## Result
 
-It holds, and the screen is worth 15.6 times the valid proofs per second of
-an unscreened miner on one M4 Max, with a spread of 0.7 across five rounds.
+It holds, and the screen is worth 16.2 times the valid proofs per second of
+an unscreened miner on one M4 Max, with a spread of 1.4 across ten rounds.
 
 A 512-sweep probe at 64 reads ranks 50,000 fresh nonces against the full
 14,336-sweep job at Spearman +0.923. Keeping the 390 nonces the probe ranks
 deepest, 1 in 128, holds all 10 of the deepest by the full job and 46 of the
-deepest 50. The screened miner examines 203 nonces per second against 13.0
-for the unscreened one.
+deepest 50. The screened miner examines 211 nonces per second against 13
+for the unscreened one, and waits 3.4 seconds for its first answer against
+2.8 seconds unscreened.
 
 The probe picks instances whose energy floor is deep for any solver, rather
 than instances that suit a 14,336-sweep anneal. On the 100 nonces the probe ranked deepest, a
@@ -27,7 +28,7 @@ short of the chain's target of −14,625,068. The random control's deepest
 stops 103,068 short.
 
 The accuracy of the screen is not what limits it. The probe's own rate is.
-Keeping 1 in 128 already captures 88% of the speed an infinitely selective
+Keeping 1 in 128 already captures 87% of the speed an infinitely selective
 screen would reach, and keeping less than that trades recall for almost
 nothing.
 
@@ -68,23 +69,20 @@ one M4 Max:
 
 | Miner | Nonces examined per second | Expected time to one valid proof |
 | --- | ---: | ---: |
-| No screen, 64 reads, 14,336 sweeps | 13.0 | 74 hours |
-| 512-sweep probe, keep 1 in 128 | 203 | 4.8 hours |
+| No screen, 64 reads, 14,336 sweeps | 13 | 74 hours |
+| 512-sweep probe, keep 1 in 128 | 211 | 4.6 hours |
 
 Those hours are an extrapolation one standard deviation beyond the deepest
-of 50,000 nonces, not a measurement. The ratio between the two rows, 15.6,
+of 50,000 nonces, not a measurement. The ratio between the two rows, 16.2,
 rests only on the measured rates and the measured recall.
 
 The composite rate is the series sum of the two stages: one probe for every
 nonce, plus one full solve for every one hundred and twenty-eighth nonce. A
-screen that keeps a smaller fraction approaches the probe's own rate of 232
+screen that keeps a smaller fraction approaches the probe's own rate of 247
 nonces per second and no higher.
 
-The full stage needs its kept nonces buffered. At 1 in 128 they arrive at
-1.6 per second and a batch holds 20 jobs, so a miner that dispatches each
-kept nonce as it arrives would run batches of one or two and leave most of
-the device idle. Accumulate 40 kept nonces, about 25 seconds of probing,
-before dispatching, so the streaming loop keeps two full batches in flight.
+Dispatch each kept nonce as it arrives rather than waiting for a full solve
+batch. The next section measures why.
 
 ## Choosing the probe and the keep fraction
 
@@ -93,9 +91,9 @@ instances.
 
 | Probe | Rate, nonces per second | Spearman against the full job | Best speedup | Keep fraction at the best speedup |
 | --- | ---: | ---: | ---: | ---: |
-| 64 reads, 512 sweeps | 232 ± 9 | +0.923 | 15.6 ± 0.7× | 1 in 128 |
-| 64 reads, 1,024 sweeps | 144 ± 5 | +0.942 | 10.2 ± 0.2× | 1 in 128 |
-| 64 reads, 4,096 sweeps | 41 ± 4 | +0.965 | 3.1 ± 0.3× | 1 in 128 |
+| 64 reads, 512 sweeps | 247 ± 20 | +0.923 | 16.2 ± 1.4× | 1 in 128 |
+| 64 reads, 1,024 sweeps | 152 ± 12 | +0.942 | 10.4 ± 0.6× | 1 in 128 |
+| 64 reads, 4,096 sweeps | 44 ± 5 | +0.965 | 3.2 ± 0.4× | 1 in 128 |
 
 The shortest probe wins. A longer probe ranks better and costs more, and the
 cost grows faster than the ranking improves. The 800-nonce study could not
@@ -105,12 +103,12 @@ Recall as the screen tightens, for the 512-sweep probe:
 
 | Keep | Nonces kept of 50,000 | Probe cutoff, milli | Deepest 50 held | Deepest 10 held | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 in 32 | 1,562 | −14,366,000 | 50 of 50 | 10 of 10 | 11.4× |
-| 1 in 64 | 781 | −14,380,000 | 50 of 50 | 10 of 10 | 13.9× |
-| 1 in 128 | 390 | −14,396,000 | 46 of 50 | 10 of 10 | 15.6× |
-| 1 in 256 | 195 | −14,408,000 | 39 of 50 | 10 of 10 | 16.7× |
-| 1 in 512 | 97 | −14,418,000 | 32 of 50 | 9 of 10 | 17.2× |
-| 1 in 1,024 | 48 | −14,430,000 | 25 of 50 | 9 of 10 | 17.5× |
+| 1 in 32 | 1,562 | −14,366,000 | 50 of 50 | 10 of 10 | 11.7× |
+| 1 in 64 | 781 | −14,380,000 | 50 of 50 | 10 of 10 | 14.4× |
+| 1 in 128 | 390 | −14,396,000 | 46 of 50 | 10 of 10 | 16.2× |
+| 1 in 256 | 195 | −14,408,000 | 39 of 50 | 10 of 10 | 17.3× |
+| 1 in 512 | 97 | −14,418,000 | 32 of 50 | 9 of 10 | 18.0× |
+| 1 in 1,024 | 48 | −14,430,000 | 25 of 50 | 9 of 10 | 18.3× |
 
 Past 1 in 128 the speedup gains 12% in total while the deepest 50 lose more
 than half their members. A miner sets the cutoff as an absolute energy, not
@@ -159,18 +157,23 @@ rotates each round, so drift and ordering cannot look like a budget effect.
 The machine was not quiet. Load averages ran from 3 to 20 on 16 cores, and
 so each rate carries a spread.
 
-| Budget | Streaming, nonces per second | Spread over five rounds | One process per nonce |
+| Budget | Streaming, nonces per second | Lead to the first solve | One process per nonce |
 | --- | ---: | ---: | ---: |
-| 64 reads, 512 sweeps | 232 ± 9 | 11% | |
-| 64 reads, 1,024 sweeps | 144 ± 5 | 11% | 90.6 |
-| 64 reads, 4,096 sweeps | 41 ± 4 | 26% | 41.5 |
-| 64 reads, 14,336 sweeps | 13.0 ± 0.7 | 14% | 14.0 |
+| 64 reads, 512 sweeps | 247 ± 20 | 0.10 ± 0.02 s | |
+| 64 reads, 1,024 sweeps | 152 ± 12 | 0.20 ± 0.03 s | 90.6 |
+| 64 reads, 4,096 sweeps | 44 ± 5 | 0.80 ± 0.09 s | 41.5 |
+| 64 reads, 14,336 sweeps | 13 ± 1 | 2.82 ± 0.30 s | 14.0 |
+
+Rates pool ten rounds across two test sets, lead times the five rounds that
+carried the instrument. Lead is the wall time from starting a cold stage to
+its first completed job, so it covers the device open, the kernel compile,
+and one batch of sweeps.
 
 The ratio of a probe's rate to the full job's, taken inside a single round,
-is far steadier than either rate on its own, and the screen's speedup
-depends only on that ratio. The 1,024-sweep probe runs 11.05 times the full
-job's rate with a spread of 0.21 across the five rounds, the 512-sweep probe
-17.83 with a spread of 0.94.
+is steadier than either rate on its own, and the screen's speedup depends
+only on that ratio. The 1,024-sweep probe runs 11.37 times the full job's
+rate with a spread of 0.72 across the ten rounds, the 512-sweep probe 18.61
+with a spread of 1.82.
 
 `scripts/testnet/run_reads_study.py` produced the last column. It starts one
 process per nonce and runs eight at a time. Fitting each path as a fixed
@@ -216,6 +219,47 @@ samples over 41,514 edges, a cost per job that does not shrink with the
 sweep count, so the shortest probe is the budget that competes with whatever
 else the machine is doing. A miner on a quiet machine should reach the top
 of the measured range or better.
+
+## Lead time, and why a screened miner must not wait
+
+A new qblock changes every nonce, so a miner's queue is thrown away and it
+starts again. The number that pays is what a miner finishes inside one
+qblock's window, not its steady-state rate.
+
+The lead column in the preceding table is the wall time to the first
+completed job. A solve
+batch dispatched into an idle device is faster still: one job at 64 reads
+and 14,336 sweeps returns in 1.01 s, three jobs in 0.99 s, ten in 1.22 s and
+twenty in 1.50 s. A single-job batch wastes 38 of the 40 GPU cores, and it
+answers sooner than a full one.
+
+That settles how a screened miner should dispatch. At 1 in 128 the kept
+nonces arrive 1.6 times a second, so filling a 20-job solve batch takes ten
+seconds of probing.
+
+| Dispatch rule | Probes before the first solve | Lead to the first solve |
+| --- | ---: | ---: |
+| Each kept nonce as it arrives | 128 | 3.4 s |
+| Wait for a full 20-job batch | 2,560 | 12.7 s |
+
+Against the chain, the difference is the whole argument for dispatching at
+once. The 300 most recent qblocks arrived a median of 17 substrate blocks
+apart, a quarter of them within 8 blocks. Reading a substrate block as six
+seconds, and charging each miner for its own lead, the screen is worth:
+
+| Qblock window | Dispatch at once | Wait for a batch |
+| ---: | ---: | ---: |
+| 12 s, the shortest twentieth of windows | 15.2× | nothing |
+| 24 s, the shortest tenth | 15.8× | 8.6× |
+| 48 s, the lower quarter | 16.0× | 12.7× |
+| 99 s, the median | 16.1× | 14.5× |
+| 234 s, the upper quarter | 16.2× | 15.5× |
+
+Over the measured distribution of windows the screen keeps 16.1 of its 16.2
+times when it dispatches at once, and 15.2 when it waits, with 5% of windows
+too short to return any solve at all under the waiting rule. Doubling the
+assumed block time to twelve seconds moves both columns up and changes
+nothing about the choice.
 
 The chunk planner does not hold its bound on this envelope. Across 95
 batches at 64 reads and 14,336 sweeps, two chunks ran past the 400 ms the

@@ -203,7 +203,7 @@ fn run_stage(
     stage: Stage,
     stage_index: usize,
     target: i64,
-) -> (Vec<Option<Summary>>, f64) {
+) -> (Vec<Option<Summary>>, f64, f64) {
     let (job_tx, job_rx) = tokio::sync::mpsc::channel(128);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(128);
     let cancel = CancelToken::default();
@@ -256,7 +256,12 @@ fn run_stage(
     let mut summaries: Vec<Option<Summary>> = vec![None; count];
     let mut done = 0usize;
     let mut last_report = Instant::now();
+    // Lead time: how long a cold miner waits for its first answer. It covers
+    // the device open, the kernel compile and one batch of sweeps, so it is
+    // not the steady-state rate turned upside down.
+    let mut first_result: Option<Duration> = None;
     while let Some(r) = out_rx.blocking_recv() {
+        first_result.get_or_insert_with(|| start.elapsed());
         let index: usize = String::from_utf8_lossy(&r.job_id)
             .parse()
             .expect("job index");
@@ -292,6 +297,7 @@ fn run_stage(
     }
     let wall_s = start.elapsed().as_secs_f64();
     worker.join().expect("stream worker");
+    let lead_s = first_result.unwrap_or_default().as_secs_f64();
     let (drawing, blocked) = producer.join().expect("producer");
     eprintln!(
         "  producer: drawing {:.1} s, blocked on the device {:.1} s, of {wall_s:.1} s wall;\
@@ -300,7 +306,7 @@ fn run_stage(
         blocked.as_secs_f64(),
         1000.0 * drawing.as_secs_f64() / count as f64
     );
-    (summaries, wall_s)
+    (summaries, wall_s, lead_s)
 }
 
 /// Positive control for the fixture derivation. `scripts/testnet/regen`
@@ -362,10 +368,10 @@ fn probe_then_solve_on_fresh_nonces() {
     let mut columns = Vec::with_capacity(stages.len());
     for (k, stage) in stages.iter().enumerate() {
         let run = &seeds[..stage.nonces.unwrap_or(seeds.len()).min(seeds.len())];
-        let (mut summaries, wall_s) = run_stage(&edges, run, *stage, k, target);
+        let (mut summaries, wall_s, lead_s) = run_stage(&edges, run, *stage, k, target);
         let done = summaries.iter().flatten().count();
         eprintln!(
-            "stage {}x{}: {done} of {} jobs in {wall_s:.1} s = {:.2} jobs/s; wall_seconds={wall_s:.6}",
+            "stage {}x{}: {done} of {} jobs in {wall_s:.1} s = {:.2} jobs/s; lead {lead_s:.2} s; wall_seconds={wall_s:.6}",
             stage.num_reads,
             stage.num_sweeps,
             run.len(),
