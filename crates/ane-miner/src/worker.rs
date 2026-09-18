@@ -164,11 +164,14 @@ fn check_device() -> Result<WorkerResult, AneError> {
 /// Run one private worker request, terminating if its owning parent disappears.
 ///
 /// `entry` is captured at the top of `main`, before argument parsing. Task 8
-/// measurement instrumentation only: it times the child's own `dyld` and
-/// runtime startup, which the process that spawned this one cannot see.
+/// measurement instrumentation only: it times `main` entry to this line,
+/// which is `Cli::parse()` and nothing else. `dyld` has already loaded every
+/// library this binary links and jumped to the entry point before `main`
+/// ever runs, so that cost, and the `execve` before it, are not in this
+/// window and are not measured anywhere in this task.
 pub fn worker_main(parent_pid: u32, entry: Instant) -> ExitCode {
     eprintln!(
-        "worker startup: pid={} child_startup_us={}",
+        "worker startup: pid={} child_arg_parse_us={}",
         std::process::id(),
         entry.elapsed().as_micros()
     );

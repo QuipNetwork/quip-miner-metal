@@ -359,7 +359,7 @@ Task 7 named the out-of-process worker path as the largest cost outside
 pure wrapper, the file and process machinery around the real job, adds
 19.082 ms to a job's fixed setup. Most of the earlier gap turns out to sit
 inside the child's own compute, which the wrapper counters cannot see, and
-inside two file-and-line-named spots this section bounds but does not
+inside four file-and-line-named spots this section bounds but does not
 directly instrument. The redone total still misses the 508.162 ms budget,
 by 110.069 ms, 21.7% of budget, over the 15% check in the task brief. See
 Gap accounting below for both ways to compute this, and why they differ.
@@ -397,14 +397,28 @@ branch changed. `wait` logs the six counters through one
 `tracing::debug!` call once teardown finishes.
 
 `crates/ane-miner/src/worker.rs` and `crates/ane-miner/src/bin/quip_ane_msa.rs`
-add a seventh counter for the child's own startup. `main` now captures an
+add a seventh counter, `child_arg_parse_us`. `main` now captures an
 `Instant` before it parses arguments, and `worker_main` prints the elapsed
-time as its first line, to standard error, which the parent inherits. This
-times `dyld` loading the binary's own libraries and the runtime reaching
-`worker_main`, a cost the process that spawned the child cannot see from
-its own side. It does not reach earlier than `main`, so it excludes
-whatever `dyld` does before any Rust code runs. This section does not
-measure that part, and it does not estimate it.
+time as its first line, to standard error, which the parent inherits. By
+the time any Rust code in `main` runs, `dyld` has already resolved and
+loaded every library the binary links, including the private ANE runtime
+library, and has already jumped to the compiled binary's entry point.
+None of that work happens inside this window. What `child_arg_parse_us`
+actually times is `main` entry to `worker_main` entry, which is
+`Cli::parse()` parsing one optional flag and nothing else. Its own
+0.064 ms median, in the Stage table below, is consistent with that: too
+small to be library loading, right for one argument parse. `execve` and
+`dyld` both run before `main`, on the child's side, entirely inside the
+parent's `wait_us` window. This section does not measure either one, and
+does not estimate their cost from this counter. See Gap accounting for a
+bound on that cost from a different, direct measurement.
+
+`wait_inner`'s poll loop, `crates/ane-miner/src/process.rs:167`, sleeps
+10 ms between checks for the child's exit. This adds up to 10 ms to
+`wait_us` beyond the child's real lifetime, about 5 ms on average across
+many jobs. This section does not correct for it. It affects every figure
+in this section that includes `wait_us`, including the 25.616 ms residual
+in Gap accounting below.
 
 Five runs, one at a time with a 3-second sleep, of a real `--ane-worker`
 job holding production's own request shape: the topology in
@@ -446,17 +460,17 @@ record.
 | wait_us | 634.613 | 372.733 | 378.740 | 392.353 | 364.025 | 378.740 |
 | reply_read_us | 15.208 | 15.949 | 16.213 | 15.926 | 15.565 | 15.926 |
 | teardown_us | 0.326 | 0.366 | 0.398 | 0.423 | 0.372 | 0.372 |
-| child_startup_us | 0.858 | 0.062 | 0.064 | 0.061 | 0.065 | 0.064 |
+| child_arg_parse_us | 0.858 | 0.062 | 0.064 | 0.061 | 0.065 | 0.064 |
 | **Full run total, spawn to reply consumed** | 657.201 | 391.744 | 398.093 | 411.548 | 382.844 | **398.093** |
 
 The full run total row adds `directory_setup_us`, `request_write_us`, and
 `spawn_us`, timed before `wait_us` starts, to `wait_us` itself, then to
 `reply_read_us` and `teardown_us`, timed after `wait_us` ends. It excludes
-`child_startup_us`: that counter times a span inside `wait_us`, on the
-child's side, so adding it on top of `wait_us` would count part of the
-child's own startup twice. The bold median, 398.093 ms, is the median of
+`child_arg_parse_us`: that counter times a span inside `wait_us`, on the
+child's side, so adding it on top of `wait_us` would count part of that
+span twice. The bold median, 398.093 ms, is the median of
 the five per-run totals, the same convention Task 1's stage table sets.
-Summing the six per-stage medians instead, excluding `child_startup_us`
+Summing the six per-stage medians instead, excluding `child_arg_parse_us`
 for the reason just given, gives 397.822 ms, close enough to support
 either figure. This report uses 398.093 ms for the rest of Gap accounting.
 Summing `directory_setup_us`, `request_write_us`, `spawn_us`,
@@ -533,15 +547,27 @@ measurement instead of summing two methods with a known 31 ms disagreement
 between them. Either way, the gap stays open past the 15% check, though it
 has narrowed from Task 7's 33.0% best figure to 21.7%.
 
-Two spots hold part of the remaining 110.069 ms, named here rather than
-estimated by assertion. This section did not instrument either one
-directly. It bounds both together with one arithmetic check. Add
-`child_startup_us` (0.064 ms), `setup_us` (346.355 ms), and `anneal_us`
+Four spots hold part of the remaining 110.069 ms, named here rather than
+estimated by assertion. This section did not instrument any of the four
+directly. It bounds all of them together with one arithmetic check. Add
+`child_arg_parse_us` (0.064 ms), `setup_us` (346.355 ms), and `anneal_us`
 (6.705 ms), the child's own compute Tasks 1, 7, and this section's own
 `RunStats` figures already name, and subtract that sum from `wait_us`'s
 median. 378.740 minus 353.124 leaves 25.616 ms this section cannot
 assign to one place:
 
+- The child's own `execve` and `dyld` startup, before `main` runs and
+  before `child_arg_parse_us`'s own window starts. See Method above for
+  why `child_arg_parse_us` does not cover this. This section does not
+  measure it, but bounds it: run five times, one at a time with a
+  3-second sleep, `--capabilities` is a complete process lifetime that
+  includes `execve`, `dyld`, argument parsing, and exit, with no device
+  and no worker child. The team lead measured it directly and reports
+  three repetitions at 0.00 s warm against `/usr/bin/time -p`, whose
+  resolution is 10 ms, and one cold run at 0.35 s. This cost is under
+  roughly 10 ms warm, likely a small part of the 25.616 ms bucket, not a
+  large one. This is a bound from a different measurement, not a figure
+  this section derived.
 - `read_message(std::io::stdin().lock())`, `crates/ane-miner/src/worker.rs:190`,
   deserializes the request the parent already spent 2.189 ms writing.
   Deserializing costs more than writing raw bytes. `serde_json` walks and
@@ -553,6 +579,11 @@ assign to one place:
   `crates/ane-miner/src/worker.rs:212`, serializes and writes the reply,
   128 reads across 4,577 nodes as a spin array, before the parent's own
   `reply_read_us` timer starts on its side of the same file.
+
+The 10 ms poll interval in `wait_inner`'s loop, named in Method above,
+also inflates this same 25.616 ms bucket, by up to 10 ms and about 5 ms on
+average. It is not a fifth occupant so much as noise on top of the four
+above, since it does not correspond to any real work on the child's side.
 
 The remaining 84.453 ms, 110.069 minus 25.616, sits outside the span this
 section measures altogether: parent process startup before
@@ -567,14 +598,21 @@ accounting matters.
 A persistent worker would keep one child process alive across jobs
 instead of spawning one per job. It would remove the four counters this
 section ties to process lifecycle rather than to message content:
-`directory_setup_us` (0.268 ms), `spawn_us` (0.327 ms), `child_startup_us`
+`directory_setup_us` (0.268 ms), `spawn_us` (0.327 ms), `child_arg_parse_us`
 (0.064 ms), and `teardown_us` (0.372 ms), for a sum of 1.031 ms per job.
 `request_write_us` and `reply_read_us` stay, since they time message
 serialization, not process creation, and a persistent worker still has to
 serialize and deserialize each job's request and reply.
 
-1.031 ms is small next to the 520 ms fixed-setup budget. A persistent
-worker only pays off if the child can also skip recompiling the ANE
+That 1.031 ms understates the process-lifecycle saving, because
+`child_arg_parse_us` does not cover the child's `execve` and `dyld`
+startup, per Method above. A persistent worker would also remove that
+cost, bounded above at roughly 10 ms warm by the same `--capabilities`
+measurement Gap accounting cites. The fuller process-lifecycle saving is
+1.031 ms plus up to about 10 ms, not 1.031 ms alone.
+
+Even the fuller figure is small next to the 520 ms fixed-setup budget.
+A persistent worker only pays off if the child can also skip recompiling the ANE
 program for each job. Task 4's plan is to swap in new weights on one
 compiled program instead of recompiling it, but Task 4 has not run, and
 this section does not know whether that weight swap works. If it does, a

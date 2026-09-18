@@ -11,10 +11,12 @@ to that section and the commands behind it, not a duplicate of it.
 job: directory and file creation, the request write, `Command::spawn`,
 the wait for the child to exit, the reply read, and teardown.
 `crates/ane-miner/src/worker.rs` and
-`crates/ane-miner/src/bin/quip_ane_msa.rs` add a seventh counter. It times
-the child's own `dyld` and runtime startup. The child prints this value,
-and whatever spawned it captures the value. All seven are counters only.
-No control flow changed.
+`crates/ane-miner/src/bin/quip_ane_msa.rs` add a seventh counter,
+`child_arg_parse_us`. It times `main` entry to `worker_main` entry, which
+is argument parsing, not the child's `dyld` and runtime startup: `dyld`
+finishes before `main` ever runs, outside this window. The child prints
+this value, and whatever spawned it captures the value. All seven are
+counters only. No control flow changed.
 
 ## How to reproduce
 
