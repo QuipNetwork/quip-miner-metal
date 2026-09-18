@@ -82,7 +82,14 @@ int main(void) {
         Class descriptorClass = NSClassFromString(@"_ANEInMemoryModelDescriptor");
         Class modelClass = NSClassFromString(@"_ANEInMemoryModel");
         Class surfaceClass = NSClassFromString(@"_ANEIOSurfaceObject");
-        requireSelector(descriptorClass, @selector(alloc));
+        // Matches the production check in ane_bridge.m: validates the exact
+        // initializer selector called below, not the universally-answered
+        // `alloc`, which every NSObject subclass responds to and so proves
+        // nothing.
+        if (![descriptorClass instancesRespondToSelector:@selector(initWithNetworkText:weights:optionsPlist:isMILModel:)]) {
+            fprintf(stderr, "ANE descriptor initializer unavailable\n");
+            return 2;
+        }
         requireSelector(modelClass, @selector(inMemoryModelWithDescriptor:));
         requireSelector(surfaceClass, @selector(objectWithIOSurface:));
         NSData *plist = [NSPropertyListSerialization dataWithPropertyList:@{} format:NSPropertyListXMLFormat_v1_0 options:0 error:&error];
