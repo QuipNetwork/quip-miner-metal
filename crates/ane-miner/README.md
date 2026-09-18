@@ -196,7 +196,9 @@ A complete graph on 21 variables has degree 20.
 The miner accepts that graph on the same degree-20 path.
 The miner rejects degree 21.
 
-Coloring sorts by descending degree, then ascending index.
+The Advantage2 topology uses its own four-colouring, with classes of 1,148,
+1,145, 1,145 and 1,139 nodes.
+Every other graph colours greedily, by descending degree then ascending index.
 The solver walks colors in order.
 Each color is an independent set.
 A color splits into tiles of at most 4,096 outputs.
@@ -207,6 +209,11 @@ Static slices remove that padding before spin updates.
 
 Requested reads may be 1 through 128.
 Execution always uses 128 physical lanes.
+
+Measurement keeps that count. It costs 5.09 microseconds per read, against
+15.31 at 32 lanes and 9.99 at 256, so it is a minimum rather than a plateau.
+`docs/perf/2026-09-18-ane-read-count.md` records the sweep.
+
 At each node and sweep, each group of 32 replicas shares one threshold value.
 The four groups use independent streams.
 Nodes do not share one global threshold.
