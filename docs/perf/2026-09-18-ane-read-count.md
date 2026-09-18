@@ -2,9 +2,10 @@
 
 ## Result
 
-Keep 128 reads. The count inherited from the CUDA code is the
-cheapest per read this engine offers, and it is a clean minimum rather than
-a plateau.
+Keep 128 reads. Reads cost 1.75 microseconds each at the margin, against a
+fixed 0.425 ms per sweep that no read count can remove, so 128 buys four
+times the samples of 32 for 32% more time. Above 128 the cost per read
+roughly doubles.
 
 Cutting reads saves far less time than it gives up in samples. Dropping from
 128 to 32 removes three quarters of the arithmetic and returns only 25% of
@@ -26,22 +27,38 @@ the time. Raising reads past 128 costs roughly double per read.
 The engine refuses fewer than 32 reads. A program at 8 or 16 fails to
 compile with `InvalidMILProgram`.
 
-## What the shape says
+## The cost model
 
-Cost per read falls from 32 reads to 128, then jumps. Between 128 and 160 it
-rises by 31%, and by 256 it has roughly doubled. Past that it settles near
-9 microseconds and grows with the count.
+Up to 128 reads the cost is a fixed charge plus a small charge per read. A
+least-squares fit over 32, 64, 96 and 128 reads gives
 
-The natural reading is that the engine processes a 128-wide activation
-vector natively, and a wider program tiles into more than one pass. That
-makes 128 the largest read count available at the cheap rate. This report
-measures the shape rather than the cause, so treat the explanation as a
-hypothesis.
+    sweep = 0.425 ms + 1.75 microseconds x reads
 
-Sublinearity below 128 has a separate cause. Each sweep's convolution reads
-the whole weight matrix whatever the read count, because reads multiply only
-the activation width. At production shape the couplings are about 44 MB per
-program, so weight bandwidth dominates and cutting reads cannot remove it.
+with an R-squared of 0.94.
+
+The fixed 0.425 ms is 65% of a 128-read sweep. It matches the cost of
+streaming the couplings: the weight blob is 43,352,640 bytes, and moving it
+in 0.425 ms is 102 GB/s, which is a credible memory rate on this host. Each
+sweep's convolution reads the whole matrix whatever the read count, because
+reads multiply only the activation width.
+
+That is the whole answer to why removing three quarters of the arithmetic
+returns only a quarter of the time. Reads scale the 35% of the sweep that is
+activation work. They cannot touch the 65% that is weight streaming. The
+model predicts a 26% saving from cutting 128 reads to 32, against 25%
+measured.
+
+Above 128 the model breaks. It predicts 0.705 ms at 160 reads against 1.062
+measured, and 0.873 at 256 against 2.558. The jump is consistent with the
+engine processing a 128-wide activation vector natively and tiling a wider
+program into more than one pass, which would make 128 the widest count
+available before the step. This report measures the step rather than its
+cause, so treat that reading as a hypothesis.
+
+The cost-per-read column falls with the count because it is the fixed charge
+divided by the reads, plus the marginal 1.75 microseconds. Its minimum at
+128 marks where the tiling step falls, not a special property of the number
+itself.
 
 ## What follows for the read count
 
@@ -81,6 +98,29 @@ fields.
 Each figure is 200 back-to-back evaluations of one prepared request. Values
 are medians of three runs at 32, 64 and 128 reads, and of two runs at 96,
 160 and 256. Every run went through `scripts/ane-guard`.
+
+### Checks against measurement artifacts
+
+The ordering of the runs does not change the result. Sweeping 32, 64, 96,
+128 gives 0.4975, 0.5116, 0.5959 and 0.6498 ms. Sweeping the same counts in
+reverse gives 0.4973, 0.5084, 0.6003 and 0.6595. Alternating 32 and 128
+three times inside one process gives 0.4816, 0.4885 and 0.4781 against
+0.6342, 0.6220 and 0.6326, with no overlap between the two bands. Running
+each count in its own process gives 0.4952 and 0.7056.
+
+Other processes use the engine during these runs. The system log recorded 85
+program-instance creations by `aned` in one two-minute window, none of them
+this probe's. The guard serialises this repository's own probes and cannot
+exclude Apple's daemons. Two things make that acceptable here. The
+alternating runs above hold to about 2% across the session, and background
+work of that kind would fall on both read counts alike rather than produce a
+consistent ratio between them.
+
+Compile time is not monotonic in the read count. It runs about 95 to 105 ms
+at 32 and 128 reads against about 110 to 120 ms at 64 and 96. Reversing the
+order leaves that pattern in place. Compile is under 1% of a 16,384-sweep job, so
+this report does not chase it, but it is recorded rather than smoothed
+away.
 
 ### Commands
 

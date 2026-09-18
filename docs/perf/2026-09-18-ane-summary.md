@@ -39,12 +39,15 @@ serialising. Four workers reach about 25%.
 Four. Each is closed with evidence rather than opinion, so none needs
 revisiting without new information.
 
-**Read count below 128.** Cost per read is 5.09 microseconds at 128, against
-15.31 at 32 and 9.99 at 256. The inherited count is a minimum rather than a
-plateau. Cutting reads to 32 removes three quarters of the arithmetic and
-returns only 25% of the time, because each sweep's convolution reads the
-whole 44 MB weight matrix whatever the read count. The engine refuses fewer
-than 32 reads outright. `2026-09-18-ane-read-count.md`.
+**Read count below 128.** A sweep costs 0.425 ms plus 1.75 microseconds per
+read, fitted over 32 to 128 reads at an R-squared of 0.94. That fixed part
+is 65% of a 128-read sweep, and it matches streaming the 43.35 MB coupling
+blob at 102 GB/s. Every dispatch pays it whatever the read count, which leaves
+cutting to 32 reads giving up three quarters of the samples to save a
+quarter of the time. Above 128 the cost per read roughly doubles. The engine refuses fewer
+than 32 reads outright. The result held against run order, against
+alternating the counts, and against running each in its own process.
+`2026-09-18-ane-read-count.md`.
 
 **Couplings as a runtime graph input.** Works and validates, but the best
 variant runs 1.752 ms per sweep against 1.13, so the trade turns negative
