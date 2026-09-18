@@ -112,6 +112,12 @@ the nonce byte order: the runtime API returns it SCALE little-endian, and
 the seed is the reverse. Node ids compact to the position in the on-chain
 node list, so each field and coupling stays with its drawn node.
 
+The validator draws with `rand_chacha::ChaCha8Rng` 0.9 and the published
+crate draws with its own port of ChaCha8. A test in the tool seeds both
+from the same bytes, including qblock 3250's nonce, and compares 100,000
+draws each, more than twice the 46,091 a problem consumes. All match. A
+second test flips one seed bit and checks that the comparison notices.
+
 **Run.** `scripts/testnet/run_reads_study.py` pipes each problem through
 `quip-metal-msa --solve`, eight processes at a time, at 32, 64, 128, and
 256 reads, five seeds per block and read count, 16,384 sweeps, and the

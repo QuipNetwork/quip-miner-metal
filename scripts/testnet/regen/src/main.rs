@@ -124,3 +124,50 @@ fn main() {
     .expect("write index");
     eprintln!("wrote {} problems, nonce check passed on all", index.len());
 }
+
+#[cfg(test)]
+mod tests {
+    use rand_core::{RngCore, SeedableRng};
+
+    /// Nonce seed of Aglais qblock 3250, fetched 2026-09-18.
+    const REAL_NONCE: &str = "f72f174fdb5d8d7fd56c6c30c4d03f41cb26fee3d8e1ccf4866009253c82a4bd";
+
+    fn seed32(hex_str: &str) -> [u8; 32] {
+        hex::decode(hex_str)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    /// The chain draws with `rand_chacha::ChaCha8Rng`; the published crate
+    /// draws with its own port. A problem consumes 46,091 draws, so 100,000
+    /// covers it twice over.
+    #[test]
+    fn published_draw_matches_the_validators_rng() {
+        let seeds = [[0u8; 32], [0x5a; 32], [0xff; 32], seed32(REAL_NONCE)];
+        for seed in seeds {
+            let mut theirs = rand_chacha::ChaCha8Rng::from_seed(seed);
+            let mut ours = quip_protocol::chacha8::ChaCha8Rng::from_seed(seed);
+            for draw in 0..100_000 {
+                assert_eq!(
+                    ours.next_u32(),
+                    theirs.next_u32(),
+                    "seed {} diverges at draw {draw}",
+                    hex::encode(seed)
+                );
+            }
+        }
+    }
+
+    /// Positive control for the test above: the comparison must see a
+    /// difference when one seed bit flips, or a stub RNG would pass it.
+    #[test]
+    fn comparison_detects_a_one_bit_seed_change() {
+        let mut flipped = seed32(REAL_NONCE);
+        flipped[31] ^= 1;
+        let mut theirs = rand_chacha::ChaCha8Rng::from_seed(seed32(REAL_NONCE));
+        let mut ours = quip_protocol::chacha8::ChaCha8Rng::from_seed(flipped);
+        let differs = (0..16).any(|_| ours.next_u32() != theirs.next_u32());
+        assert!(differs, "a flipped seed produced the same first block");
+    }
+}
