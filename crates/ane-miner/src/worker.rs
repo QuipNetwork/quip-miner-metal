@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quip_solver_core::{IsingGraph, SampleParams};
 use serde::{Deserialize, Serialize};
@@ -162,7 +162,16 @@ fn check_device() -> Result<WorkerResult, AneError> {
 }
 
 /// Run one private worker request, terminating if its owning parent disappears.
-pub fn worker_main(parent_pid: u32) -> ExitCode {
+///
+/// `entry` is captured at the top of `main`, before argument parsing. Task 8
+/// measurement instrumentation only: it times the child's own `dyld` and
+/// runtime startup, which the process that spawned this one cannot see.
+pub fn worker_main(parent_pid: u32, entry: Instant) -> ExitCode {
+    eprintln!(
+        "worker startup: pid={} child_startup_us={}",
+        std::process::id(),
+        entry.elapsed().as_micros()
+    );
     if parent_pid == 0 {
         return ExitCode::from(70);
     }

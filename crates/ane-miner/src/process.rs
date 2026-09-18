@@ -34,16 +34,35 @@ fn sample_error(error: AneError) -> SampleError {
     }
 }
 
+/// Wall-clock stages of one out-of-process job, in microseconds. Task 8
+/// measurement instrumentation only; never read to make a decision.
+#[derive(Debug, Default)]
+pub(crate) struct WorkerPathStats {
+    pub(crate) directory_setup_us: u64,
+    pub(crate) request_write_us: u64,
+    pub(crate) spawn_us: u64,
+    pub(crate) wait_us: u64,
+    pub(crate) reply_read_us: u64,
+    pub(crate) teardown_us: u64,
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 pub(crate) struct WorkerProcess {
     child: Child,
     directory: TempDir,
     reply_path: PathBuf,
     pid: u32,
     reaped: bool,
+    stats: WorkerPathStats,
 }
 
 impl WorkerProcess {
     pub(crate) fn spawn(executable: &Path, request: &WorkerRequest) -> Result<Self, SampleError> {
+        let mut stats = WorkerPathStats::default();
+        let directory_setup_started = Instant::now();
         let directory = tempfile::Builder::new()
             .prefix("quip-ane-job-")
             .tempdir()
@@ -52,11 +71,17 @@ impl WorkerProcess {
         let reply_path = directory.path().join("response.json");
         let file =
             File::create(&request_path).map_err(|error| fault("create request file", error))?;
+        stats.directory_setup_us = elapsed_us(directory_setup_started);
+        let request_write_started = Instant::now();
         write_message(file, request).map_err(|error| fault("serialize request", error))?;
+        stats.request_write_us = elapsed_us(request_write_started);
+        let directory_setup_started = Instant::now();
         let request_file =
             File::open(&request_path).map_err(|error| fault("open request file", error))?;
         let reply_file =
             File::create(&reply_path).map_err(|error| fault("create response file", error))?;
+        stats.directory_setup_us += elapsed_us(directory_setup_started);
+        let spawn_started = Instant::now();
         let child = Command::new(executable)
             .arg("--ane-worker")
             .arg(std::process::id().to_string())
@@ -66,6 +91,7 @@ impl WorkerProcess {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|error| fault("spawn worker", error))?;
+        stats.spawn_us = elapsed_us(spawn_started);
         let pid = child.id();
         Ok(Self {
             child,
@@ -73,6 +99,7 @@ impl WorkerProcess {
             reply_path,
             pid,
             reaped: false,
+            stats,
         })
     }
 
@@ -81,10 +108,22 @@ impl WorkerProcess {
         should_stop: &dyn Fn() -> bool,
     ) -> Result<Option<WorkerReply>, SampleError> {
         let result = self.wait_inner(should_stop);
+        let teardown_started = Instant::now();
         self.stop_and_reap()?;
         // Remove native compiler artifacts only after the process has released them.
         std::fs::remove_dir_all(self.directory.path())
             .map_err(|error| fault("remove job directory", error))?;
+        self.stats.teardown_us = elapsed_us(teardown_started);
+        tracing::debug!(
+            pid = self.pid,
+            directory_setup_us = self.stats.directory_setup_us,
+            request_write_us = self.stats.request_write_us,
+            spawn_us = self.stats.spawn_us,
+            wait_us = self.stats.wait_us,
+            reply_read_us = self.stats.reply_read_us,
+            teardown_us = self.stats.teardown_us,
+            "ANE worker process stages"
+        );
         result
     }
 
@@ -92,6 +131,7 @@ impl WorkerProcess {
         &mut self,
         should_stop: &dyn Fn() -> bool,
     ) -> Result<Option<WorkerReply>, SampleError> {
+        let wait_started = Instant::now();
         loop {
             if let Some(status) = self
                 .child
@@ -99,13 +139,16 @@ impl WorkerProcess {
                 .map_err(|error| fault("poll worker", error))?
             {
                 self.reaped = true;
+                self.stats.wait_us = elapsed_us(wait_started);
                 if !status.success() {
                     return Err(fault("worker exited unsuccessfully", status));
                 }
+                let reply_read_started = Instant::now();
                 let file = File::open(&self.reply_path)
                     .map_err(|error| fault("open response file", error))?;
                 let reply: WorkerReply =
                     read_message(file).map_err(|error| fault("read worker response", error))?;
+                self.stats.reply_read_us = elapsed_us(reply_read_started);
                 if reply.pid != self.pid {
                     return Err(fault("worker response PID mismatch", reply.pid));
                 }
@@ -118,6 +161,7 @@ impl WorkerProcess {
                 return Err(fault("worker response", "exceeds size limit"));
             }
             if should_stop() {
+                self.stats.wait_us = elapsed_us(wait_started);
                 return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -864,6 +908,91 @@ mod tests {
         assert_eq!(dispatches, 1);
         assert_gone(pid, &directory);
         eprintln!("startup receipt: pid={pid}, dispatches={dispatches}, directory_removed=true");
+    }
+
+    /// Task 8 measurement harness: spawns one real `--ane-worker` job on
+    /// production's own topology and sweep count, and prints every
+    /// worker-path counter to stderr. `wait` already logs its six counters
+    /// through `tracing::debug!`; this test installs a `fmt` subscriber so
+    /// that event reaches stderr under `--nocapture`. The child's own
+    /// `worker_main` prints its `child_startup_us` line directly, since its
+    /// stderr is inherited. The reply also carries `RunStats`, Task 7's five
+    /// Rust counters plus `setup_us`, `dispatches`, `staging_us`,
+    /// `dispatch_us`, and `anneal_us`, printed here too so the report can
+    /// separate the child's own compute (already measured by Tasks 1 and 7)
+    /// from this task's wrapper counters.
+    ///
+    /// Same topology as Task 7's harness, `tests/fixtures/advantage2-system1.edges`,
+    /// couplings in {-1, 1} from seed 7, zero fields, 128 reads, solved with
+    /// seed 123. Sweeps is 2, not 512: the brief asks for the real topology
+    /// at 2 sweeps, matching `BLOCK_SWEEPS`, one dispatch. Run five times,
+    /// one process at a time with a 3-second sleep between runs, to collect
+    /// medians; not itself a benchmark.
+    #[test]
+    #[ignore = "requires integrated Apple Silicon ANE worker binary"]
+    fn hardware_worker_path_stage_medians_advantage2_system1() {
+        fn xorshift64(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::stderr)
+            .try_init();
+        let mut s: u64 = 7 | 1;
+        let mut edges = Vec::with_capacity(41_515);
+        let mut j = Vec::with_capacity(41_515);
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/advantage2-system1.edges"
+        ));
+        for line in fixture.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut nodes = line.split_whitespace();
+            let u = nodes.next().expect("edge start").parse().expect("node id");
+            let v = nodes.next().expect("edge end").parse().expect("node id");
+            assert!(nodes.next().is_none(), "two node ids per edge");
+            edges.push((u, v));
+            j.push(if xorshift64(&mut s) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            });
+        }
+        assert_eq!(edges.len(), 41_515);
+        let graph = IsingGraph::new(vec![0.0; 4_577], j, edges);
+        let params = SampleParams {
+            num_reads: 128,
+            num_sweeps: 2,
+            sweeps_per_beta: 1,
+            beta_range: None,
+            seed: 123,
+        };
+        let worker = WorkerProcess::spawn(
+            &worker_binary(),
+            &WorkerRequest::Sample(RawJob::from_parts(&graph, &params)),
+        )
+        .unwrap();
+        let pid = worker.pid;
+        let directory = worker.directory.path().to_path_buf();
+        let reply = worker.wait(&|| false).unwrap().unwrap();
+        let WorkerResult::Solved { output } = reply.result else {
+            panic!("job did not solve");
+        };
+        assert_gone(pid, &directory);
+        eprintln!(
+            "advantage2-system1 worker job stats: setup_us={} dispatches={} staging_us={} dispatch_us={} anneal_us={}",
+            output.stats.setup_us,
+            output.stats.dispatches,
+            output.stats.staging_us,
+            output.stats.dispatch_us,
+            output.stats.anneal_us,
+        );
     }
 
     #[test]

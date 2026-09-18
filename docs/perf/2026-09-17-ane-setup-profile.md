@@ -337,19 +337,251 @@ hold the rest, named here rather than estimated by assertion:
   fullest figure here, the 340.423 ms `setup_us` median, misses the 508.162
   ms budget by 167.739 ms. Every job in production spawns a second copy of
   the worker binary through `WorkerProcess::spawn`,
-  `crates/ane-miner/src/process.rs:46` through `process.rs:77`. That call
+  `crates/ane-miner/src/process.rs:63` through `process.rs:104`. That call
   makes a temporary directory, creates two files, and runs a full `fork` and
   `exec` of the ANE worker executable. The new process loads its own copy of
   Metal, IOSurface, and the other linked libraries. `worker_main`,
-  `crates/ane-miner/src/worker.rs:165`
-  through `worker.rs:187`, starts a watchdog thread, and reads the job off
+  `crates/ane-miner/src/worker.rs:169`
+  through `worker.rs:196`, starts a watchdog thread, and reads the job off
   standard input before it calls `solve_in_process` at all. None of this
   runs inside `stats.setup_us`, and none of it resembles the single small C
   binary the probe's 11.838 ms process-spawn estimate covers. This report
   does not measure the worker spawn and inter-process communication path, so
   it does not assign the remaining 167.739 ms to it. A later task should
   time `WorkerProcess::spawn` through the first byte `solve_in_process`
-  reads, directly, if full accounting matters.
+  reads, directly, if full accounting matters. Task 8 does this. See
+  Worker path below.
+
+## Worker path
+
+Task 7 named the out-of-process worker path as the largest cost outside
+`stats.setup_us`, and left it unmeasured. This section measures it. The
+pure wrapper, the file and process machinery around the real job, adds
+19.082 ms to a job's fixed setup. Most of the earlier gap turns out to sit
+inside the child's own compute, which the wrapper counters cannot see, and
+inside two file-and-line-named spots this section bounds but does not
+directly instrument. The redone total still misses the 508.162 ms budget,
+by 110.069 ms, 21.7% of budget, over the 15% check in the task brief. See
+Gap accounting below for both ways to compute this, and why they differ.
+
+### Harness cost, bounded
+
+`--solve` reads its whole problem from standard input before any worker
+spawns. Production takes jobs over the coordinator protocol and never pays
+that read. Five runs each, one at a time with a 3-second sleep, of the
+release binary's `--solve` mode, first on the real topology at 2 sweeps,
+matching `BLOCK_SWEEPS`, then on the two-node problem in
+`crates/ane-miner/README.md:74`:
+
+| Input | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Real topology, 2 sweeps, seconds | 1.02 | 0.52 | 0.52 | 0.51 | 0.54 | 0.52 |
+| Two-node problem, seconds | 0.22 | 0.22 | 0.21 | 0.21 | 0.22 | 0.22 |
+
+The difference is 0.30 s. It bounds, but does not equal, the cost of the
+813 KB standard input read production never pays. The same 0.30 s also
+holds a bigger graph preparation step, a bigger inter-process reply, and
+the real compile against the full topology instead of a two-node graph.
+Do not read 0.30 s as the parse cost alone. Run 1 of the real-topology row
+shows the same cold-start pattern every prior section in this document
+finds in a first run. The median absorbs it.
+
+### Method
+
+`crates/ane-miner/src/process.rs` now times six stages around
+`WorkerProcess::spawn` and `WorkerProcess::wait`: directory and file
+creation, the request write, `Command::spawn`, the wait for the child to
+exit, the reply read, and teardown. These are new `Instant` calls around
+work the function already does, in the same order. No call moved, and no
+branch changed. `wait` logs the six counters through one
+`tracing::debug!` call once teardown finishes.
+
+`crates/ane-miner/src/worker.rs` and `crates/ane-miner/src/bin/quip_ane_msa.rs`
+add a seventh counter for the child's own startup. `main` now captures an
+`Instant` before it parses arguments, and `worker_main` prints the elapsed
+time as its first line, to standard error, which the parent inherits. This
+times `dyld` loading the binary's own libraries and the runtime reaching
+`worker_main`, a cost the process that spawned the child cannot see from
+its own side. It does not reach earlier than `main`, so it excludes
+whatever `dyld` does before any Rust code runs. This section does not
+measure that part, and it does not estimate it.
+
+Five runs, one at a time with a 3-second sleep, of a real `--ane-worker`
+job holding production's own request shape: the topology in
+`tests/fixtures/advantage2-system1.edges`, couplings in {-1, 1} from a
+seeded xorshift64 generator with seed 7, zero fields, 128 reads, solved
+with seed 123, 2 sweeps. This is the same topology and coupling seed
+Task 7's Rust-side harness uses, run through `WorkerProcess::spawn` and
+`WorkerProcess::wait` directly against the real worker binary, the same
+pattern `hardware_rust_setup_stage_medians_advantage2_system1` set. The
+new test, `hardware_worker_path_stage_medians_advantage2_system1` in
+`crates/ane-miner/src/process.rs`, is `#[ignore = "requires integrated
+Apple Silicon ANE worker binary"]` like the file's other hardware tests.
+It also prints the reply's `RunStats` fields, so this section can compare
+its own counters against Tasks 1 and 7 without a second device run.
+
+No shared device guard exists in this repository or in `/tmp`, the same
+gap every prior section in this document finds. The five runs below ran
+one at a time, with a 3-second sleep between runs, in place of a guard.
+
+Command, run five times:
+
+```bash
+cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --release \
+  --lib hardware_worker_path_stage_medians_advantage2_system1 \
+  -- --ignored --nocapture --exact \
+  process::tests::hardware_worker_path_stage_medians_advantage2_system1
+```
+
+### Stage table
+
+All values are milliseconds, converted from the microseconds the counters
+record.
+
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| directory_setup_us | 0.705 | 0.261 | 0.240 | 0.345 | 0.268 | 0.268 |
+| request_write_us | 4.933 | 2.104 | 2.189 | 2.174 | 2.306 | 2.189 |
+| spawn_us | 1.416 | 0.331 | 0.313 | 0.327 | 0.308 | 0.327 |
+| wait_us | 634.613 | 372.733 | 378.740 | 392.353 | 364.025 | 378.740 |
+| reply_read_us | 15.208 | 15.949 | 16.213 | 15.926 | 15.565 | 15.926 |
+| teardown_us | 0.326 | 0.366 | 0.398 | 0.423 | 0.372 | 0.372 |
+| child_startup_us | 0.858 | 0.062 | 0.064 | 0.061 | 0.065 | 0.064 |
+| **Full run total, spawn to reply consumed** | 657.201 | 391.744 | 398.093 | 411.548 | 382.844 | **398.093** |
+
+The full run total row adds `directory_setup_us`, `request_write_us`, and
+`spawn_us`, timed before `wait_us` starts, to `wait_us` itself, then to
+`reply_read_us` and `teardown_us`, timed after `wait_us` ends. It excludes
+`child_startup_us`: that counter times a span inside `wait_us`, on the
+child's side, so adding it on top of `wait_us` would count part of the
+child's own startup twice. The bold median, 398.093 ms, is the median of
+the five per-run totals, the same convention Task 1's stage table sets.
+Summing the six per-stage medians instead, excluding `child_startup_us`
+for the reason just given, gives 397.822 ms, close enough to support
+either figure. This report uses 398.093 ms for the rest of Gap accounting.
+Summing `directory_setup_us`, `request_write_us`, `spawn_us`,
+`reply_read_us`, and `teardown_us` alone, the parts of a job outside
+`wait_us`, gives a wrapper cost of 19.082 ms. Run 1 shows the same
+cold-start pattern as every earlier stage table in this document. The
+median absorbs it.
+
+The same five runs also carried `RunStats` in their reply, the same
+fields Task 7's harness measures, confirming this section's job matches
+Task 7's fixed-cost stages regardless of sweep count:
+
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| setup_us | 372.037 | 342.903 | 346.355 | 357.544 | 333.469 | 346.355 |
+| staging_us | 0.653 | 0.679 | 0.645 | 0.613 | 0.609 | 0.645 |
+| dispatch_us | 2.516 | 2.593 | 2.756 | 2.660 | 2.500 | 2.593 |
+| anneal_us | 6.619 | 6.709 | 6.836 | 6.705 | 6.481 | 6.705 |
+
+`setup_us` does not depend on sweep count. Validation, graph preparation,
+schedule construction, initial spins, compile, and reset all run before
+the first dispatch. Its median here, 346.355 ms, is within 1.7% of Task
+7's own 340.423 ms median from a 512-sweep job on the same topology and
+seed. This cross-check supports both measurements.
+
+### Gap accounting
+
+The task brief's instruction is to add the worker-path total to the
+309.462 ms native sum and the 5.647 ms Rust sum, then check the result
+against the 508.162 ms budget. Read literally, "worker-path total" is the
+preceding 19.082 ms wrapper figure, since the native and Rust sums already
+cover the child's compile and setup.
+
+| Quantity | Value, ms |
+| --- | ---: |
+| Native stage sum (Task 1) | 309.462 |
+| Rust setup sum (Task 7) | 5.647 |
+| Worker-path wrapper (this task) | 19.082 |
+| New total | 334.191 |
+| Budget for measured stages | 508.162 |
+| Gap | 173.971 |
+| Gap as a share of budget | 34.2% |
+
+This does not close to within 15%, and the gap is worse than Task 7's own
+33.0% or 38.1% figures. That is a warning sign, not an improvement:
+309.462 plus 5.647 is a proxy for the child's setup cost, built from an
+independent C probe and a set of Rust counters. This section's own job
+carries the real `setup_us`, 346.355 ms, directly in the same reply. The
+proxy falls short of the real figure by about 31 ms, the same
+`AneProgram::compile` internal cost Task 7 already named at
+`crates/ane-miner/src/native.rs:89` through `native.rs:106` and
+`native.rs:137` through `native.rs:145`. Adding a wrapper on top of an
+already-short proxy widens the gap instead of closing it.
+
+A figure that avoids this proxy is the full run total from the preceding
+Stage table, 398.093 ms, the real, directly measured median cost of one
+job from `WorkerProcess::spawn` to the parent consuming the reply.
+Subtracting the 309.462 ms native sum and the 5.647 ms Rust sum from that
+figure gives a worker-path total of 82.984 ms that does not double-count
+the child's compute.
+
+| Quantity | Value, ms |
+| --- | ---: |
+| Native stage sum (Task 1) | 309.462 |
+| Rust setup sum (Task 7) | 5.647 |
+| Worker-path total, reconciled against the direct 398.093 ms figure | 82.984 |
+| New total | 398.093 |
+| Budget for measured stages | 508.162 |
+| Gap | 110.069 |
+| Gap as a share of budget | 21.7% |
+
+Trust this second table over the first. It uses one direct, self-consistent
+measurement instead of summing two methods with a known 31 ms disagreement
+between them. Either way, the gap stays open past the 15% check, though it
+has narrowed from Task 7's 33.0% best figure to 21.7%.
+
+Two spots hold part of the remaining 110.069 ms, named here rather than
+estimated by assertion. This section did not instrument either one
+directly. It bounds both together with one arithmetic check. Add
+`child_startup_us` (0.064 ms), `setup_us` (346.355 ms), and `anneal_us`
+(6.705 ms), the child's own compute Tasks 1, 7, and this section's own
+`RunStats` figures already name, and subtract that sum from `wait_us`'s
+median. 378.740 minus 353.124 leaves 25.616 ms this section cannot
+assign to one place:
+
+- `read_message(std::io::stdin().lock())`, `crates/ane-miner/src/worker.rs:190`,
+  deserializes the request the parent already spent 2.189 ms writing.
+  Deserializing costs more than writing raw bytes. `serde_json` walks and
+  allocates for every field.
+- `program.close()`, `crates/ane-miner/src/solver.rs:129`, releases the
+  compiled ANE program and its input and output surfaces. It runs after
+  `anneal_us` stops timing, so no counter in this document covers it.
+- `write_message(std::io::stdout().lock(), &reply)`,
+  `crates/ane-miner/src/worker.rs:212`, serializes and writes the reply,
+  128 reads across 4,577 nodes as a spin array, before the parent's own
+  `reply_read_us` timer starts on its side of the same file.
+
+The remaining 84.453 ms, 110.069 minus 25.616, sits outside the span this
+section measures altogether: parent process startup before
+`WorkerProcess::spawn` runs, and, for jobs sampled rather than checked,
+the parent's own consensus scoring after the reply returns,
+`crates/ane-miner/src/process.rs:337` through `process.rs:357`. Neither
+received a counter in this task. A later task should time both if full
+accounting matters.
+
+### Persistent worker
+
+A persistent worker would keep one child process alive across jobs
+instead of spawning one per job. It would remove the four counters this
+section ties to process lifecycle rather than to message content:
+`directory_setup_us` (0.268 ms), `spawn_us` (0.327 ms), `child_startup_us`
+(0.064 ms), and `teardown_us` (0.372 ms), for a sum of 1.031 ms per job.
+`request_write_us` and `reply_read_us` stay, since they time message
+serialization, not process creation, and a persistent worker still has to
+serialize and deserialize each job's request and reply.
+
+1.031 ms is small next to the 520 ms fixed-setup budget. A persistent
+worker only pays off if the child can also skip recompiling the ANE
+program for each job. Task 4's plan is to swap in new weights on one
+compiled program instead of recompiling it, but Task 4 has not run, and
+this section does not know whether that weight swap works. If it does, a
+persistent worker would also remove the 283.887 ms `compile_ms` median
+from Task 1's stage table, for a combined saving of 284.918 ms per job. If
+it does not, the saving stays at 1.031 ms. State which figure you use, and
+why, alongside Task 4's result.
 
 ## Platform
 
@@ -369,3 +601,16 @@ The bit-exactness check's receipts are
 `--solve`, `solve-before.json` and `solve-after.json`, its output before and
 after this task's change, and `quip-ane-msa-before` and `quip-ane-msa-after`,
 the two compiled binaries.
+
+The Worker path section's receipts are
+`/tmp/quip-ane-throughput-0917/worker-path-real-run1.log` through
+`worker-path-real-run5.log`, each the full output of one `cargo test`
+invocation, and, for the Harness cost subsection,
+`/tmp/quip-ane-throughput-0917/solve-input-real-2sweeps.json` and
+`solve-input-two-node.json`, the two problems sent to `--solve`, with
+`solve-real-2sweeps-run1.json` through `run5.json`, `solve-two-node-run1.json`
+through `run5.json`, and their matching `.time` files. Its bit-exactness
+check reused the same `solve-input.json`, with
+`quip-ane-msa-task8-before` and `quip-ane-msa-task8-after` as the two
+compiled binaries and `solve-task8-before.json` and `solve-task8-after.json`
+as their output.
