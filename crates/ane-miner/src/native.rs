@@ -7,7 +7,7 @@ use crate::graph::{PreparedGraph, LANES};
 use crate::AneError;
 
 const ERROR_BYTES: usize = 1024;
-pub(crate) const BLOCK_SWEEPS: usize = 2;
+pub(crate) const BLOCK_SWEEPS: usize = 1;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]

@@ -768,3 +768,106 @@ check reused the same `solve-input.json`, with
 `quip-ane-msa-task8-before` and `quip-ane-msa-task8-after` as the two
 compiled binaries and `solve-task8-before.json` and `solve-task8-after.json`
 as their output.
+
+## Sweeps per dispatch
+
+Task 2 found the Apple Neural Engine (ANE) behaves like one time-divided
+resource, with only a modest gain from concurrent dispatch. That verdict
+leaves fewer and larger dispatches as the main remaining lever this plan had
+not yet tested against the per-sweep cost. This task raised
+`BLOCK_SWEEPS`, `crates/ane-miner/src/native.rs:10`, through every value
+`compile_raw` accepts, 1 through 8, and measured `--solve` wall time at 512,
+2,048, and 8,192 sweeps for each one, real topology, coupling seed 7, solve
+seed 123.
+
+**`BLOCK_SWEEPS` of 1 wins at both ends of the 2,048 to 8,192 mining sweep
+budget.** Raising the value past 1 does not lower the per-sweep cost. It
+only raises fixed setup, because compile time grows close to linearly with
+the value while the weight blob stays the same size. This is not the win the
+task brief expected: batching more sweeps into one dispatch does not pay for
+itself on this host. `BLOCK_SWEEPS` changes from 2 to 1 in this task's
+commit.
+
+### Stage table
+
+All values are milliseconds except `mil_bytes` and `blob_bytes`, exact byte
+counts, deterministic across runs. `compile_ms` is the median of three runs
+of a probe built from the same file Task 1 used,
+`crates/ane-miner/probes/setup_profile.m`, with its `kSweeps` constant set
+to the value under test. `T512`, `T2048`, and `T8192` are the median
+`--solve` wall time against four runs at 512 and 2,048 sweeps and three to
+five runs at 8,192 sweeps. `Fixed` and `Per-sweep` come from a line fit
+through the `T512` and `T2048` points, per the task brief's Step 3.
+`Fit T8192` is that line's value at 8,192 sweeps. `T8192` is the direct
+measurement. The two agree within about 1.5% at every value, which supports
+the fit.
+
+| BLOCK_SWEEPS | compile_ms | mil_bytes | blob_bytes | Fixed, ms | Per-sweep, ms | T512, ms | T2048, ms | Fit T8192, ms | T8192, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 155.016 | 46,938 | 43,352,640 | 390.0 | 1.1523 | 980.0 | 2,750.0 | 9,830.0 | 9,680.0 |
+| 2 | 277.644 | 70,717 | 43,352,640 | 531.7 | 1.1393 | 1,115.0 | 2,865.0 | 9,865.0 | 10,000.0 |
+| 4 | 531.859 | 118,275 | 43,352,640 | 871.7 | 1.1589 | 1,465.0 | 3,245.0 | 10,365.0 | 10,355.0 |
+| 8 | 1,042.970 | 213,391 | 43,352,640 | 1,498.3 | 1.0970 | 2,060.0 | 3,745.0 | 10,485.0 | 10,490.0 |
+
+`blob_bytes` holds constant across every value. This confirms the task
+brief's prediction: the same tile matrices serve every sweep, so the weight
+blob does not grow. `compile_ms` does not track it. `compile_ms` tracks
+`mil_bytes` instead, and grows faster than `mil_bytes` does. From
+`BLOCK_SWEEPS` 1 to 8, `mil_bytes` grows 4.5 times while `compile_ms` grows
+6.7 times. Doubling `BLOCK_SWEEPS` close to doubles `compile_ms` at every
+step, factors of 1.79, 1.92, and 1.96 for 1 to 2, 2 to 4, and 4 to 8, closer
+to linear in the sweep count than in the Model Intermediate Language (MIL)
+byte count. This matches the task brief's prediction that MIL text, and so
+compile time, grows close to linearly in `BLOCK_SWEEPS`.
+
+The per-sweep slope does not fall as `BLOCK_SWEEPS` rises. All four values
+hold inside a narrow band, 1.0970 to 1.1589 ms per sweep, with no trend
+toward the round-trip savings the task brief expected. A second slope
+estimate, fit through the `T2048` and `T8192` points instead of `T512` and
+`T2048`, gives 1.128, 1.161, 1.157, and 1.098 ms per sweep for `BLOCK_SWEEPS`
+1, 2, 4, and 8, the same narrow band from an independent pair of points.
+Fewer dispatches does not measurably lower the real per-sweep cost on this
+host. Only the fixed cost changes, and it rises with `BLOCK_SWEEPS` instead
+of falling.
+
+### Totals
+
+| BLOCK_SWEEPS | Total at 2,048 sweeps, ms | Total at 8,192 sweeps, ms |
+| --- | ---: | ---: |
+| 1 | 2,750.0 | 9,680.0 |
+| 2 | 2,865.0 | 10,000.0 |
+| 4 | 3,245.0 | 10,355.0 |
+| 8 | 3,745.0 | 10,490.0 |
+
+`BLOCK_SWEEPS` of 1 has the lowest total at both ends of the mining sweep
+budget. The gap to `BLOCK_SWEEPS` of 2 is 115 ms (4.0%) at 2,048 sweeps and
+320 ms (3.2%) at 8,192 sweeps. `BLOCK_SWEEPS` of 4 and 8 trail both values at
+every sweep count tested. No crossover exists inside the 2,048 to 8,192
+budget: the ranking 1 < 2 < 4 < 8 holds at every sweep count this task
+measured, so this task does not need to report a crossover point.
+
+### Bit-exactness
+
+Every value produced identical output for the same seed. This task diffed
+`--solve` output for `BLOCK_SWEEPS` 1, 4, and 8 against `BLOCK_SWEEPS` 2 at
+512, 2,048, and 8,192 sweeps, exact multiples of every value tested, and at
+517 sweeps, a count that leaves a partial tail block for every value except
+1. `jq -S` found no difference in any comparison. `block.fill(255)`,
+`crates/ane-miner/src/solver.rs:111`, fills the tail slots the last dispatch
+does not use with a threshold that disables every flip, so a partial tail
+does not change the result at any `BLOCK_SWEEPS` value.
+
+### Noise on this host
+
+Three of the 44 timed `--solve` runs showed a wall-clock spike with no
+matching change in output: one `BLOCK_SWEEPS` 2 run at 2,048 sweeps took
+4.40 s against a 2.865 s median, and two `BLOCK_SWEEPS` 2 runs at 8,192
+sweeps took 15.47 s and 12.92 s against a 10.00 s median. All three produced
+output identical to the fast runs at the same sweep count and value. This
+task treats them as noise on an unguarded host, not a correctness problem,
+and used the median rather than the mean at every sweep count to absorb
+them. No other value showed a comparable spike, and this task found no other
+sign of a second program competing for the engine.
+
+Full method, per-run receipts, and exact commands are in
+`.superpowers/sdd/2026-09-17-ane-throughput/task-5-report.md`.

@@ -647,9 +647,11 @@ mod tests {
     fn response_states_and_dispatch_receipts_are_validated() {
         use crate::solver::RunStats;
         let graph = IsingGraph::new(vec![0.0, 1.0], vec![1.0], vec![(0, 1)]);
+        // num_sweeps is 1 so the correct dispatch count is 1 no matter what
+        // BLOCK_SWEEPS is: div_ceil(1, n) is 1 for every n from 1 through 8.
         let params = SampleParams {
             num_reads: 1,
-            num_sweeps: 3,
+            num_sweeps: 1,
             ..SampleParams::default()
         };
         for spins in [
@@ -662,13 +664,13 @@ mod tests {
                 spins,
                 stats: RunStats {
                     programs: 1,
-                    dispatches: 2,
+                    dispatches: 1,
                     ..RunStats::default()
                 },
             };
             assert_fault(validate_output(&output, &graph, &params, 1));
         }
-        for (programs, dispatches) in [(0, 0), (1, 1), (1, 3), (2, 2)] {
+        for (programs, dispatches) in [(0, 0), (1, 0), (1, 2), (2, 1)] {
             let output = RunOutput {
                 spins: vec![vec![1, -1]],
                 stats: RunStats {
@@ -683,7 +685,7 @@ mod tests {
             spins: vec![vec![1, -1]],
             stats: RunStats {
                 programs: 1,
-                dispatches: 2,
+                dispatches: 1,
                 ..RunStats::default()
             },
         };
@@ -703,14 +705,16 @@ mod tests {
 
     #[test]
     fn parent_scores_valid_states_with_original_graph() {
-        let (_fixture, path) = script("printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[1,-1]],\"stats\":{\"programs\":1,\"dispatches\":2,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"");
+        // num_sweeps is 1 so the correct dispatch count is 1 no matter what
+        // BLOCK_SWEEPS is: div_ceil(1, n) is 1 for every n from 1 through 8.
+        let (_fixture, path) = script("printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[1,-1]],\"stats\":{\"programs\":1,\"dispatches\":1,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"");
         let sampler = AneSampler {
             executable: path,
             access: Mutex::new(()),
         };
         let graph = IsingGraph::new(vec![1.0, -1.0], vec![1.0], vec![(0, 1)]);
         let params = SampleParams {
-            num_sweeps: 3,
+            num_sweeps: 1,
             ..SampleParams::default()
         };
         assert_eq!(
