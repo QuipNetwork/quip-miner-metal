@@ -557,9 +557,9 @@ median. 378.740 minus 353.124 leaves 25.616 ms this section cannot
 assign to one place:
 
 - The child's own `execve` and `dyld` startup, before `main` runs and
-  before `child_arg_parse_us`'s own window starts. See Method above for
-  why `child_arg_parse_us` does not cover this. This section does not
-  measure it, but bounds it: run five times, one at a time with a
+  before `child_arg_parse_us`'s own window starts. See the preceding
+  Method section for why `child_arg_parse_us` does not cover this cost.
+  This section does not measure it, but bounds it: run five times, one at a time with a
   3-second sleep, `--capabilities` is a complete process lifetime that
   includes `execve`, `dyld`, argument parsing, and exit, with no device
   and no worker child. The team lead measured it directly and reports
@@ -580,10 +580,11 @@ assign to one place:
   128 reads across 4,577 nodes as a spin array, before the parent's own
   `reply_read_us` timer starts on its side of the same file.
 
-The 10 ms poll interval in `wait_inner`'s loop, named in Method above,
-also inflates this same 25.616 ms bucket, by up to 10 ms and about 5 ms on
-average. It is not a fifth occupant so much as noise on top of the four
-above, since it does not correspond to any real work on the child's side.
+The 10 ms poll interval in `wait_inner`'s loop, named in the preceding
+Method section, also inflates this same 25.616 ms bucket, by up to 10 ms
+and, on average, about 5 ms. This is not a fifth occupant so much as
+noise on top of the four preceding spots, since it does not correspond to
+any real work on the child's side.
 
 The remaining 84.453 ms, 110.069 minus 25.616, sits outside the span this
 section measures altogether: parent process startup before
@@ -606,9 +607,10 @@ serialize and deserialize each job's request and reply.
 
 That 1.031 ms understates the process-lifecycle saving, because
 `child_arg_parse_us` does not cover the child's `execve` and `dyld`
-startup, per Method above. A persistent worker would also remove that
-cost, bounded above at roughly 10 ms warm by the same `--capabilities`
-measurement Gap accounting cites. The fuller process-lifecycle saving is
+startup, per the preceding Method section. A persistent worker would
+also remove that cost, bounded above at roughly 10 ms warm by the same
+`--capabilities` measurement Gap accounting cites. The fuller
+process-lifecycle saving is
 1.031 ms plus up to about 10 ms, not 1.031 ms alone.
 
 Even the fuller figure is small next to the 520 ms fixed-setup budget.
