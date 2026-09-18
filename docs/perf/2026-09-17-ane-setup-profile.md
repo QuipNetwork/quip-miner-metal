@@ -316,8 +316,8 @@ Adding all five new counters, not only the two the brief names, changes the
 sum little. 309.462 plus 5.647 ms, the sum of all five medians, is 315.109
 ms. That is a 193.053 ms gap, 38.0% of budget. `validate_us`, `schedule_us`,
 and `initial_spins_us` are small next to `graph_prep_us` and `reset_us`, as
-the brief predicted, though `validate_us` never resolved above the
-counter's 1 µs floor, so its 0.000 ms median means below 1 µs, not zero.
+the brief predicted, though `validate_us` never exceeded the counter's
+1 µs floor, so its 0.000 ms median means below 1 µs, not zero.
 
 A third figure uses the `setup_us` median directly, 340.423 ms, instead of
 summing figures from two different processes and cache states, the probe
