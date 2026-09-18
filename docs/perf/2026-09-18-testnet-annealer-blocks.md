@@ -14,8 +14,10 @@ sweeps reaches a lower energy than the annealer's winning proof on 60 of 60,
 by a median of 30,000 milli (0.2%) at 64 reads and 42,000 at 256 reads and
 65,536 sweeps. It produces a valid proof on 97% of jobs at 64 reads and 100%
 at 128, and the same on 60 matched classical-won blocks from the same era.
-Every one of those blocks is reachable, so the annealer's wins say nothing
-about which blocks are hard for this solver.
+Every one of those blocks is reachable. The annealer's winning energies do
+say which blocks are deep for this solver: they rank the blocks by the
+solver's own energy at Spearman +0.74 to +0.77. `2026-09-18-qpu-screen.md`
+takes that finding to the screening question.
 
 | Cohort | Reads | Jobs | P(valid) | P(beats winner) | Median best energy, milli | Mean gap to winner, milli | Mean winner margin, milli | Valid on 5/5 | Valid on 0/5 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -29,11 +31,11 @@ negative gap is a lower energy than the winner. Winner margin is the target
 minus the winning energy. Each cell is 300 jobs: 60 blocks, five seeds.
 
 The chain stores only the winner's energy and a self-reported time, so it
-cannot say whether an annealer's samples would sort nonces by reachability.
-What the data on hand can say is what a filter has to beat: the first
-quarter of the solver's own anneal already predicts the outcome, and
-abandoning the poor jobs there yields 1.29 times the valid proofs per unit
-of compute at 64 reads on the recent 60 blocks.
+cannot say how an annealer's samples sort the nonces it did not win. What
+the data on hand can say is what a filter has to beat: the first quarter of
+the solver's own anneal already predicts the outcome, and abandoning the
+poor jobs there yields 1.29 times the valid proofs per unit of compute at
+64 reads on the recent 60 blocks.
 
 ## The annealer on the chain
 
@@ -70,13 +72,20 @@ failed on the miner's 65,536-sweep cap.
 
 ## What the chain can say about a filter
 
-A filter needs blocks the solver reaches and blocks it does not, and the
-annealer's era has none of the second kind. No block of the 120 was
-invalid on every seed, and 116 of 120 were valid on every seed. On the
-annealer-won blocks at 64 reads the winner's margin below target has a
+A filter on validity needs blocks the solver reaches and blocks it does
+not, and the annealer's era has none of the second kind. No block of the
+120 was invalid on every seed, and 116 of 120 were valid on every seed. On
+the annealer-won blocks at 64 reads the winner's margin below target has a
 weak rank correlation with the solver's valid fraction, Spearman +0.29,
 with the four blocks that missed a seed all below the median margin. The
 control blocks have nothing to correlate, since every seed was valid.
+
+A filter on energy is testable here, and the signal is strong. The
+annealer's winning energy ranks the 60 blocks by the solver's best energy
+at Spearman +0.77 at 64 reads and 16,384 sweeps, +0.74 at 128 reads and
++0.76 at 256 reads and 65,536 sweeps. `scripts/testnet/annealer/predict.py`
+computes it. `2026-09-18-qpu-screen.md` sizes the effect and compares it
+with the solver's own energy after a few sweeps as a screen.
 
 The recent 60 blocks, where the solver reaches 0.40 to 0.54 of its jobs,
 are where a filter would matter, and no annealer sample exists for them.

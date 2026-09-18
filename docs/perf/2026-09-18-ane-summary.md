@@ -143,10 +143,18 @@ ran on the GPU. `2026-09-18-testnet-sweeps-study.md` and
 One account mined the testnet with a quantum annealer and stopped winning
 at qblock 1,308, when the target passed its best energy. The Metal solver
 beats its winning proofs on 60 of 60 by a median 30,000 milli, and every
-block of that era is reachable, so those blocks cannot test a filter. The
-solver's own quarter-budget energy predicts its outcome on the recent
-blocks and abandoning the poor jobs there yields up to 1.29 times the
-valid proofs per unit of compute. `2026-09-18-testnet-annealer-blocks.md`.
+block of that era is reachable. The annealer's winning energy ranks those
+blocks by the solver's energy at Spearman +0.74 to +0.77.
+`2026-09-18-testnet-annealer-blocks.md`.
+
+On 800 fresh nonces the solver at 64 reads and 16,384 sweeps lands 4.7
+standard deviations short of today's target, none valid, and the instance
+sets 98% of a job's energy. A 1,024-sweep probe ranks fresh nonces at
+Spearman +0.95, and keeping the deepest 1 in 8 by probe holds 38 of the 40
+deepest, worth about 3.7 times the valid proofs per second on one M4 Max.
+An annealer at the chain's schedule screens a quarter to a third as many
+nonces per second as that probe, so it pays only with a much faster call
+or a stronger signal than +0.95. `2026-09-18-qpu-screen.md`.
 
 The testnet mines zero-field problems on the Advantage2 graph with one
 read below target as a valid proof. Winners self-report 1.0 to 3.9 s of
