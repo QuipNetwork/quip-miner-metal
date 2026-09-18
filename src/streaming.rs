@@ -105,12 +105,14 @@ const MSA_TG_PER_CORE: f64 = 1.0;
 
 /// Nominal reads used to size [`stream_width`] before any job has arrived:
 /// each kernel's adapt envelope `min_reads`, the smallest count the adapt
-/// path issues (`METAL_ADAPT` for SA and Gibbs, `METAL_MSA_ADAPT` for MSA).
+/// path issues. Read from the envelopes themselves so the width follows a
+/// change to them.
 fn nominal_reads(kernel: Kernel) -> usize {
-    match kernel {
-        Kernel::Sa | Kernel::Gibbs => 64,
-        Kernel::Msa => 128,
-    }
+    let bounds = match kernel {
+        Kernel::Sa | Kernel::Gibbs => crate::METAL_ADAPT,
+        Kernel::Msa => crate::METAL_MSA_ADAPT,
+    };
+    bounds.min_reads as usize
 }
 
 /// Threadgroups this dispatch aims to have in flight.
@@ -1102,13 +1104,23 @@ mod tests {
     #[test]
     fn declared_width_uses_each_kernels_nominal_reads() {
         // The width is sized before any job arrives, from the smallest read
-        // count the adapt envelope issues: 64 for SA and Gibbs, 128 for MSA.
-        assert_eq!(nominal_reads(Kernel::Sa), 64);
-        assert_eq!(nominal_reads(Kernel::Gibbs), 64);
-        assert_eq!(nominal_reads(Kernel::Msa), 128);
+        // count the adapt envelope issues, so it follows the envelope.
+        assert_eq!(
+            nominal_reads(Kernel::Sa),
+            crate::METAL_ADAPT.min_reads as usize
+        );
+        assert_eq!(
+            nominal_reads(Kernel::Gibbs),
+            crate::METAL_ADAPT.min_reads as usize
+        );
+        assert_eq!(
+            nominal_reads(Kernel::Msa),
+            crate::METAL_MSA_ADAPT.min_reads as usize
+        );
+        assert_eq!(nominal_reads(Kernel::Msa), 64);
         assert_eq!(
             declared_stream_width(Kernel::Msa),
-            (batch_size_for_reads(Kernel::Msa, 128) * 2).max(1)
+            (batch_size_for_reads(Kernel::Msa, 64) * 2).max(1)
         );
     }
 

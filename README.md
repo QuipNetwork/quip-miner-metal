@@ -96,8 +96,12 @@ The 2026-09-15 runs used Apple M4 Max with 40 GPU cores and
 graph. The fixture has 4577 nodes, 41515 edges, and eight greedy classes.
 At one threadgroup per core, 40 jobs, 128 reads, and 16384 sweeps, the
 multi-spin kernel reached 7.27 jobs/s. The `quip-metal-sa` reference
-reached 1.02 jobs/s at 2048 sweeps and 256 reads. The multi-spin sweep range
-remains 4096 to 16384, with 128 reads. The occupancy curve uses safety 0.2.
+reached 1.02 jobs/s at 2048 sweeps and 256 reads. The occupancy curve uses
+safety 0.2. The multi-spin adapt envelope is 4096 to 14336 sweeps at 64
+reads, set by the 2026-09-18 testnet studies in `docs/perf/`. On 60
+regenerated qblocks, 64 reads at 14336 sweeps gives 1.67 times the valid
+proofs per second of 128 reads at 16384 sweeps. The chance per job is flat
+from 14336 to 16384 sweeps.
 Three rounds at 7392 sweeps covered 1, 2, 5, 10, and 40 jobs.
 Their largest `max_chunk_ms` was 261. The sweep-range runs peaked at 258 ms.
 See `tests/msa_bench.rs` for the commands to repeat each run.

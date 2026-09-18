@@ -226,13 +226,16 @@ and returns each job's credit after its committed chunk finishes.
   `batch_size_for_reads(Kernel::Msa, reads)` divides the budget by `words`.
 - **Identity.** `METAL_MSA_IDENTITY`: backend `metal`, algorithm `msa`,
   `max_nodes = MSA_MAX_NODES`, features `streaming` and `governor`. Adapt
-  envelope `4096..16384` sweeps, with `128` reads fixed at four words.
+  envelope `4096..14336` sweeps, with `64` reads fixed at two words.
   On the same fixture and machine, the 2026-09-15 reference reached 1.02
   jobs/s at 2048 sweeps and 256 reads, using its production T=6.
   The multi-spin kernel used T=1, safety 0.2, 40 jobs, and 128 reads.
   It reached 34.75, 21.94, 12.86, and 7.27 jobs/s at 2048, 4096, 8192, and
-  16384 sweeps. The largest tested count meets the reference, so
-  `max_sweeps = 16384` and `min_sweeps = 16384 / 4 = 4096`.
+  16384 sweeps, which set the first envelope at `4096..16384` sweeps and
+  128 reads. The 2026-09-18 testnet studies (`docs/perf/`) then measured
+  valid proofs per second on 60 regenerated qblocks and moved the envelope
+  to 64 reads at 14336 sweeps: 1.67 times the valid proofs per second of
+  the first envelope, with the chance per job flat from 14336 to 16384.
   The envelope chunks peaked at 258 ms. `MAX_SWEEPS = 65536` still bounds
   every accepted job.
 - **Binary.** `quip-metal-msa`, same CLI as `quip-metal-sa`.

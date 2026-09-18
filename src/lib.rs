@@ -92,36 +92,39 @@ const METAL_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adap
 
 /// Multi-spin adapt envelope.
 ///
-/// Reads are pinned to 128: four 32-lane words per problem, the count the
-/// CUDA port fixed for its shared-memory budget, kept here so the two `msa`
-/// miners answer the same job shape. `max_sweeps` is the largest measured S
-/// at which MSA jobs/s stays at or above SA jobs/s at 2048 sweeps / 256
-/// reads. `min_sweeps = max_sweeps / 4`. Every accepted job is still bounded
-/// by `sampler::MAX_SWEEPS`.
+/// Reads are pinned to 64: two 32-lane words per problem. Sweeps run from
+/// 4096 to 14336 with the difficulty. At the testnet's current target the
+/// difficulty saturates at 1.0, so a job is 64 reads at 14336 sweeps. Every
+/// accepted job is still bounded by `sampler::MAX_SWEEPS`.
 ///
-/// Measured 2026-09-15 on Apple M4 Max (40 GPU cores), using
-/// `tests/fixtures/advantage2-system1.edges`: 4577 nodes, 41515 edges, eight
-/// greedy colour classes. Each run used 40 jobs. SA at its production T=6,
-/// 2048 sweeps and 256 reads: 1.02 jobs/s. MSA at T=1, safety 0.2 and 128
-/// reads, mean best in milli:
+/// Measured 2026-09-18 on Apple M4 Max (40 GPU cores) against 60 Aglais
+/// testnet qblocks regenerated from their nonces, five seeds each, with the
+/// jobs/s of each shape from the batched bench
+/// (`docs/perf/2026-09-18-testnet-sweeps-study.md` and
+/// `docs/perf/2026-09-18-testnet-sweeps-intermediates.md`). Against the
+/// previous envelope of 128 reads at 16384 sweeps:
 ///
 /// ```text
-/// S        jobs/s   mean best
-/// 2048     34.75    -14804550
-/// 4096     21.94    -14818500
-/// 8192     12.86    -14826600
-/// 16384     7.27    -14832850
+/// reads  sweeps   jobs/s   P(valid)   valid/s   winner-beating/s   valid/s at min_solutions 5
+/// 128    16384     6.24      0.54      3.37       2.00               1.21
+/// 64     16384    12.19      0.40      4.92       2.48               1.38
+/// 64     14336    13.99      0.40      5.64       3.03               1.40
+/// 64      8192    22.49      0.23      5.17       2.17               0.67
+/// 64      4096    41.50      0.06      2.49       1.25               0.00
 /// ```
 ///
-/// The largest tested S meets the reference: 7.27 >= 1.02 jobs/s. Thus
-/// max_sweeps = 16384 and min_sweeps = 16384 / 4 = 4096. Envelope chunks
-/// peaked at 258 ms. `MAX_SWEEPS = 65536` still admits the advertised maximum.
+/// 64 reads at 14336 sweeps gives 1.67x the valid proofs per second of the
+/// old envelope (90% bootstrap interval 1.46 to 1.88), 1.51x the
+/// winner-beating proofs (1.23 to 1.82), and 1.40 against 1.21 proofs per
+/// second under the chain's default `min_solutions` of 5. P(valid) is flat
+/// from 14336 to 16384 sweeps. The floor stays at 4096: the chance per job
+/// collapses between 4096 and 2048 sweeps at that target.
 const METAL_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
     quip_solver_core::adapt::AdaptBounds {
         min_sweeps: 4096,
-        max_sweeps: 16384,
-        min_reads: 128,
-        max_reads: 128,
+        max_sweeps: 14336,
+        min_reads: 64,
+        max_reads: 64,
         reads_solution_min_factor: 0,
         reads_solution_max_factor: 0,
         reads_solution_floor_factor: 0,
@@ -191,7 +194,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 ///
 /// assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
 /// assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
-/// assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads, 128);
+/// assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads, 64);
 /// ```
 pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
@@ -537,6 +540,29 @@ mod tests {
         const {
             assert!(METAL_MSA_IDENTITY.adapt.min_sweeps <= METAL_MSA_IDENTITY.adapt.max_sweeps);
         }
+    }
+
+    #[test]
+    fn msa_envelope_resolves_to_the_measured_shape_at_the_testnet_target() {
+        use super::METAL_MSA_IDENTITY;
+        use quip_solver_core::adapt::adapt_params;
+        // Aglais qblock 3278: zero-field Advantage2 graph, target below the
+        // adapt model's hardest energy, so the difficulty saturates at 1.0 and
+        // the job is the envelope's maximum: the shape the sweeps study picked.
+        let job = adapt_params(
+            -14_624_068,
+            1,
+            4_577,
+            41_514,
+            &[0],
+            &METAL_MSA_IDENTITY.adapt,
+        );
+        assert_eq!(job.num_reads, 64);
+        assert_eq!(job.num_sweeps, 14_336);
+        // An easy target lands on the floor, still a whole number of words.
+        let easy = adapt_params(0, 1, 4_577, 41_514, &[0], &METAL_MSA_IDENTITY.adapt);
+        assert_eq!(easy.num_reads, 64);
+        assert_eq!(easy.num_sweeps, 4_096);
     }
 
     /// CLI defaults the pure resolver starts from in every case below.
