@@ -20,7 +20,7 @@ static const size_t kTiles = 8;
 static const size_t kChannels = 4608;
 // BLOCK_SWEEPS in crates/ane-miner/src/native.rs: every production compile
 // call, `--solve` included, builds the program with exactly this many sweeps.
-static const size_t kSweeps = 2;
+static const size_t kSweeps = 1;
 
 int main(void) {
     setbuf(stdout, NULL);
@@ -30,7 +30,7 @@ int main(void) {
     for (size_t i = 0; i < kTiles; ++i) sum += kLengths[i];
     if (sum != 4577) { fprintf(stderr, "tile length sum is %zu, expected 4577\n", sum); return 2; }
     if (kChannels != 4608) { fprintf(stderr, "channel count is %zu, expected 4608\n", kChannels); return 2; }
-    if (kSweeps + 2 != 4) { fprintf(stderr, "kSweeps changed; update the surfaces[4] array below\n"); return 2; }
+    if (kSweeps + 2 != 3) { fprintf(stderr, "kSweeps changed; update the surfaces[3] array below\n"); return 2; }
 
     @autoreleasepool {
     @try {
@@ -144,10 +144,10 @@ int main(void) {
         if (![owner removeDirectory:&error]) { fprintf(stderr, "staging directory removal failed: %s\n", error.description.UTF8String); return 2; }
 
         // surface_setup_ms: the sweeps+2 IOSurfaces quip_ane_create allocates
-        // and wraps, same count as the real create path (kSweeps == 2).
+        // and wraps, same count as the real create path (kSweeps == 1).
         size_t inputElements;
         if (!multiply(kChannels, 128, &inputElements)) { fprintf(stderr, "input element count overflow\n"); return 2; }
-        IOSurfaceRef surfaces[4] = {0}; // kSweeps + 2
+        IOSurfaceRef surfaces[3] = {0}; // kSweeps + 2
         NSMutableArray *wrappers = [NSMutableArray new];
         t0 = now();
         for (size_t i = 0; i < kSweeps + 2; ++i) {

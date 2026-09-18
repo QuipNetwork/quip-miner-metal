@@ -727,6 +727,37 @@ mod tests {
     }
 
     #[test]
+    fn parent_scores_valid_states_with_multiple_dispatches() {
+        // num_sweeps is 9, more than the largest BLOCK_SWEEPS this crate
+        // accepts (8), so this always exercises more than one dispatch,
+        // unlike the num_sweeps: 1 case above. The expected dispatch count
+        // is computed from the live constant, not hardcoded, so this test
+        // does not need updating if BLOCK_SWEEPS changes again.
+        let num_sweeps: usize = 9;
+        let dispatches = num_sweeps.div_ceil(crate::native::BLOCK_SWEEPS);
+        assert!(dispatches > 1, "test no longer exercises multiple dispatches");
+        let template = "printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[1,-1]],\"stats\":{\"programs\":1,\"dispatches\":DISPATCHES,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"";
+        let body = template.replace("DISPATCHES", &dispatches.to_string());
+        let (_fixture, path) = script(&body);
+        let sampler = AneSampler {
+            executable: path,
+            access: Mutex::new(()),
+        };
+        let graph = IsingGraph::new(vec![1.0, -1.0], vec![1.0], vec![(0, 1)]);
+        let params = SampleParams {
+            num_sweeps,
+            ..SampleParams::default()
+        };
+        assert_eq!(
+            sampler.sample(&graph, &params).unwrap(),
+            vec![SamplerResult {
+                spins: vec![1, -1],
+                energy_milli: 1000
+            }]
+        );
+    }
+
+    #[test]
     fn sample_job_rejects_invalid_child_spins() {
         let (_fixture, path) = script("printf '{\"pid\":%s,\"result\":{\"status\":\"solved\",\"output\":{\"spins\":[[0]],\"stats\":{\"programs\":1,\"dispatches\":2,\"setup_us\":0,\"staging_us\":0,\"dispatch_us\":0,\"anneal_us\":0}}}}' \"$$\"");
         let sampler = AneSampler {
@@ -929,9 +960,13 @@ mod tests {
     /// Same topology as Task 7's harness, `tests/fixtures/advantage2-system1.edges`,
     /// couplings in {-1, 1} from seed 7, zero fields, 128 reads, solved with
     /// seed 123. Sweeps is 2, not 512: the brief asks for the real topology
-    /// at 2 sweeps, matching `BLOCK_SWEEPS`, one dispatch. Run five times,
-    /// one process at a time with a 3-second sleep between runs, to collect
-    /// medians; not itself a benchmark.
+    /// at 2 sweeps, the value `BLOCK_SWEEPS` held when this test was
+    /// written, one dispatch at that value. `BLOCK_SWEEPS` has since
+    /// changed (Task 5); this fixture's own `num_sweeps: 2` is a literal,
+    /// independent of the constant, so the test still runs, but "one
+    /// dispatch" is no longer accurate at the constant's current value. Run
+    /// five times, one process at a time with a 3-second sleep between
+    /// runs, to collect medians; not itself a benchmark.
     #[test]
     #[ignore = "requires integrated Apple Silicon ANE worker binary"]
     fn hardware_worker_path_stage_medians_advantage2_system1() {
