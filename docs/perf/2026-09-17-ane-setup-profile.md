@@ -370,8 +370,7 @@ Gap accounting below for both ways to compute this, and why they differ.
 spawns. Production takes jobs over the coordinator protocol and never pays
 that read. Five runs each, one at a time with a 3-second sleep, of the
 release binary's `--solve` mode, first on the real topology at 2 sweeps,
-matching `BLOCK_SWEEPS`, then on the two-node problem in
-`crates/ane-miner/README.md:74`:
+then on the two-node problem in `crates/ane-miner/README.md:74`:
 
 | Input | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -929,3 +928,21 @@ sign of a second program competing for the engine.
 
 Full method, per-run receipts, and exact commands are in
 `.superpowers/sdd/2026-09-17-ane-throughput/task-5-report.md`.
+
+## Levers not taken
+
+This plan measured two further levers and did not act on either. Both are
+small, so this document records them here rather than as beads.
+
+Bulk weight-blob construction failed its own gate. Task 3's gate required
+`blob_build_ms` plus `blob_write_ms` to reach at least 50 ms before a bulk
+rewrite of `makeWeightBlob` was worth attempting. The measured sum is
+15.436 ms, 10.046 ms build plus 5.390 ms write, so a bulk rewrite can save
+at most 15 ms against this task's 520 ms fixed setup budget. Task 3 did not
+run.
+
+The dense weight blob is sparse. The blob spends 43,352,640 bytes and about
+21.68 million elements to carry 41,515 edges. This plan did not change the
+encoding, because the fixed setup cost this task targets sits in compile and
+build time, not in the blob's byte count, and a sparse encoding would first
+need its own compiler-compatibility check.

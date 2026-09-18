@@ -158,6 +158,8 @@ Advertised limits are:
 - logical reads 1 through 128
 - 65,536 sweeps
 
+At production shape, a second concurrent ANE worker raises measured throughput by about 17 percent over one worker, and a third or fourth worker adds almost nothing beyond that, because measurement never showed more than two programs dispatching at once.
+
 A complete graph on 21 variables has degree 20.
 The miner accepts that graph on the same degree-20 path.
 The miner rejects degree 21.
@@ -166,7 +168,7 @@ Coloring sorts by descending degree, then ascending index.
 The solver walks colors in order.
 Each color is an independent set.
 A color splits into tiles of at most 4,096 outputs.
-The static ANE graph applies all colors in order and repeats that sequence for two sweeps per dispatch.
+The static ANE graph applies all colors in order for one sweep per dispatch.
 State rows follow color order, with padding only after the last node.
 Each convolution output pads to the next 32-channel boundary.
 Static slices remove that padding before spin updates.
@@ -191,7 +193,7 @@ Node reordering preserves the original node and replica assignments for every ra
 ## Memory
 
 One program carries all dense FP16 tile matrices in one weight file.
-Each matrix is a separate aligned chunk, reused across the two sweeps.
+Each matrix is a separate aligned chunk, reused across dispatches.
 Each tile matrix may use at most 128 MiB.
 The largest four-tile shape is four matrices of 16,384 by 4,096.
 That raw dense FP16 payload is 512 MiB.
@@ -212,5 +214,27 @@ identity.
 Optimization closed as bead `quip-miner-metal-djn`. The dense path stays in
 production. Fused local routing measured 3.4 to 3.6 times slower than matched
 dense work. `docs/perf/2026-09-16-ane-local-routing.md` records that result.
+
+Compile serialization under concurrency is open as bead
+`quip-miner-metal-6jd`. Throughput under `evaluateWithQoS:` scales with
+concurrent processes, but compile sat outside the timed loop, so that gain
+is unproven for real mining, where every job compiles.
+
+Runtime-input couplings are open as bead `quip-miner-metal-yba`. Moving the
+couplings and the per-job threshold `h` out of the compiled weight blob and
+Model Intermediate Language (MIL) text into a runtime input is the only
+remaining way to remove the per-job compile cost.
+
+Four-coloring chunk balance is open as bead `quip-miner-metal-fjo`. This
+task appends the ANE-side argument, that the smallest color classes are too
+small to amortize a dispatch, to that bead's existing Metal-side numbers.
+
+A shared device guard is open as bead `quip-miner-metal-c7l`. No guard
+script exists in this repository or in `/tmp`, and every task in this plan
+substituted its own serialization for device access.
+
+The wall-clock assertion in `crates/ane-miner/src/process.rs:438` is open as
+bead `quip-miner-metal-erz`. The assertion is flaky by construction under
+parallel load.
 
 See `docs/validation.md` for host, hardware, capacity, lifetime, and protocol receipts.
