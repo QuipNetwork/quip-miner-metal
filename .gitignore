@@ -19,3 +19,6 @@
 .claude/
 .codex/
 CLAUDE.md
+
+# Python bytecode from the probe scripts
+__pycache__/

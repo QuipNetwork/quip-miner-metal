@@ -253,10 +253,20 @@ once, and compile throughput scales 1.145 times at two processes and 1.230
 times at four, matching the curve measured for `evaluateWithQoS:`.
 `docs/perf/2026-09-17-ane-compile-contention.md` records the measurement.
 
-Runtime-input couplings are open as bead `quip-miner-metal-yba`. Moving the
-couplings and the per-job threshold `h` out of the compiled weight blob and
-Model Intermediate Language (MIL) text into a runtime input is the only
-remaining way to remove the per-job compile cost.
+Runtime-input couplings closed as bead `quip-miner-metal-yba`, rejected on
+measurement. Moving the couplings and the per-job threshold `h` out of the
+compiled weight blob and Model Intermediate Language (MIL) text into runtime
+inputs works and gives the right answers, but it costs more than the compile
+it removes. The best variant runs a sweep in 1.752 ms against production's
+1.13 ms, so the trade turns negative after about 254 sweeps, and production
+jobs run 2,048 to 8,192. That variant also cannot fuse sweeps: two sweeps in
+one program cost about 700 ms rather than twice 1.752 ms. Every matmul
+variant measured slower than the convolution variant.
+`docs/perf/2026-09-18-ane-runtime-couplings.md` records the measurement.
+
+No route to removing the per-job compile cost remains open. The compile is
+also not the limit on running more workers, per
+`docs/perf/2026-09-17-ane-compile-contention.md`.
 
 Four-coloring chunk balance is open as bead `quip-miner-metal-fjo`. This
 task appends the ANE-side argument, that the smallest color classes are too
