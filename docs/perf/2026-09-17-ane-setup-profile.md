@@ -648,6 +648,13 @@ The unload-plus-reload time, 3.439 ms at the median, is far below
 `compile_ms`. That speed is moot: outcome 3 means the reload path produces
 the wrong (unchanged) result regardless of how fast it runs.
 
+A positive control removes the remaining doubt. A fresh compile using the
+negated weights, built through the real, unmodified `quip_ane_create` and
+independent of the preceding reload path, matches the host prediction for
+the negated weights. The device does honor negated couplings. The compiled
+program under test just does not pick them up on a weight-file overwrite
+and reload.
+
 Given outcome 3, the remaining option to remove the per-job compile is to
 make the couplings a runtime input rather than a compile-time constant.
 `docs/perf/2026-09-16-ane-local-routing.md` already measured one

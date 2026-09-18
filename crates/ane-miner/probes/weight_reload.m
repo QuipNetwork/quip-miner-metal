@@ -66,6 +66,20 @@ static BOOL matchesReplicated(const int8_t *actual, size_t channels, const int8_
     return YES;
 }
 
+// Simple 64-bit FNV-1a checksum, used only to prove the two weight blobs
+// this probe writes to disk are not the same bytes, and that each write
+// landed intact. Not a security hash; collisions are not a concern for
+// artifacts this small and this distinct.
+static uint64_t fnv1a64(const void *data, size_t length) {
+    const uint8_t *bytes = data;
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= bytes[i];
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
 // Deterministic pseudo-random +/-1 pattern, not a fixed alternation, so the
 // host check exercises real per-node flip/no-flip variation instead of one
 // uniform outcome across every node.
@@ -145,6 +159,17 @@ int main(void) {
             fprintf(stderr, "weight blob write failed: %s\n", error.description.UTF8String);
             return 2;
         }
+        // Prove the write landed where and as intended, not just that
+        // writeToFile: returned YES. Read the file back and hash it rather
+        // than trusting the in-memory NSData this probe already holds.
+        uint64_t hashA = fnv1a64(blobA.bytes, blobA.length);
+        NSData *onDiskA = [NSData dataWithContentsOfFile:weightPath];
+        if (onDiskA == nil || fnv1a64(onDiskA.bytes, onDiskA.length) != hashA) {
+            fprintf(stderr, "weight blob A readback does not match what this probe wrote\n");
+            return 2;
+        }
+        printf("blobA bytes=%llu fnv1a64=%016llx (readback confirmed)\n",
+            (unsigned long long)blobA.length, (unsigned long long)hashA);
 
         requireSelector(owner.model, @selector(compileWithQoS:options:error:));
         uint64_t t0 = now();
@@ -231,10 +256,25 @@ int main(void) {
         if (weightsB == NULL) { fprintf(stderr, "weightsB allocation failed\n"); return 2; }
         for (size_t i = 0; i < weightCount; ++i) weightsB[i] = (int8_t)(-weightsA[i]);
         NSData *blobB = makeWeightBlob(weightsB, kChannels, kLengths, kTiles, weightCount);
+        // The no-change result below only means something if blob B is
+        // provably not the same bytes as blob A. Check that before writing,
+        // not by inspecting makeWeightBlob's logic.
+        uint64_t hashB = fnv1a64(blobB.bytes, blobB.length);
+        if (hashB == hashA) {
+            fprintf(stderr, "weight blob B has the same checksum as blob A; negating the couplings produced identical bytes\n");
+            return 2;
+        }
         if (![blobB writeToFile:weightPath options:NSDataWritingAtomic error:&error]) {
             fprintf(stderr, "weight blob overwrite failed: %s\n", error.description.UTF8String);
             return 2;
         }
+        NSData *onDiskB = [NSData dataWithContentsOfFile:weightPath];
+        if (onDiskB == nil || fnv1a64(onDiskB.bytes, onDiskB.length) != hashB) {
+            fprintf(stderr, "weight blob B readback does not match what this probe wrote\n");
+            return 2;
+        }
+        printf("blobB bytes=%llu fnv1a64=%016llx (readback confirmed, differs from blobA's %016llx)\n",
+            (unsigned long long)blobB.length, (unsigned long long)hashB, (unsigned long long)hashA);
 
         t0 = now();
         BOOL unloadOK = [owner.model unloadWithQoS:21 error:&error];
@@ -303,11 +343,71 @@ int main(void) {
         printf("{\"unload_ms\":%.3f,\"reload_ms\":%.3f,\"compile_ms\":%.3f,\"compile_ms_baseline\":%.3f}\n",
             unload_ms, reload_ms, compile_ms, kCompileMsBaseline);
 
-        // Cleanup. quip_ane_destroy consumes the bridge retain and unloads.
-        // QuipAneProgram's dealloc (ane_bridge.m:110-129) removes the
-        // staging directory this probe deliberately kept; it fires once the
-        // `owner` local below drops its own last strong reference, which
-        // ARC does at the end of this scope.
+        // === Positive control: a fresh compile with the negated weights,
+        // built independently of the reload path above through the real,
+        // unmodified quip_ane_create export (not this probe's step-1
+        // scaffold). A pass here proves three things at once: expectedB is
+        // correct and achievable on this device, the device honours
+        // negated couplings at all, and this probe can detect a coupling
+        // change when the runtime really makes one. It does not depend on
+        // anything the reload path above measured.
+        void *controlProgram = NULL;
+        char controlError[1024];
+        if (quip_ane_create(kChannels, kLengths, kTiles, kSweeps, weightsB, weightCount,
+                fields, kChannels, &controlProgram, controlError, sizeof(controlError)) != 0) {
+            fprintf(stderr, "positive control: fresh compile with negated weights failed: %s\n", controlError);
+            printf("positive_control=FAILED reason=compile\n");
+            return 2;
+        }
+        if (quip_ane_reset(controlProgram, spinsFlat, inputElements, controlError, sizeof(controlError)) != 0) {
+            fprintf(stderr, "positive control: reset failed: %s\n", controlError);
+            printf("positive_control=FAILED reason=reset\n");
+            quip_ane_destroy(controlProgram, controlError, sizeof(controlError));
+            return 2;
+        }
+        QuipAneTimes controlTimes;
+        if (quip_ane_evaluate(controlProgram, thresholds, inputElements * kSweeps, &controlTimes,
+                controlError, sizeof(controlError)) != 0) {
+            fprintf(stderr, "positive control: evaluate failed: %s\n", controlError);
+            printf("positive_control=FAILED reason=evaluate\n");
+            quip_ane_destroy(controlProgram, controlError, sizeof(controlError));
+            return 2;
+        }
+        int8_t *outControl = malloc(inputElements);
+        if (outControl == NULL) { fprintf(stderr, "outControl allocation failed\n"); return 2; }
+        if (quip_ane_read(controlProgram, outControl, inputElements, controlError, sizeof(controlError)) != 0) {
+            fprintf(stderr, "positive control: read failed: %s\n", controlError);
+            printf("positive_control=FAILED reason=read\n");
+            free(outControl);
+            quip_ane_destroy(controlProgram, controlError, sizeof(controlError));
+            return 2;
+        }
+        BOOL controlMatchesExpectedB = matchesReplicated(outControl, kChannels, expectedB);
+        printf("positive_control node[0..3]=[%d,%d,%d,%d] matches_expectedB=%d\n",
+            outControl[0 * 128], outControl[1 * 128], outControl[2 * 128], outControl[3 * 128], controlMatchesExpectedB);
+        if (quip_ane_destroy(controlProgram, controlError, sizeof(controlError)) != 0) {
+            fprintf(stderr, "warning: positive control destroy failed: %s\n", controlError);
+        }
+        free(outControl);
+        if (!controlMatchesExpectedB) {
+            fprintf(stderr, "POSITIVE CONTROL FAILED: a fresh compile with the negated weights does not "
+                "match expectedB. This calls the outcome-3 conclusion into question. Do not trust it "
+                "without re-examining the host model and this probe.\n");
+            printf("positive_control=FAILED reason=output_mismatch\n");
+            return 3;
+        }
+        printf("positive_control=PASS\n");
+
+        // Cleanup for the step-1 program. quip_ane_destroy consumes the
+        // bridge retain and unloads. QuipAneProgram's dealloc
+        // (ane_bridge.m:110-129) then removes the staging directory this
+        // probe deliberately kept. dealloc fires when the `owner` local
+        // below drops its own last strong reference, which ARC does at the
+        // end of this scope: strictly after every Step 2, 3, and 4
+        // measurement above, and after the positive control just run. The
+        // "No such file or directory" NSLog line some runs print during
+        // this cleanup is therefore harmless by construction; see the task
+        // report for why it happens anyway.
         if (quip_ane_destroy(program, nativeError, sizeof(nativeError)) != 0) {
             fprintf(stderr, "warning: destroy failed: %s\n", nativeError);
         }
