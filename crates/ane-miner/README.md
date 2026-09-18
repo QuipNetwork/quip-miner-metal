@@ -264,8 +264,14 @@ one program cost about 700 ms rather than twice 1.752 ms. Every matmul
 variant measured slower than the convolution variant.
 `docs/perf/2026-09-18-ane-runtime-couplings.md` records the measurement.
 
-No route to removing the per-job compile cost remains open. The compile is
-also not the limit on running more workers, per
+That result closes the runtime-input route only. It does not close the
+per-job compile. Compiling one program per topology and writing each job's
+couplings into the compiled program is a separate route, open as bead
+`quip-miner-metal-kyk`. The topology is fixed, so only the values change per
+job. `_ANERequest` already takes a `weightsBuffer` argument, typed
+`_ANEIOSurfaceObject`, that this crate passes as `nil`.
+
+The compile is not the limit on running more workers, per
 `docs/perf/2026-09-17-ane-compile-contention.md`.
 
 Four-coloring chunk balance is open as bead `quip-miner-metal-fjo`. This
