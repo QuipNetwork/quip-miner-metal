@@ -171,7 +171,7 @@ way the gap is real and exceeds the 15% check.
 `solve_with_block`, `crates/ane-miner/src/solver.rs:45` through
 `solver.rs:71`, sets `stats.setup_us`, the metric behind the 520 ms baseline.
 Besides `AneProgram::compile`, the function this probe's native stages
-measure, that window runs four more functions the probe never touches:
+measure, that window runs five more functions the probe never touches:
 
 - `validate_params`, `crates/ane-miner/src/msa.rs:21` through `msa.rs:50`,
   called from `solver.rs:46` and again inside `schedule`.
