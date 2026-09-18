@@ -190,6 +190,7 @@ Advertised limits are:
 - 65,536 sweeps
 
 At production shape, a second concurrent ANE worker raises measured throughput by about 17 percent over one worker, and four workers reach about 25 percent, because measurement never showed more than two programs dispatching at once.
+Compile scales the same way and does not cap that gain. Four processes compile at once, rather than queueing, but each compile slows enough that four reach only 1.230 times the compile throughput of one. `docs/perf/2026-09-17-ane-compile-contention.md` records that result, which holds for real mining, where every job compiles.
 
 A complete graph on 21 variables has degree 20.
 The miner accepts that graph on the same degree-20 path.
@@ -246,10 +247,11 @@ Optimization closed as bead `quip-miner-metal-djn`. The dense path stays in
 production. Fused local routing measured 3.4 to 3.6 times slower than matched
 dense work. `docs/perf/2026-09-16-ane-local-routing.md` records that result.
 
-Compile serialization under concurrency is open as bead
-`quip-miner-metal-6jd`. Throughput under `evaluateWithQoS:` scales with
-concurrent processes, but compile sat outside the timed loop, so that gain
-is unproven for real mining, where every job compiles.
+Compile serialization under concurrency closed as bead
+`quip-miner-metal-6jd`. Compile does not serialize. Four processes compile at
+once, and compile throughput scales 1.145 times at two processes and 1.230
+times at four, matching the curve measured for `evaluateWithQoS:`.
+`docs/perf/2026-09-17-ane-compile-contention.md` records the measurement.
 
 Runtime-input couplings are open as bead `quip-miner-metal-yba`. Moving the
 couplings and the per-job threshold `h` out of the compiled weight blob and
