@@ -35,10 +35,9 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    let entry = std::time::Instant::now();
     let mut cli = Cli::parse();
     if let Some(parent_pid) = cli.ane_worker {
-        return quip_miner_ane::worker_main(parent_pid, entry);
+        return quip_miner_ane::worker_main(parent_pid);
     }
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("metal-{}", cli.device));

@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use quip_solver_core::{IsingGraph, SampleParams};
 use serde::{Deserialize, Serialize};
@@ -162,11 +162,7 @@ fn check_device() -> Result<WorkerResult, AneError> {
 }
 
 /// Run one private worker request, terminating if its owning parent disappears.
-///
-/// `_entry`, the process start captured at the top of `main` before argument
-/// parsing, is passed by both `src/bin/quip_metal_msa.rs` and this crate's
-/// own entry point; nothing in this function reads it.
-pub fn worker_main(parent_pid: u32, _entry: Instant) -> ExitCode {
+pub fn worker_main(parent_pid: u32) -> ExitCode {
     if parent_pid == 0 {
         return ExitCode::from(70);
     }

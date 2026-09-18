@@ -970,9 +970,8 @@ mod tests {
     /// production's own topology and sweep count, and prints every
     /// worker-path counter to stderr. `wait` already logs its six counters
     /// through `tracing::debug!`; this test installs a `fmt` subscriber so
-    /// that event reaches stderr under `--nocapture`. The child's own
-    /// `worker_main` prints its `child_arg_parse_us` line directly, since its
-    /// stderr is inherited. The reply also carries `RunStats`, Task 7's five
+    /// that event reaches stderr under `--nocapture`. The reply also carries
+    /// `RunStats`, Task 7's five
     /// Rust counters plus `setup_us`, `dispatches`, `staging_us`,
     /// `dispatch_us`, and `anneal_us`, printed here too so the report can
     /// separate the child's own compute (already measured by Tasks 1 and 7)

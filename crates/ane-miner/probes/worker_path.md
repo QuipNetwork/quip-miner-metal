@@ -11,12 +11,17 @@ to that section and the commands behind it, not a duplicate of it.
 job: directory and file creation, the request write, `Command::spawn`,
 the wait for the child to exit, the reply read, and teardown.
 `crates/ane-miner/src/worker.rs` and
-`crates/ane-miner/src/bin/quip_ane_msa.rs` add a seventh counter,
-`child_arg_parse_us`. It times `main` entry to `worker_main` entry, which
+`crates/ane-miner/src/bin/quip_ane_msa.rs` added a seventh counter,
+`child_arg_parse_us`. It timed `main` entry to `worker_main` entry, which
 is argument parsing, not the child's `dyld` and runtime startup: `dyld`
-finishes before `main` ever runs, outside this window. The child prints
-this value, and whatever spawned it captures the value. All seven are
-counters only. No control flow changed.
+finishes before `main` ever runs, outside this window. The child printed
+this value on inherited stderr, and whatever spawned it captured the
+value. All seven were counters only. No control flow changed.
+
+The seventh counter is no longer in the code. It printed one line per
+production job on inherited stderr, and
+`docs/perf/2026-09-17-ane-setup-profile.md` records its measurement, so
+Task 6 deleted it. The six counters in `process.rs` remain.
 
 ## How to reproduce
 

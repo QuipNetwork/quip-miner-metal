@@ -13,10 +13,9 @@ struct Cli {
 }
 
 fn main() -> std::process::ExitCode {
-    let entry = std::time::Instant::now();
     let cli = Cli::parse();
     if let Some(parent_pid) = cli.ane_worker {
-        return worker_main(parent_pid, entry);
+        return worker_main(parent_pid);
     }
     run(ANE_MSA_IDENTITY, &cli.common, || {
         let executable = std::env::current_exe()

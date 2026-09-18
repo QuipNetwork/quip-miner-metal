@@ -175,8 +175,8 @@ gap derived from it, are `BLOCK_SWEEPS`-2 measurements. Task 5's Stage
 table, further down in this document, supersedes them with a 390.0 ms fixed
 setup and a 155.016 ms compile at `BLOCK_SWEEPS` 1.
 
-`solve_with_block`, `crates/ane-miner/src/solver.rs:45` through
-`solver.rs:71`, sets `stats.setup_us`, the metric behind the 520 ms baseline.
+`solve_with_block`, `crates/ane-miner/src/solver.rs:51` through
+`solver.rs:91`, sets `stats.setup_us`, the metric behind the 520 ms baseline.
 Besides `AneProgram::compile`, the function this probe's native stages
 measure, that window runs five more functions the probe never touches:
 
@@ -316,7 +316,8 @@ Adding all five new counters, not only the two the brief names, changes the
 sum little. 309.462 plus 5.647 ms, the sum of all five medians, is 315.109
 ms. That is a 193.053 ms gap, 38.0% of budget. `validate_us`, `schedule_us`,
 and `initial_spins_us` are small next to `graph_prep_us` and `reset_us`, as
-the brief predicted.
+the brief predicted, though `validate_us` never resolved above the
+counter's 1 µs floor, so its 0.000 ms median means below 1 µs, not zero.
 
 A third figure uses the `setup_us` median directly, 340.423 ms, instead of
 summing figures from two different processes and cache states, the probe
@@ -415,9 +416,12 @@ branch changed. `wait` logs the six counters through one
 `tracing::debug!` call once teardown finishes.
 
 `crates/ane-miner/src/worker.rs` and `crates/ane-miner/src/bin/quip_ane_msa.rs`
-add a seventh counter, `child_arg_parse_us`. `main` now captures an
-`Instant` before it parses arguments, and `worker_main` prints the elapsed
-time as its first line, to standard error, which the parent inherits. By
+added a seventh counter, `child_arg_parse_us`, for this measurement.
+`main` captured an `Instant` before it parsed arguments, and `worker_main`
+printed the elapsed time as its first line, to standard error, which the
+parent inherits. The counter is no longer in the code. It printed one line
+per production job on inherited stderr, so Task 6 deleted it after this
+measurement. Reproducing the Stage table below means restoring it. By
 the time any Rust code in `main` runs, `dyld` has already resolved and
 loaded every library the binary links, including the private ANE runtime
 library, and has already jumped to the compiled binary's entry point.
@@ -464,6 +468,12 @@ cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --release \
   -- --ignored --nocapture --exact \
   process::tests::hardware_worker_path_stage_medians_advantage2_system1
 ```
+
+This table covers one dispatch, under `BLOCK_SWEEPS` 2. The fixture's
+`num_sweeps: 2` is a literal, independent of the constant, so the command as
+written still runs. At the `BLOCK_SWEEPS` 1 now live in
+`crates/ane-miner/src/native.rs:10`, it produces two dispatches instead of
+one, and `wait_us` and `setup_us` both differ from the table's figures.
 
 ### Stage table
 
@@ -591,7 +601,7 @@ assign to one place:
   roughly 10 ms warm, likely a small part of the 25.616 ms bucket, not a
   large one. This is a bound from a different measurement, not a figure
   this section derived.
-- `read_message(std::io::stdin().lock())`, `crates/ane-miner/src/worker.rs:190`,
+- `read_message(std::io::stdin().lock())`, `crates/ane-miner/src/worker.rs:181`,
   deserializes the request the parent already spent 2.189 ms writing.
   Deserializing costs more than writing raw bytes. `serde_json` walks and
   allocates for every field.
@@ -599,7 +609,7 @@ assign to one place:
   compiled ANE program and its input and output surfaces. It runs after
   `anneal_us` stops timing, so no counter in this document covers it.
 - `write_message(std::io::stdout().lock(), &reply)`,
-  `crates/ane-miner/src/worker.rs:212`, serializes and writes the reply,
+  `crates/ane-miner/src/worker.rs:203`, serializes and writes the reply,
   128 reads across 4,577 nodes as a spin array, before the parent's own
   `reply_read_us` timer starts on its side of the same file.
 

@@ -158,7 +158,7 @@ Advertised limits are:
 - logical reads 1 through 128
 - 65,536 sweeps
 
-At production shape, a second concurrent ANE worker raises measured throughput by about 17 percent over one worker, and a third or fourth worker adds almost nothing beyond that, because measurement never showed more than two programs dispatching at once.
+At production shape, a second concurrent ANE worker raises measured throughput by about 17 percent over one worker, and four workers reach about 25 percent, because measurement never showed more than two programs dispatching at once.
 
 A complete graph on 21 variables has degree 20.
 The miner accepts that graph on the same degree-20 path.
@@ -233,7 +233,7 @@ A shared device guard is open as bead `quip-miner-metal-c7l`. No guard
 script exists in this repository or in `/tmp`, and every task in this plan
 substituted its own serialization for device access.
 
-The wall-clock assertion in `crates/ane-miner/src/process.rs:438` is open as
+The wall-clock assertion in `crates/ane-miner/src/process.rs:482` is open as
 bead `quip-miner-metal-erz`. The assertion is flaky by construction under
 parallel load.
 
