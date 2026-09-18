@@ -676,48 +676,65 @@ single-pending-queue scheduler and a measured 1.04 times serialization
 factor for two concurrent submission threads.
 
 **Concurrent `evaluateWithQoS:` dispatch gives a modest, real throughput
-gain on this host, at production shape.** Two concurrent processes reach
-1.16 times a single process's rate. Four reach 1.29 times. Neither figure
-matches the archived notes' near-1.0 prediction, and neither is the 2x an
-uncorrected first measurement in this task originally reported. That
-number came from summing each process's own throughput over its own time
-window. Those windows only partly overlap, and summing rates over windows
-that do not fully overlap overstates a group's real throughput even with
-no engine contention at all. Corrected by computing throughput over the
-window the group actually shared, total calls divided by the span from the
-first process's start to the last process's end, the factors are 1.16 and
-1.29.
+gain on this host, at production shape, capped at two processes
+overlapping at once.** Two concurrent processes reach 1.17 times a single
+process's rate. Four reach 1.25 times, barely more than two, because at no
+point in three independent measurements did more than two of the four
+processes dispatch at the same instant. `aggregate_rate(N)` in every
+number below is total group calls divided by the group's shared wall-clock
+window (the span from the first process's loop start to the last
+process's loop end), never a sum of per-process rates computed over each
+process's own window. The second inflates and was the source of an
+uncorrected first pass through this task, which reported a factor near
+2.15 before this correction.
 
-| Shape | N | `R1`, calls/s | Corrected group rate, calls/s | Corrected factor |
-| --- | --- | ---: | ---: | ---: |
-| small, 512 channels, 1 tile | 2 | 5,434.192 | 5,345.735 | 0.984 |
-| small, 512 channels, 1 tile | 4 | 5,434.192 | 4,573.729 | 0.842 |
-| production, 4,608 channels, 8 tiles | 2 | 464.516 | 540.692 | 1.165 |
-| production, 4,608 channels, 8 tiles | 4 | 464.516 | 600.807 | 1.293 |
+| Shape | N | `R1`, calls/s | Group rate, calls/s | Factor | Max processes overlapping |
+| --- | --- | ---: | ---: | ---: | ---: |
+| small, 512 channels, 1 tile | 2 | 5,764.03 (bracket average, 2 reps) | 5,920.66 (2-rep average) | 1.027 | 1 (no true overlap) |
+| small, 512 channels, 1 tile | 4 | 5,766.76 (bracket average, 2 reps) | 5,612.22 (2-rep average) | 0.973 | 1 (no true overlap) |
+| production, 4,608 channels, 8 tiles | 2 | 473.93 (bracket average, 2 reps) | 552.48 (2-rep average) | 1.166 | 2 |
+| production, 4,608 channels, 8 tiles | 4 | 478.82 (bracket average, 2 reps) | 599.44 (2-rep average) | 1.253 | 2 |
+
+These figures come from a round-robin measurement that alternates N=1,
+N=2, and N=4 runs, rather than blocking all runs of one condition
+together, and brackets every N=2 and N=4 group with an `R1` run
+immediately before and after it. That way a competing device user during a
+baseline window cannot depress `R1` for a later, unrelated group without
+the report noticing. Bracket pairs disagree by 0.4% to 11.4% run to run,
+ordinary timing noise on a host running other work, not a directional
+pattern. The pair with the least drift, 0.4%, a production N=2 rep,
+produced a higher factor than the pair with the most drift, 11.4%, the
+other production N=2 rep. That is the opposite of what a depressed-`R1`
+explanation predicts. A first, non-bracketed pass at production shape
+returned matching factors, 1.165 and 1.293, before this stricter protocol
+ran.
 
 Production shape, the real per-job topology and compile cost, governs this
 verdict. The small shape used to keep compile short is 13 times cheaper
-per dispatch, 0.164 ms versus 2.15 ms, and its corrected factors sit at or
-below 1.0, matching the archived notes. It characterizes round-trip
-overhead rather than engine behavior under the load a job actually
-applies. The task report keeps it for Task 5 rather than using it here.
+per dispatch, 0.164 ms versus 2.15 ms, and its factors sit at or below
+1.0, matching the archived notes, with a measured top of one process
+dispatching at a time even at N=4. It characterizes round-trip overhead
+rather than engine behavior under the load a job actually applies. The
+task report keeps it for Task 5 rather than using it here.
 
-The gain shows early diminishing returns. Four processes add about 13
-percentage points over two, not another 16. Per-process latency also rises
-with N. Production N=4 loop-start timestamps also stagger by close to
-258-288 ms between consecutive process starts, near the 283.887 ms
-`compile_ms` median reported earlier in this document. That is consistent
-with `compileWithQoS:` serializing across concurrent processes even where
-`evaluateWithQoS:` does not. This task did not time compile in isolation to
-confirm that. Compile is most of a job's fixed cost, and this task's
-200-call loop measures only the cheap part, so this task does not extend
-its verdict to real per-job throughput with more than one worker. The
-remaining levers already identified in this document, fewer dispatches and
-more work per dispatch, both still reduce that compile-dominated fixed
-cost regardless of how that question resolves.
+At production shape, the two-process overlap cap explains the gap between
+the N=2 and N=4 factors. Running four processes never bought more than two
+processes' worth of simultaneous dispatch. Per-process latency also rises
+with N. Production N=4 loop-start timestamps stagger by close to 250 to
+290 milliseconds between consecutive process starts, near the 283.887 ms
+`compile_ms` median reported earlier in this document. That pattern is
+consistent with `compileWithQoS:` serializing across concurrent processes
+even where `evaluateWithQoS:` allows two-deep overlap. This task did not
+time compile in isolation to confirm it. Compile is most of a job's fixed
+cost, and this task's 200-call loop measures only the cheap part, so this
+task does not extend its verdict to real per-job throughput with more than
+one worker. The remaining levers already identified in this document,
+fewer dispatches and more work per dispatch, both still reduce that
+compile-dominated fixed cost regardless of how that question resolves.
 
-Full method, the arithmetic-trap analysis, per-process latencies, exact
-commands, and the compile-serialization data is in
+Full method, the arithmetic-trap analysis, the round-robin data and
+bracket-drift table, per-process latencies, exact commands, and the
+compile-serialization data is in
 `.superpowers/sdd/2026-09-17-ane-throughput/task-2-report.md`.
 
 ## Platform
