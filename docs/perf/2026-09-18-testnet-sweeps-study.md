@@ -38,8 +38,11 @@ Solution quality at each point:
 
 ## The answer
 
-One sweep count below 16,384 matches the baseline at 64 reads, and that is
-8,192. It produces 1.53 times the baseline's valid proofs per second and
+This study tested powers of two only. The intermediate counts, measured
+later the same day in `2026-09-18-testnet-sweeps-intermediates.md`, move
+the answer to 64 reads at 14,336 sweeps, which beats the baseline on every
+measure below. Within the counts here, one sweep count below 16,384
+matches the baseline at 64 reads, and that is 8,192. It produces 1.53 times the baseline's valid proofs per second and
 1.07 times the baseline's winner-beating proofs per second.
 
 | Configuration | Valid proofs per second against baseline | Winner-beating proofs per second against baseline |

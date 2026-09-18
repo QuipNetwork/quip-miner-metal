@@ -127,13 +127,18 @@ second under the default streaming, at about 5.0 against 3.9 at 128, and
 32 reads with one batch at a time gives 6.1. The ANE keeps 128 until its
 lane width can follow the job.
 
-Sweeps below 16,384 do not help. At 64 reads, 8,192 sweeps gives 1.53
-times the baseline's valid proofs per second but only 1.07 times its
+Sweeps trade against the chance per job. At 64 reads, 8,192 sweeps gives
+1.53 times the baseline's valid proofs per second but only 1.07 times its
 winner-beating proofs, with an interval that spans parity, and under the
 chain's default `min_solutions` of 5 it falls to 0.55 of the baseline.
-The chance per job collapses between 4,096 and 2,048 sweeps. 64 reads at
-16,384 sweeps beats the baseline on both rates, 1.46 and 1.24, under both
-settings. That study ran on the GPU against the same 60 blocks.
+The chance per job collapses between 4,096 and 2,048 sweeps. The chance
+stops rising at 14,336 sweeps, and 64 reads at 14,336 beats the baseline
+on every measure: 1.67 times the valid proofs per second, 1.51 times the
+winner-beating proofs, and 1.40 against 1.21 proofs per second under a
+`min_solutions` of 5. Doubling sweeps from 8,192 to 16,384 buys about
+10,000 milli of energy on any block, whatever its target. Those studies
+ran on the GPU. `2026-09-18-testnet-sweeps-study.md` and
+`2026-09-18-testnet-sweeps-intermediates.md`.
 
 The testnet mines zero-field problems on the Advantage2 graph with one
 read below target as a valid proof. Winners self-report 1.0 to 3.9 s of

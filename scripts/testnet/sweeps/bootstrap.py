@@ -9,10 +9,12 @@ on the ratio narrower than two separate intervals would suggest.
 """
 
 import csv
+import glob
 import json
 import math
 import os
 import random
+import re
 import statistics
 import sys
 
@@ -25,7 +27,11 @@ random.seed(20260918)
 def load():
     """{(reads, sweeps): {block: [(valid, beats), ...]}}"""
     cells = {}
-    paths = [(s, os.path.join(OUT, f"study-{s}.csv")) for s in (1024, 2048, 4096, 8192)]
+    paths = []
+    for path in sorted(glob.glob(os.path.join(OUT, "study-*.csv"))):
+        m = re.fullmatch(r"study-(\d+)\.csv", os.path.basename(path))
+        if m:
+            paths.append((int(m.group(1)), path))
     paths.append((16384, BASELINE))
     for sweeps, path in paths:
         with open(path) as f:

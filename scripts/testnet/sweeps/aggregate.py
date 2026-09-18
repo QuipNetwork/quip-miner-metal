@@ -3,7 +3,7 @@
 
     aggregate.py OUT_DIR BASELINE_CSV
 
-Reads `study-<sweeps>.csv` for the low sweep counts, the 16,384-sweep rows
+Reads every `study-<sweeps>.csv` in OUT_DIR, the 16,384-sweep rows
 from `BASELINE_CSV`, the earlier reads study's output, and the throughput rows from `bench.jsonl`.
 Writes `summary.csv` and prints the table.
 
@@ -14,25 +14,33 @@ floor. Proofs per second appear under both.
 """
 
 import csv
+import glob
 import json
 import os
+import re
 import statistics
 import sys
 
 OUT, BASELINE = sys.argv[1], sys.argv[2]
-LOW_SWEEPS = [1024, 2048, 4096, 8192]
 READS = [64, 128]
 MIN_SOLUTIONS = 5
+
+
+def study_sweeps():
+    """Every sweep count with a `study-<sweeps>.csv` in the output directory."""
+    found = []
+    for path in glob.glob(os.path.join(OUT, "study-*.csv")):
+        m = re.fullmatch(r"study-(\d+)\.csv", os.path.basename(path))
+        if m:
+            found.append(int(m.group(1)))
+    return sorted(found)
 
 
 def load_rows():
     """Return job rows keyed by (reads, sweeps), only 64 and 128 reads."""
     by_cell = {}
-    for s in LOW_SWEEPS:
+    for s in study_sweeps():
         path = os.path.join(OUT, f"study-{s}.csv")
-        if not os.path.exists(path):
-            print(f"missing {path}, skipping", file=sys.stderr)
-            continue
         with open(path) as f:
             for r in csv.DictReader(f):
                 if r.get("error"):
