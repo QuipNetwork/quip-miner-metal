@@ -137,7 +137,8 @@ static NSString *makeMILL(size_t channels, const size_t *lengths, size_t tiles,
 // Compiles one program at the given lane count and times `calls`
 // evaluations. Returns NO on any failure, which a lane count the engine
 // rejects will produce, and that rejection is itself a result.
-static BOOL timeLanes(size_t lanes, size_t calls, double *msPerSweep, double *compileMS) {
+static BOOL timeLanes(size_t lanes, size_t calls, double *msPerSweep, double *compileMS,
+                      uint64_t *loopStartUS, uint64_t *loopEndUS) {
     @autoreleasepool {
         NSError *error = nil;
         size_t weightCount = 0;
@@ -239,7 +240,10 @@ static BOOL timeLanes(size_t lanes, size_t calls, double *msPerSweep, double *co
                 return NO;
             }
         }
-        double loopMS = (monotonicUS() - loopStart) / 1000.0;
+        uint64_t loopEnd = monotonicUS();
+        double loopMS = (loopEnd - loopStart) / 1000.0;
+        *loopStartUS = loopStart;
+        *loopEndUS = loopEnd;
         *msPerSweep = loopMS / (double)(calls * kSweeps);
 
         [model unloadWithQoS:21 error:&error];
@@ -276,14 +280,18 @@ int main(int argc, const char **argv) {
         for (size_t i = 0; i < laneCount; ++i) {
             size_t lanes = laneList[i];
             double msPerSweep = 0, compileMS = 0;
-            if (!timeLanes(lanes, calls, &msPerSweep, &compileMS)) {
+            uint64_t loopStartUS = 0, loopEndUS = 0;
+            if (!timeLanes(lanes, calls, &msPerSweep, &compileMS, &loopStartUS, &loopEndUS)) {
                 printf("{\"lanes\":%zu,\"status\":\"rejected\"}\n", lanes);
                 continue;
             }
             if (lanes == 128) baseline = msPerSweep;
+            // Absolute loop bounds from monotonicUS() let concurrently launched
+            // instances show how much of their loops overlapped.
             printf("{\"lanes\":%zu,\"calls\":%zu,\"compile_ms\":%.3f,\"ms_per_sweep\":%.4f,"
-                "\"us_per_sweep_per_read\":%.4f}\n",
-                lanes, calls, compileMS, msPerSweep, msPerSweep * 1000.0 / (double)lanes);
+                "\"us_per_sweep_per_read\":%.4f,\"loop_start_us\":%llu,\"loop_end_us\":%llu}\n",
+                lanes, calls, compileMS, msPerSweep, msPerSweep * 1000.0 / (double)lanes,
+                (unsigned long long)loopStartUS, (unsigned long long)loopEndUS);
         }
         if (baseline > 0) printf("{\"baseline_128_ms_per_sweep\":%.4f}\n", baseline);
         return 0;

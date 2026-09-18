@@ -70,6 +70,53 @@ Cutting reads to reach a sweep budget is the wrong lever. It gives up
 sampling breadth, which is the thing reads exist to provide, in exchange
 for a saving the table shows to be small.
 
+## Fewer reads do not make room for a second model
+
+Two concurrent 64-read models run, but they mostly serialise. Each slows
+from 0.52 ms per sweep alone to 0.78 to 0.87 ms alongside the other, where
+full serialisation would give 1.04 and full overlap 0.52. Their combined
+output is 80% of the samples per second of one 128-read model.
+
+| Models | Reads each | Model-sweeps per second | Lane-sweeps per second | Against one at 128 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1,564 | 200,230 | 1.00 |
+| 2 | 128 | 1,910 | 244,439 | 1.22 |
+| 4 | 128 | 1,931 | 247,167 | 1.23 |
+| 1 | 64 | 1,921 | 122,961 | 0.61 |
+| 2 | 64 | 2,496 | 159,737 | 0.80 |
+| 4 | 64 | 2,580 | 165,116 | 0.82 |
+| 1 | 32 | 2,052 | 65,654 | 0.33 |
+| 2 | 32 | 2,674 | 85,553 | 0.43 |
+| 4 | 32 | 2,701 | 86,442 | 0.43 |
+
+Each row is the median of two launches. A launch starts its processes at
+once with 5,000 calls each, and the aggregate is the total sweeps over the
+union of the loop windows, so it charges the whole wall time. The loops
+overlapped by 0.89 to 0.97 of that window.
+
+The concurrency gain is 1.30 times at 64 reads and 1.32 at 32, against 1.22
+at 128. Halving the reads frees almost nothing, because what the models
+contend for is the coupling stream, and each model carries its own. The
+cost model above says that stream is 79% of a 64-read sweep.
+
+In valid proofs per second on the testnet's blocks, the trade nets to
+zero. Two 64-read models give 0.152 jobs per second at 16,384 sweeps, and
+the study's 0.40 chance per job makes 0.061 valid proofs per second. Two
+128-read models give 0.117 jobs per second at 0.54, or 0.063. Four of
+either give 0.063 and 0.064. Those rates use the probe's dispatch-only
+sweep cost, so they compare configurations and are not production rates.
+The ANE keeps 128 reads, which also keeps more reads below target per
+valid job against a `min_solutions` above 1.
+
+The probe is `reads_sweep.m` with `loop_start_us` and `loop_end_us` added
+to its output, launched by `probes/reads_concurrency.sh` and summarised by
+`probes/reads_concurrency.py`:
+
+```sh
+scripts/ane-guard -s 3 -t 900 -- crates/ane-miner/probes/reads_concurrency.sh /tmp/reads-sweep 5000 reads-concurrency.jsonl 2
+crates/ane-miner/probes/reads_concurrency.py reads-concurrency.jsonl
+```
+
 ## Reaching 16,384 sweeps
 
 At the four-colouring's 0.8818 ms per sweep through the production path,

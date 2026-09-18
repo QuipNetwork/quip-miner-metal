@@ -84,7 +84,12 @@ attention. It mattered when jobs were 2,048 sweeps and it was 277 ms.
 
 The ANE runs one model at a time. The runtime overlaps at most two
 dispatches, which is where the 15% at two workers and 25% at four come
-from. The GPU holds 40 threadgroups of 32 replicas each, one per core, so
+from. Fewer reads do not make room for a second model. Two 64-read models
+contend for the coupling stream that each carries on its own, so together
+they deliver 80% of the samples per second of one 128-read model, which
+nets to the same valid proofs per second.
+`2026-09-18-ane-read-count.md`. The GPU holds 40 threadgroups of 32
+replicas each, one per core, so
 it holds 10 models at 128 reads and 40 at 32, with two batches in flight
 on top. At 16,384 sweeps and 128 reads the GPU runs 7.3 jobs per second
 and the ANE 0.068, or 0.086 with four workers. The ANE adds about 1% to
