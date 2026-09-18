@@ -1,0 +1,111 @@
+#!/bin/sh
+# Serialize access to the Apple Neural Engine across processes.
+#
+# Every ANE probe and every hardware test shares one device. Two of them
+# running at once corrupts the measurement, and concurrency measurements are
+# the case where contention is indistinguishable from the result. Run the
+# work through this guard so only one holder touches the device at a time.
+#
+# Usage:
+#   scripts/ane-guard [-t SECONDS] [-s SECONDS] -- COMMAND [ARG...]
+#
+#   -t  how long to wait for the device before giving up. Default 300.
+#   -s  quiet interval held after the command finishes, so the device
+#       settles before the next holder starts. Default 3.
+#
+# Exit status is the command's own, except 75 (EX_TEMPFAIL) when the wait
+# times out and 64 (EX_USAGE) for a bad invocation. A timeout is a failure
+# on purpose: a contended run produces a number nobody can trust, so it must
+# stop rather than publish one.
+#
+# The lock is a directory, because mkdir is atomic on POSIX and needs no
+# external tool. A lock whose owning process is gone is broken automatically.
+
+set -eu
+
+timeout=300
+settle=3
+lock=${QUIP_ANE_LOCK:-/tmp/quip-ane-device.lock}
+
+usage() {
+	echo "usage: ane-guard [-t SECONDS] [-s SECONDS] -- COMMAND [ARG...]" >&2
+	exit 64
+}
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	-t)
+		[ $# -ge 2 ] || usage
+		timeout=$2
+		shift 2
+		;;
+	-s)
+		[ $# -ge 2 ] || usage
+		settle=$2
+		shift 2
+		;;
+	--)
+		shift
+		break
+		;;
+	*) usage ;;
+	esac
+done
+
+[ $# -gt 0 ] || usage
+
+case $timeout in
+'' | *[!0-9]*) usage ;;
+esac
+case $settle in
+'' | *[!0-9]*) usage ;;
+esac
+
+# Tenths of a second, so the wait loop stays in integer arithmetic.
+deadline=$((timeout * 10))
+waited=0
+
+while ! mkdir "$lock" 2>/dev/null; do
+	holder=$(cat "$lock/pid" 2>/dev/null || true)
+	case $holder in
+	'' | *[!0-9]*)
+		# No readable owner. Either the holder has not written its pid
+		# yet, or it died between mkdir and the write. Wait it out; a
+		# holder that never appears is caught by the timeout.
+		;;
+	*)
+		if ! kill -0 "$holder" 2>/dev/null; then
+			echo "ane-guard: breaking lock held by dead pid $holder" >&2
+			rm -f "$lock/pid"
+			rmdir "$lock" 2>/dev/null || true
+			continue
+		fi
+		;;
+	esac
+
+	if [ "$waited" -ge "$deadline" ]; then
+		echo "ane-guard: device held by pid ${holder:-unknown} for ${timeout}s" >&2
+		echo "ane-guard: giving up" >&2
+		exit 75
+	fi
+
+	sleep 0.2
+	waited=$((waited + 2))
+done
+
+echo $$ >"$lock/pid"
+
+# Hold the lock across the settling interval, not just the command. Releasing
+# first would let the next holder start against a device that is still busy,
+# which is the contention this guard exists to remove.
+# shellcheck disable=SC2329  # invoked indirectly by the EXIT trap below.
+release() {
+	sleep "$settle"
+	rm -f "$lock/pid"
+	rmdir "$lock" 2>/dev/null || true
+}
+trap release EXIT
+
+status=0
+"$@" || status=$?
+exit "$status"

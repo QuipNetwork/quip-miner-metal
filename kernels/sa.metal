@@ -170,6 +170,15 @@ kernel void pure_simulated_annealing(
         // ── First chunk: random initialization ──────────────
         rng_state = (base_seed ? base_seed : 1u) ^ (thread_id * 12345u);
 
+        // A zero xorshift32 state is a fixed point (xorshift(0) == 0), which
+        // freezes this thread's whole RNG stream at a constant. The mixing
+        // above can yield 0 (e.g. public seed 12344 -> base_seed 12345, whose
+        // thread_id 1 mixes to 12345 ^ 12345 == 0). Substitute the nonzero
+        // state 1; every nonzero mixed value is preserved unchanged.
+        if (rng_state == 0u) {
+            rng_state = 1u;
+        }
+
         // Generate random initial state (bit-packed)
         for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
             packed_state[byte_idx] = 0;

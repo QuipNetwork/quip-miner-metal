@@ -1,4 +1,4 @@
-//! Protocol conformance: spawn SA and Gibbs miners against
+//! Protocol conformance: spawn SA, multi-spin SA and Gibbs miners against
 //! quip-solver-conformance's scripted driver.
 //!
 //! Metal GPU tests: needs a real device (Apple Silicon).
@@ -207,11 +207,32 @@ async fn quip_metal_gibbs_passes_conformance() {
     );
 }
 
+#[tokio::test]
+async fn quip_metal_msa_passes_conformance() {
+    ensure_built(&["quip-metal-msa"]);
+    let miner = profile_bin("quip-metal-msa");
+    let socket = format!(
+        "/tmp/quip-metal-msa-conf-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    // `msa` is not `gibbs`, so the resolved budget is not doubled.
+    assert_conformant("quip-metal-msa", &report, CONFIGURED_SWEEPS);
+}
+
 #[test]
 fn capabilities_and_version_and_check() {
-    ensure_built(&["quip-metal-sa", "quip-metal-gibbs"]);
+    ensure_built(&["quip-metal-sa", "quip-metal-gibbs", "quip-metal-msa"]);
 
-    for (bin, algo) in [("quip-metal-sa", "sa"), ("quip-metal-gibbs", "gibbs")] {
+    for (bin, algo) in [
+        ("quip-metal-sa", "sa"),
+        ("quip-metal-msa", "msa"),
+        ("quip-metal-gibbs", "gibbs"),
+    ] {
         let path = profile_bin(bin);
 
         let out = Command::new(&path).arg("--capabilities").output().unwrap();
@@ -253,6 +274,7 @@ fn invalid_log_level_is_a_usage_error() {
     for bin in [
         env!("CARGO_BIN_EXE_quip-metal-sa"),
         env!("CARGO_BIN_EXE_quip-metal-gibbs"),
+        env!("CARGO_BIN_EXE_quip-metal-msa"),
     ] {
         let out = Command::new(bin)
             .arg("--capabilities")

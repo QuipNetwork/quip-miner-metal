@@ -1,7 +1,8 @@
 //! Metal Ising samplers.
 //!
-//! Two binaries share this library:
+//! Three binaries share this library:
 //! - `quip-metal-sa` — Metropolis simulated annealing on one Apple GPU
+//! - `quip-metal-msa` — multi-spin annealing on selected Metal and ANE engines
 //! - `quip-metal-gibbs` — single-site heat-bath Gibbs on one Apple GPU
 //!
 //! Kernels take **explicit per-job** CSR buffers from the host (no kernel-side
@@ -47,6 +48,8 @@ compile_error!(
 
 pub mod sampler;
 
+mod combined;
+
 pub mod iokit_gov;
 pub mod metal_device;
 pub mod streaming;
@@ -54,7 +57,7 @@ pub mod topology;
 
 pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 
-pub use sampler::sample_ising;
+pub use sampler::{sample_ising, Kernel};
 
 use quip_solver_core::{run, BackendIdentity, CommonArgs};
 use std::process::ExitCode;
@@ -86,6 +89,51 @@ const METAL_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adap
     reads_solution_max_factor: 0,
     reads_solution_floor_factor: 0,
 };
+
+/// Multi-spin adapt envelope.
+///
+/// Reads are pinned to 64: two 32-lane words per problem. Sweeps run from
+/// 4096 to 14336 with the difficulty. At the testnet's current target the
+/// difficulty saturates at 1.0, so a job is 64 reads at 14336 sweeps. Every
+/// accepted job is still bounded by `sampler::MAX_SWEEPS`.
+///
+/// Measured 2026-09-18 on Apple M4 Max (40 GPU cores) against 60 Aglais
+/// testnet qblocks regenerated from their nonces, five seeds each, with the
+/// jobs/s of each shape from the batched bench
+/// (`docs/perf/2026-09-18-testnet-sweeps-study.md` and
+/// `docs/perf/2026-09-18-testnet-sweeps-intermediates.md`). Against the
+/// previous envelope of 128 reads at 16384 sweeps:
+///
+/// ```text
+/// reads  sweeps   jobs/s   P(valid)   valid/s   winner-beating/s   valid/s at min_solutions 5
+/// 128    16384     6.24      0.54      3.37       2.00               1.21
+/// 64     16384    12.19      0.40      4.92       2.48               1.38
+/// 64     14336    13.99      0.40      5.64       3.03               1.40
+/// 64      8192    22.49      0.23      5.17       2.17               0.67
+/// 64      4096    41.50      0.06      2.49       1.25               0.00
+/// ```
+///
+/// 64 reads at 14336 sweeps gives 1.67x the valid proofs per second of the
+/// old envelope (90% bootstrap interval 1.46 to 1.88), 1.51x the
+/// winner-beating proofs (1.23 to 1.82), and 1.40 against 1.21 proofs per
+/// second under the chain's default `min_solutions` of 5. P(valid) is flat
+/// from 14336 to 16384 sweeps. The floor stays at 4096: the chance per job
+/// collapses between 4096 and 2048 sweeps at that target.
+const METAL_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
+    quip_solver_core::adapt::AdaptBounds {
+        min_sweeps: 4096,
+        max_sweeps: 14336,
+        min_reads: 64,
+        max_reads: 64,
+        reads_solution_min_factor: 0,
+        reads_solution_max_factor: 0,
+        reads_solution_floor_factor: 0,
+    };
+
+const _: () = assert!(
+    sampler::MAX_SWEEPS >= METAL_MSA_ADAPT.max_sweeps as usize,
+    "sampler::MAX_SWEEPS must admit METAL_MSA_ADAPT.max_sweeps"
+);
 
 /// Backend identity for `quip-metal-sa`.
 ///
@@ -137,6 +185,27 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     adapt: METAL_ADAPT,
 };
 
+/// Backend identity for `quip-metal-msa`.
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_metal::METAL_MSA_IDENTITY;
+///
+/// assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
+/// assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
+/// assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads, 64);
+/// ```
+pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "metal",
+    algorithm: "msa",
+    // Union capacity. Routing still enforces each engine's own limits.
+    max_nodes: quip_miner_ane::ANE_MSA_IDENTITY.max_nodes,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &["streaming", "governor"],
+    adapt: METAL_MSA_ADAPT,
+};
+
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization
 /// governor. macOS-only.
 ///
@@ -144,7 +213,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 ///
 /// ```no_run
 /// use quip_miner_metal::{
-///     Algorithm, MetalSampler,
+///     Kernel, MetalSampler,
 ///     iokit_gov::UtilGovernor,
 ///     metal_device::MetalDevice,
 /// };
@@ -152,7 +221,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = MetalDevice::open(0)?;
 /// let gov = UtilGovernor::start(0, 100, false);
-/// let sampler = MetalSampler::new(device, gov, Algorithm::Sa);
+/// let sampler = MetalSampler::new(device, gov, Kernel::Sa);
 /// let _ = sampler;
 /// # Ok(())
 /// # }
@@ -161,7 +230,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 pub struct MetalSampler {
     device: crate::metal_device::MetalDevice,
     gov: crate::iokit_gov::UtilGovernor,
-    algorithm: Algorithm,
+    kernel: Kernel,
 }
 
 /// Metal backend config, parsed from the verbatim `config.toml` subsection in
@@ -173,19 +242,21 @@ struct MetalConfig {
     utilization: Option<u32>,
     /// Yield the GPU to siblings when util exceeds the ceiling.
     yielding: Option<bool>,
+    enable_ane: Option<bool>,
+    enable_metal: Option<bool>,
     #[serde(flatten)]
     unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 impl MetalSampler {
     /// Bind an opened [`crate::metal_device::MetalDevice`] and
-    /// [`crate::iokit_gov::UtilGovernor`] to an algorithm.
+    /// [`crate::iokit_gov::UtilGovernor`] to a kernel.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use quip_miner_metal::{
-    ///     Algorithm, MetalSampler,
+    ///     Kernel, MetalSampler,
     ///     iokit_gov::UtilGovernor,
     ///     metal_device::MetalDevice,
     /// };
@@ -193,19 +264,19 @@ impl MetalSampler {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let device = MetalDevice::open(0)?;
     /// let gov = UtilGovernor::start(0, 100, false);
-    /// let _sampler = MetalSampler::new(device, gov, Algorithm::Gibbs);
+    /// let _sampler = MetalSampler::new(device, gov, Kernel::Gibbs);
     /// # Ok(())
     /// # }
     /// ```
     pub fn new(
         device: crate::metal_device::MetalDevice,
         gov: crate::iokit_gov::UtilGovernor,
-        algorithm: Algorithm,
+        kernel: Kernel,
     ) -> Self {
         Self {
             device,
             gov,
-            algorithm,
+            kernel,
         }
     }
 }
@@ -216,7 +287,7 @@ impl quip_solver_core::Sampler for MetalSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, quip_solver_core::SampleError> {
-        sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
+        sample_ising(&self.device, graph, params, self.kernel).map_err(|e| {
             // `kind` carries the local `sampler::SampleError` variant (Debug),
             // so a kernel compile failure and a device reset stay
             // distinguishable in the log even though both map to
@@ -245,11 +316,11 @@ impl quip_solver_core::Sampler for MetalSampler {
         // behavior, so the dependency is made explicit in the signature. The
         // governor is passed whole (not just a throttle closure) because sizing
         // is a loop: the stream reports its GPU time back through it.
-        streaming::run_stream(&self.device, self.algorithm, jobs, &out, &self.gov, &cancel);
+        streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
     }
 
     fn stream_width(&self) -> usize {
-        streaming::stream_width(&self.device, self.algorithm)
+        streaming::stream_width(&self.device, self.kernel)
     }
 
     fn utilization(&self) -> f64 {
@@ -261,7 +332,7 @@ impl quip_solver_core::Sampler for MetalSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        streaming::max_reads(self.algorithm)
+        streaming::max_reads(self.kernel)
     }
 
     fn apply_config(&self, backend_toml: &str) {
@@ -299,44 +370,50 @@ fn resolve_governor_config(
     (ceiling, yielding)
 }
 
-/// Algorithm selection at the type level, one tag per Metal binary.
+/// Kernel selection at the type level, one tag per Metal binary.
 ///
 /// [`quip_solver_core::Sampler::declared_stream_width`] is associated —
 /// `--capabilities` answers it with no device — so a width that differs per
-/// algorithm needs a `Sampler` type per binary. [`run_metal`] takes the tag
+/// kernel needs a `Sampler` type per binary. [`run_metal`] takes the tag
 /// and builds the matching [`TaggedSampler`].
 ///
 /// `Send + Sync + 'static` because `Sampler` requires them of the whole
 /// sampler type; a zero-sized tag satisfies all three trivially.
-pub trait AlgorithmTag: Send + Sync + 'static {
-    /// The algorithm this tag selects.
-    const ALGORITHM: Algorithm;
+pub trait KernelTag: Send + Sync + 'static {
+    /// The kernel this tag selects.
+    const KERNEL: Kernel;
 }
 
 /// Tag for `quip-metal-sa`.
 pub struct SaTag;
 
-impl AlgorithmTag for SaTag {
-    const ALGORITHM: Algorithm = Algorithm::Sa;
+impl KernelTag for SaTag {
+    const KERNEL: Kernel = Kernel::Sa;
 }
 
 /// Tag for `quip-metal-gibbs`.
 pub struct GibbsTag;
 
-impl AlgorithmTag for GibbsTag {
-    const ALGORITHM: Algorithm = Algorithm::Gibbs;
+impl KernelTag for GibbsTag {
+    const KERNEL: Kernel = Kernel::Gibbs;
 }
 
-/// [`MetalSampler`] bound to its binary's algorithm at the type level, so the
-/// associated `declared_stream_width` answers per algorithm. [`run_metal`]
-/// constructs the inner sampler from `A::ALGORITHM`, keeping the tag and the
-/// runtime algorithm equal by construction.
-pub struct TaggedSampler<A: AlgorithmTag> {
-    inner: MetalSampler,
-    _algorithm: std::marker::PhantomData<A>,
+/// Tag for `quip-metal-msa`.
+pub struct MsaTag;
+
+impl KernelTag for MsaTag {
+    const KERNEL: Kernel = Kernel::Msa;
 }
 
-impl<A: AlgorithmTag> quip_solver_core::Sampler for TaggedSampler<A> {
+/// Engine router bound to its binary's kernel. MSA has one ANE slot in
+/// addition to the Metal stream width. SA and Gibbs execute on Metal only.
+/// [`run_metal`] keeps the tag and runtime kernel equal by construction.
+pub struct TaggedSampler<A: KernelTag> {
+    inner: combined::CombinedSampler,
+    _kernel: std::marker::PhantomData<A>,
+}
+
+impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
     fn sample(
         &self,
         graph: &IsingGraph,
@@ -358,11 +435,10 @@ impl<A: AlgorithmTag> quip_solver_core::Sampler for TaggedSampler<A> {
         self.inner.stream_width()
     }
 
-    /// What the live [`MetalSampler::stream_width`] resolves to for this
-    /// tag's algorithm — the device does not participate in the Metal width,
-    /// so the advertised and live numbers agree by construction.
+    /// Combined admission bound, independent of which engines configuration
+    /// enables. Disabled slots remain unused rather than changing capabilities.
     fn declared_stream_width() -> u32 {
-        u32::try_from(streaming::declared_stream_width(A::ALGORITHM)).unwrap_or(u32::MAX)
+        u32::try_from(combined::stream_width(A::KERNEL)).unwrap_or(u32::MAX)
     }
 
     fn utilization(&self) -> f64 {
@@ -382,9 +458,9 @@ impl<A: AlgorithmTag> quip_solver_core::Sampler for TaggedSampler<A> {
     }
 }
 
-/// Run a Metal miner binary. macOS opens the GPU and governor; other platforms
-/// support `--capabilities`/`--version` but return `EnvIncompatible` for
-/// `--check` and session mode.
+/// Run one miner identity with the selected engines. Session engines open on
+/// first use, after backend configuration arrives. `--check` opens the default
+/// engines: Metal for every algorithm, plus ANE for MSA.
 ///
 /// # Examples
 ///
@@ -403,23 +479,21 @@ impl<A: AlgorithmTag> quip_solver_core::Sampler for TaggedSampler<A> {
 /// };
 /// let _code = run_metal::<SaTag>(METAL_SA_IDENTITY, &common, 0, 100, false);
 /// ```
-pub fn run_metal<A: AlgorithmTag>(
+pub fn run_metal<A: KernelTag>(
     id: BackendIdentity,
     common: &CommonArgs,
     device: usize,
     utilization: u32,
     yielding: bool,
 ) -> ExitCode {
-    use crate::iokit_gov::UtilGovernor;
-    use crate::metal_device::MetalDevice;
-    use quip_solver_core::OpenError;
     run(id, common, || {
-        let dev =
-            MetalDevice::open(device).map_err(|e| OpenError(format!("device {device}: {e}")))?;
-        let gov = UtilGovernor::start(device as u32, utilization, yielding);
+        let inner = combined::CombinedSampler::new(A::KERNEL, device, utilization, yielding);
+        if common.check {
+            inner.check()?;
+        }
         Ok(TaggedSampler::<A> {
-            inner: MetalSampler::new(dev, gov, A::ALGORITHM),
-            _algorithm: std::marker::PhantomData,
+            inner,
+            _kernel: std::marker::PhantomData,
         })
     })
 }
@@ -428,23 +502,67 @@ pub fn run_metal<A: AlgorithmTag>(
 mod tests {
     use super::resolve_governor_config;
 
-    /// A swapped tag constant would silently advertise the other algorithm's
-    /// width; pin the tag → algorithm binding. Device-free on purpose: the
+    /// A swapped tag constant would silently advertise the other kernel's
+    /// width; pin the tag → kernel binding. Device-free on purpose: the
     /// declared width must be answerable without a GPU.
     #[test]
-    fn tagged_declared_widths_follow_their_algorithms() {
-        use super::{GibbsTag, SaTag, TaggedSampler};
-        use quip_solver_core::{Algorithm, Sampler};
+    fn tagged_declared_widths_follow_their_kernels() {
+        use super::{GibbsTag, Kernel, MsaTag, SaTag, TaggedSampler};
+        use quip_solver_core::Sampler;
         assert_eq!(
             TaggedSampler::<SaTag>::declared_stream_width(),
-            u32::try_from(crate::streaming::declared_stream_width(Algorithm::Sa))
-                .unwrap_or(u32::MAX)
+            u32::try_from(crate::streaming::declared_stream_width(Kernel::Sa)).unwrap_or(u32::MAX)
         );
         assert_eq!(
             TaggedSampler::<GibbsTag>::declared_stream_width(),
-            u32::try_from(crate::streaming::declared_stream_width(Algorithm::Gibbs))
+            u32::try_from(crate::streaming::declared_stream_width(Kernel::Gibbs))
                 .unwrap_or(u32::MAX)
         );
+        assert_eq!(
+            TaggedSampler::<MsaTag>::declared_stream_width(),
+            u32::try_from(crate::combined::stream_width(Kernel::Msa)).unwrap_or(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn msa_identity_advertises_the_multi_spin_kernel() {
+        use super::{METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
+        assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
+        assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
+        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 16_384);
+        assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
+        // Reads are pinned to whole words.
+        assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads % 32, 0);
+        assert_eq!(
+            METAL_MSA_IDENTITY.adapt.min_reads,
+            METAL_MSA_IDENTITY.adapt.max_reads
+        );
+        const {
+            assert!(METAL_MSA_IDENTITY.adapt.min_sweeps <= METAL_MSA_IDENTITY.adapt.max_sweeps);
+        }
+    }
+
+    #[test]
+    fn msa_envelope_resolves_to_the_measured_shape_at_the_testnet_target() {
+        use super::METAL_MSA_IDENTITY;
+        use quip_solver_core::adapt::adapt_params;
+        // Aglais qblock 3278: zero-field Advantage2 graph, target below the
+        // adapt model's hardest energy, so the difficulty saturates at 1.0 and
+        // the job is the envelope's maximum: the shape the sweeps study picked.
+        let job = adapt_params(
+            -14_624_068,
+            1,
+            4_577,
+            41_514,
+            &[0],
+            &METAL_MSA_IDENTITY.adapt,
+        );
+        assert_eq!(job.num_reads, 64);
+        assert_eq!(job.num_sweeps, 14_336);
+        // An easy target lands on the floor, still a whole number of words.
+        let easy = adapt_params(0, 1, 4_577, 41_514, &[0], &METAL_MSA_IDENTITY.adapt);
+        assert_eq!(easy.num_reads, 64);
+        assert_eq!(easy.num_sweeps, 4_096);
     }
 
     /// CLI defaults the pure resolver starts from in every case below.

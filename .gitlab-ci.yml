@@ -56,6 +56,7 @@ build-macos-arm64:
     - mkdir -p dist
     - cp target/release/quip-metal-sa dist/quip-metal-sa-darwin-arm64
     - cp target/release/quip-metal-gibbs dist/quip-metal-gibbs-darwin-arm64
+    - cp target/release/quip-metal-msa dist/quip-metal-msa-darwin-arm64
 
 # On a tag: upload the built binaries to the generic package registry, then cut
 # a Release linking them as downloadable assets. `build-macos-arm64` is not
@@ -91,4 +92,5 @@ release:
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
       release-cli create --name "quip-miner-metal ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
         --assets-link "{\"name\":\"quip-metal-sa-darwin-arm64\",\"url\":\"${base}/quip-metal-sa-darwin-arm64\"}" \
-        --assets-link "{\"name\":\"quip-metal-gibbs-darwin-arm64\",\"url\":\"${base}/quip-metal-gibbs-darwin-arm64\"}"
+        --assets-link "{\"name\":\"quip-metal-gibbs-darwin-arm64\",\"url\":\"${base}/quip-metal-gibbs-darwin-arm64\"}" \
+        --assets-link "{\"name\":\"quip-metal-msa-darwin-arm64\",\"url\":\"${base}/quip-metal-msa-darwin-arm64\"}"

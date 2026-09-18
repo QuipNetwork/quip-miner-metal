@@ -1,0 +1,19 @@
+fn main() {
+    assert_eq!(
+        std::env::var("TARGET").as_deref(),
+        Ok("aarch64-apple-darwin")
+    );
+    cc::Build::new()
+        .file("native/ane_bridge.m")
+        .flag("-fobjc-arc")
+        .flag("-fobjc-arc-exceptions")
+        .flag("-std=c11")
+        .warnings(true)
+        .extra_warnings(true)
+        .warnings_into_errors(true)
+        .compile("quip_ane_bridge");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=IOSurface");
+    println!("cargo:rerun-if-changed=native/ane_bridge.h");
+    println!("cargo:rerun-if-changed=native/ane_bridge.m");
+}

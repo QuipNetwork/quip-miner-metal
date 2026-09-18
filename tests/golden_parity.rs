@@ -7,7 +7,7 @@
 
 use quip_miner_metal::metal_device::MetalDevice;
 use quip_miner_metal::sampler::sample_ising;
-use quip_miner_metal::{Algorithm, IsingGraph, SampleParams};
+use quip_miner_metal::{IsingGraph, Kernel, SampleParams};
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::quip_protocol::wire::{decode_spins, encode_spins};
 use serde_json::Value;
@@ -106,14 +106,14 @@ fn live_sample_energies_match_energy_milli() {
         ..Default::default()
     };
 
-    for algo in [Algorithm::Sa, Algorithm::Gibbs] {
-        let results = sample_ising(&dev, &graph, &params, algo).expect("sample");
+    for kernel in [Kernel::Sa, Kernel::Msa, Kernel::Gibbs] {
+        let results = sample_ising(&dev, &graph, &params, kernel).expect("sample");
         assert_eq!(results.len(), 16);
         for r in &results {
             let expected = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
             assert_eq!(
                 r.energy_milli, expected,
-                "{algo:?} reported energy_milli {} != consensus {}",
+                "{kernel:?} reported energy_milli {} != consensus {}",
                 r.energy_milli, expected
             );
             assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
@@ -146,10 +146,56 @@ fn sa_finds_ground_state_on_ferro() {
         seed: 42,
         ..Default::default()
     };
-    let results = sample_ising(&dev, &graph, &params, Algorithm::Sa).expect("sa");
+    let results = sample_ising(&dev, &graph, &params, Kernel::Sa).expect("sa");
     assert!(
         results.iter().any(|r| r.energy_milli == -1000),
         "SA failed to find ferro ground: {:?}",
         results.iter().map(|r| r.energy_milli).collect::<Vec<_>>()
     );
+}
+
+/// Multi-spin SA finds the ferro ground state (sanity that the kernel anneals).
+#[test]
+fn msa_finds_ground_state_on_ferro() {
+    let dev = open_device();
+    let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+    let params = SampleParams {
+        num_reads: 32,
+        num_sweeps: 128,
+        seed: 42,
+        ..Default::default()
+    };
+    let results = sample_ising(&dev, &graph, &params, Kernel::Msa).expect("msa");
+    assert_eq!(results.len(), 32);
+    assert!(
+        results.iter().any(|r| r.energy_milli == -1000),
+        "MSA failed to find ferro ground: {:?}",
+        results.iter().map(|r| r.energy_milli).collect::<Vec<_>>()
+    );
+}
+
+/// On a 32-spin ferromagnetic chain the ground energy is -31. Domain walls
+/// move freely under single-spin Metropolis, so 64 replicas over 512 sweeps
+/// reach it; a kernel that miscounts satisfied bonds does not.
+#[test]
+fn msa_reaches_the_ferro_chain_ground_state() {
+    let dev = open_device();
+    let n = 32;
+    let edges: Vec<(usize, usize)> = (0..n - 1).map(|i| (i, i + 1)).collect();
+    let graph = IsingGraph::new(vec![0.0; n], vec![-1.0; edges.len()], edges);
+    let params = SampleParams {
+        num_reads: 64,
+        num_sweeps: 512,
+        seed: 9,
+        ..Default::default()
+    };
+    let results = sample_ising(&dev, &graph, &params, Kernel::Msa).expect("msa");
+    let best = results.iter().map(|r| r.energy_milli).min().unwrap();
+    assert_eq!(best, -31_000, "best energy over 64 reads");
+    for r in &results {
+        assert_eq!(
+            r.energy_milli,
+            energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+        );
+    }
 }
