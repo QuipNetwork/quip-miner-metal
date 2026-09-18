@@ -192,12 +192,174 @@ None of these five has a receipt key in this task, and this report does not
 estimate any of their costs. A later task should time them directly if full
 accounting matters.
 
+## Rust-side setup
+
+This section reports five counters that `crates/ane-miner/src/solver.rs`
+now records inside `stats.setup_us`: `validate_us`, `graph_prep_us`,
+`schedule_us`, `initial_spins_us`, and `reset_us`. The probe cannot reach
+these five functions, because the probe is a C program and these five
+functions are Rust. This section measures the functions the probe could not
+reach and redoes the preceding Gap accounting section with real numbers in
+place of five blank rows.
+
+`graph_prep_us` and `graph_prep_ms` are different measurements of different
+code, despite the similar name. `graph_prep_ms`, in the preceding Stage
+table, is a synthetic placeholder that fills a weights buffer with
+`random()` calls. That does about 100 to 1,000 times more per-element work
+than the real code does. See the preceding Method section for that
+placeholder. `graph_prep_us` times the real `prepare(graph)` call at
+`crates/ane-miner/src/graph.rs:93`, called from
+`crates/ane-miner/src/solver.rs:62`. Do not read the two values as
+comparable.
+
+### Method
+
+`solve_with_block`, `crates/ane-miner/src/solver.rs:51` through
+`solver.rs:131`, now starts an `Instant` before each of the five calls and
+stores the elapsed microseconds on `RunStats` right after each call returns.
+This adds five field writes and five clock reads around calls the function
+already made. It does not change the order of the calls, the arguments
+passed to them, or any other control flow.
+
+The `--solve` driver in `quip-solver-core` does not surface `RunStats` on its
+own output. `ProblemJson` and `SolutionJson` in that crate's `driver.rs`
+carry spins and an energy value, not timing. Wiring `RunStats` into the
+worker's tracing output is Task 6's job, not this one. To measure the five
+counters, this task added a test-only harness,
+`hardware_rust_setup_stage_medians_advantage2_system1` at
+`crates/ane-miner/src/solver.rs:515`, marked `#[ignore = "requires Apple
+Silicon ANE"]` like the other hardware tests already in that file. It builds
+the same topology, coupling seed, and solve seed this section's runs use,
+calls `solve_in_process` directly, and prints every `RunStats` field to
+standard error.
+
+The topology is `tests/fixtures/advantage2-system1.edges`, the same 4,577
+nodes and 41,515 edges the probe uses. Fields are zero. Couplings are `{-1,
+1}` from a seeded xorshift64 generator with seed 7, the same generator
+`tests/msa_bench.rs` already uses for this fixture in this repository's
+top-level test suite. `num_reads` is 128, `num_sweeps` is 512, matching the
+`--solve` sweep count this task's brief specifies, `sweeps_per_beta` is 1,
+and `beta_range` is unset. `seed`, the solve-time pseudorandom source, is
+123.
+
+No shared device guard exists in this repository or in `/tmp`, the same gap
+Task 1 found. The five runs below ran one at a time, with a 3-second sleep
+between runs, in place of a guard.
+
+Command, run five times:
+
+```bash
+cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --release \
+  --lib hardware_rust_setup_stage_medians_advantage2_system1 \
+  -- --ignored --nocapture
+```
+
+### Stage table
+
+All values are milliseconds, converted from the microseconds `RunStats`
+records.
+
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| validate_us | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| graph_prep_us | 4.432 | 2.460 | 2.512 | 2.545 | 2.563 | 2.545 |
+| schedule_us | 0.244 | 0.255 | 0.255 | 0.240 | 0.241 | 0.244 |
+| initial_spins_us | 1.114 | 0.544 | 0.554 | 0.515 | 0.544 | 0.544 |
+| reset_us | 2.309 | 2.314 | 2.297 | 2.325 | 2.329 | 2.314 |
+| setup_us, the whole window | 364.084 | 346.477 | 335.019 | 340.423 | 335.843 | 340.423 |
+
+Run 1 shows the largest `graph_prep_us` and `initial_spins_us` values and the
+largest `setup_us` total. This matches the cold-start pattern Task 1 found in
+`load_ms`: the first call in a fresh process runs colder caches than the
+following four. The median absorbs it here as it did there.
+
+`setup_us` is `AneProgram::compile` plus all five measured counters. Summing
+the five counters and subtracting from the `setup_us` median leaves 334.776
+ms for `AneProgram::compile` alone in this run, more than the probe's
+309.462 ms native stage sum. See the following Gap accounting section for
+what that 25.3 ms difference most likely is.
+
+### Gap accounting
+
+The task brief that requested this section cites a 367 ms native total for
+this step. That figure is the all-seven-required-keys sum from the
+preceding Stage table, 366.974 ms. It includes the synthetic
+`graph_prep_ms` placeholder. The decision that set up this task excludes
+`graph_prep_ms` from every budget comparison. This section instead uses
+309.462 ms, the native stage sum, six stages, the same figure the earlier
+Gap accounting section already uses.
+
+| Quantity | Value, ms |
+| --- | ---: |
+| Native stage sum, six stages | 309.462 |
+| Plus graph_prep_us, median | 2.545 |
+| Plus reset_us, median | 2.314 |
+| New sum | 314.321 |
+| Budget for measured stages | 508.162 |
+| Gap | 193.841 |
+| Gap as a share of budget | 38.1% |
+
+Adding all five new counters, not only the two the brief names, changes the
+sum little. 309.462 plus 5.647 ms, the sum of all five medians, is 315.109
+ms. That is a 193.053 ms gap, 38.0% of budget. `validate_us`, `schedule_us`,
+and `initial_spins_us` are small next to `graph_prep_us` and `reset_us`, as
+the brief predicted.
+
+A third figure uses the `setup_us` median directly, 340.423 ms, instead of
+summing figures from two different processes and cache states, the probe
+and this task's harness. That gap is 167.739 ms, 33.0% of budget. Trust
+this figure over the other two: a single direct measurement beats a sum of
+measurements taken in different processes. Even this figure stays far over
+the 15% check, 76.224 ms.
+
+The gap does not close under any of the three ways to compute it. Two places
+hold the rest, named here rather than estimated by assertion:
+
+- `AneProgram::compile` itself, `crates/ane-miner/src/native.rs:77` through
+  `native.rs:176`, spends time neither the probe nor this task's five
+  counters measure. The preceding Stage table shows about 25.3 ms of this.
+  That is the gap between the measured `setup_us` median and the sum of the
+  probe's native total and this task's five counters. Two spots inside that
+  function are the likely source. The weights and fields build,
+  `native.rs:89` through `native.rs:106`, writes into a weights buffer of
+  about 21.68 million elements, the same size the `graph_prep_ms`
+  placeholder in the Method section fills. `compile_raw`'s own bounds check
+  on that same buffer, `native.rs:137` through `native.rs:145`, walks every
+  element again. This report does not measure either loop on its own, so it
+  does not assign the 25.3 ms between them.
+- A larger, unmeasured cost sits entirely outside `stats.setup_us`. Even the
+  fullest figure here, the 340.423 ms `setup_us` median, misses the 508.162
+  ms budget by 167.739 ms. Every job in production spawns a second copy of
+  the worker binary through `WorkerProcess::spawn`,
+  `crates/ane-miner/src/process.rs:46` through `process.rs:77`. That call
+  makes a temporary directory, creates two files, and runs a full `fork` and
+  `exec` of the ANE worker executable. The new process loads its own copy of
+  Metal, IOSurface, and the other linked libraries. `worker_main`,
+  `crates/ane-miner/src/worker.rs:165`
+  through `worker.rs:187`, starts a watchdog thread, and reads the job off
+  standard input before it calls `solve_in_process` at all. None of this
+  runs inside `stats.setup_us`, and none of it resembles the single small C
+  binary the probe's 11.838 ms process-spawn estimate covers. This report
+  does not measure the worker spawn and inter-process communication path, so
+  it does not assign the remaining 167.739 ms to it. A later task should
+  time `WorkerProcess::spawn` through the first byte `solve_in_process`
+  reads, directly, if full accounting matters.
+
 ## Platform
 
 The host is an Apple M4 Max running macOS 26.5.2, build 25F84, Darwin 25.5.0
-arm64. The compiler is Apple clang 21.0.0, build clang-2100.1.1.101.
+arm64. The compiler is Apple clang 21.0.0, build clang-2100.1.1.101. The
+Rust-side setup runs used the same host, plus rustc 1.98.1, commit
+48a229cea, built 2026-09-01, and cargo 1.98.1.
 
-The receipts are `/tmp/quip-ane-throughput-0917/run1.json` through
-`run5.json`, `run1.time` through `run5.time`, and the merged
+The Method section's receipts are `/tmp/quip-ane-throughput-0917/run1.json`
+through `run5.json`, `run1.time` through `run5.time`, and the merged
 `/tmp/quip-ane-throughput-0917/setup-profile.json`, which holds all five runs
-and the median of each stage.
+and the median of each stage. The Rust-side setup section's receipts are
+`/tmp/quip-ane-throughput-0917/rust-setup-run1.log` through
+`rust-setup-run5.log`, each the full output of one `cargo test` invocation.
+The bit-exactness check's receipts are
+`/tmp/quip-ane-throughput-0917/solve-input.json`, the problem sent to
+`--solve`, `solve-before.json` and `solve-after.json`, its output before and
+after this task's change, and `quip-ane-msa-before` and `quip-ane-msa-after`,
+the two compiled binaries.

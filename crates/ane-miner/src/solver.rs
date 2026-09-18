@@ -14,6 +14,16 @@ pub(crate) struct RunStats {
     pub(crate) programs: u32,
     pub(crate) dispatches: u64,
     pub(crate) setup_us: u64,
+    #[serde(default)]
+    pub(crate) validate_us: u64,
+    #[serde(default)]
+    pub(crate) graph_prep_us: u64,
+    #[serde(default)]
+    pub(crate) schedule_us: u64,
+    #[serde(default)]
+    pub(crate) initial_spins_us: u64,
+    #[serde(default)]
+    pub(crate) reset_us: u64,
     pub(crate) staging_us: u64,
     pub(crate) dispatch_us: u64,
     pub(crate) anneal_us: u64,
@@ -44,12 +54,20 @@ fn solve_with_block(
     block_sweeps: usize,
 ) -> Result<RunOutput, AneError> {
     let setup_started = Instant::now();
-    validate_params(params)?;
-    let prepared = prepare(graph)?;
-    let rungs = schedule(graph, params)?;
-    let mut state = initial_spins(prepared.node_count, params.seed);
-    state.resize(prepared.input_channels * LANES, 0);
     let mut stats = RunStats::default();
+    let validate_started = Instant::now();
+    validate_params(params)?;
+    stats.validate_us = elapsed_us(validate_started.elapsed())?;
+    let graph_prep_started = Instant::now();
+    let prepared = prepare(graph)?;
+    stats.graph_prep_us = elapsed_us(graph_prep_started.elapsed())?;
+    let schedule_started = Instant::now();
+    let rungs = schedule(graph, params)?;
+    stats.schedule_us = elapsed_us(schedule_started.elapsed())?;
+    let initial_spins_started = Instant::now();
+    let mut state = initial_spins(prepared.node_count, params.seed);
+    stats.initial_spins_us = elapsed_us(initial_spins_started.elapsed())?;
+    state.resize(prepared.input_channels * LANES, 0);
 
     if prepared.node_count == 0 || rungs.is_empty() {
         stats.setup_us = elapsed_us(setup_started.elapsed())?;
@@ -67,7 +85,9 @@ fn solve_with_block(
         packed[row * LANES..(row + 1) * LANES]
             .copy_from_slice(&state[node * LANES..(node + 1) * LANES]);
     }
+    let reset_started = Instant::now();
     program.reset(&packed)?;
+    stats.reset_us = elapsed_us(reset_started.elapsed())?;
     stats.setup_us = elapsed_us(setup_started.elapsed())?;
     let anneal_started = Instant::now();
     let mut rows = ThresholdRows::new(params.seed);
@@ -478,5 +498,72 @@ mod tests {
     #[ignore = "requires Apple Silicon ANE"]
     fn hardware_isolated_16384() {
         run_capacity(IsingGraph::new(vec![0.0; 16_384], Vec::new(), Vec::new()));
+    }
+
+    /// Task 7 measurement harness: prints the five Rust-side setup counters
+    /// this task added, plus the existing ones, to stderr. `--solve` does not
+    /// surface `RunStats` on its own (`ProblemJson`/`SolutionJson` in
+    /// `quip-solver-core`'s driver carry no timing fields; wiring one into the
+    /// worker's tracing output is Task 6's job), so this calls
+    /// `solve_in_process` directly on the same topology and seeds as the perf
+    /// doc's probe: `tests/fixtures/advantage2-system1.edges`, 128 reads,
+    /// zero fields, couplings in {-1, 1} from seed 7, solved with seed 123 at
+    /// 512 sweeps. Run five times, one process at a time with a 3-second
+    /// sleep between runs, to collect medians; not itself a benchmark.
+    #[test]
+    #[ignore = "requires Apple Silicon ANE"]
+    fn hardware_rust_setup_stage_medians_advantage2_system1() {
+        fn xorshift64(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        let mut s: u64 = 7 | 1;
+        let mut edges = Vec::with_capacity(41_515);
+        let mut j = Vec::with_capacity(41_515);
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/advantage2-system1.edges"
+        ));
+        for line in fixture.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut nodes = line.split_whitespace();
+            let u = nodes.next().expect("edge start").parse().expect("node id");
+            let v = nodes.next().expect("edge end").parse().expect("node id");
+            assert!(nodes.next().is_none(), "two node ids per edge");
+            edges.push((u, v));
+            j.push(if xorshift64(&mut s) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            });
+        }
+        assert_eq!(edges.len(), 41_515);
+        let graph = IsingGraph::new(vec![0.0; 4_577], j, edges);
+        let parameters = SampleParams {
+            num_reads: 128,
+            num_sweeps: 512,
+            sweeps_per_beta: 1,
+            beta_range: None,
+            seed: 123,
+        };
+        let output = solve_in_process(&graph, &parameters).unwrap();
+        eprintln!(
+            "advantage2-system1 validate_us={} graph_prep_us={} schedule_us={} initial_spins_us={} reset_us={} setup_us={} dispatches={} staging_us={} dispatch_us={} anneal_us={}",
+            output.stats.validate_us,
+            output.stats.graph_prep_us,
+            output.stats.schedule_us,
+            output.stats.initial_spins_us,
+            output.stats.reset_us,
+            output.stats.setup_us,
+            output.stats.dispatches,
+            output.stats.staging_us,
+            output.stats.dispatch_us,
+            output.stats.anneal_us,
+        );
     }
 }
