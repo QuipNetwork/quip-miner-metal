@@ -17,7 +17,9 @@ finding deep instances is the whole game. A probe job at 1,024 sweeps ranks
 fresh nonces against the full job at Spearman +0.95, and keeping the
 deepest 1 in 8 by that probe holds 38 of the 40 deepest nonces. On one M4
 Max that screen is worth about 3.7 times the valid proofs per second of an
-unscreened miner, from the measured rates.
+unscreened miner, from the measured rates. The 50,000-nonce follow-up in
+`2026-09-18-probe-screen-at-scale.md` measures 14.6 times with a shorter
+probe on the streaming path, and supersedes the rate arithmetic here.
 
 The annealer's energy on a nonce ranks nonces the same way. On the 60 most
 recent blocks the annealer won, its winning energy ranks the blocks by the
@@ -30,13 +32,15 @@ of 30,000 milli at 16,384 sweeps and 42,000 at 65,536. The annealer alone
 cannot win at today's target: its best energy ever, −14,580,000, is 45,000
 short.
 
-The bar the annealer has to clear is the solver's own probe. At the
-schedule the chain records, 34.8 to 46.1 ms per nonce, one annealer screens
-22 to 29 nonces per second. One M4 Max runs the 1,024-sweep probe at 90.6
-nonces per second at Spearman +0.95, and the 4,096-sweep probe at 41.5 per
-second at +0.97. A QPU screen pays only if its call costs well under 11 ms
-of access time with the signal intact, or if its ranking on fresh nonces
-beats +0.95, which leaves little room. The chain cannot show either one,
+The bar the annealer has to clear is the solver's own probe, and
+`2026-09-18-probe-screen-at-scale.md` raised that bar after this report was
+written. On 50,000 fresh nonces through the batched streaming path, a
+512-sweep probe screens 210 nonces per second at Spearman +0.923 and a
+1,024-sweep probe 141 per second at +0.942. At the schedule the chain
+records, 34.8 to 46.1 ms per nonce, one annealer screens 22 to 29 nonces per
+second. A QPU screen pays only if its call costs well under 5 ms of access
+time with the signal intact, or if its ranking beats +0.92 by enough to
+offset a rate seven to ten times lower. The chain cannot show either one,
 because it records the annealer's energy only on nonces it won.
 
 The experiment for the D-Wave thread is a paired sample. Sample the same
