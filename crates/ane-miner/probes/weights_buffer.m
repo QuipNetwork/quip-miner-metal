@@ -1,3 +1,9 @@
+// Closed. The production couplings moved to the sparse encoding on
+// 2026-09-18 (constexpr_sparse_to_dense, see ane_bridge.m makeWeightBlob),
+// so this probe's arithmetic over the dense fp16 blob describes the layout
+// at the time of its measurement. Bead quip-miner-metal-kyk records the
+// outcome; the probe is kept as that record and is not maintained.
+//
 // Bead quip-miner-metal-kyk, first experiment: does the unused
 // weightsBuffer argument on _ANERequest let one compiled program run with
 // different couplings?
@@ -182,8 +188,8 @@ int main(int argc, const char **argv) {
         }
         printf("compile_and_load_ms=%.3f\n", tb_ms(now() - t0));
 
-        NSData *blobB = makeWeightBlob(weightsB, kChannels, kLengths, kTiles, weightCount);
-        NSData *blobA = makeWeightBlob(weightsA, kChannels, kLengths, kTiles, weightCount);
+        NSData *blobB = makeWeightBlob(weightsB, kChannels, kLengths, kTiles);
+        NSData *blobA = makeWeightBlob(weightsA, kChannels, kLengths, kTiles);
         uint64_t hashA = fnv1a64(blobA.bytes, blobA.length), hashB = fnv1a64(blobB.bytes, blobB.length);
         if (hashA == hashB) {
             fprintf(stderr, "blob A and blob B are the same bytes; negation produced no difference\n");

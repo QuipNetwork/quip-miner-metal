@@ -1,3 +1,9 @@
+// Closed. The production couplings moved to the sparse encoding on
+// 2026-09-18 (constexpr_sparse_to_dense, see ane_bridge.m makeWeightBlob),
+// so this probe's arithmetic over the dense fp16 blob describes the layout
+// at the time of its measurement. Bead quip-miner-metal-kyk records the
+// outcome; the probe is kept as that record and is not maintained.
+//
 // Bead quip-miner-metal-kyk, experiment 2: can a compiled program be given
 // different couplings by loading a new instance bound to per-job weight
 // files?
@@ -132,7 +138,7 @@ int main(int argc, const char **argv) {
 
         // Write couplings B where a weight symbol can point at them, in the
         // same blob format the compiler consumed for couplings A.
-        NSData *blobB = makeWeightBlob(weightsB, kChannels, kLengths, kTiles, weightCount);
+        NSData *blobB = makeWeightBlob(weightsB, kChannels, kLengths, kTiles);
         NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"quip-ane-weight-symbol-%d", getpid()]];
         if (![NSFileManager.defaultManager createDirectoryAtPath:directory

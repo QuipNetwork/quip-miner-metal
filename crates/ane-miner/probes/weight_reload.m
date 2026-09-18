@@ -1,3 +1,9 @@
+// Closed. The production couplings moved to the sparse encoding on
+// 2026-09-18 (constexpr_sparse_to_dense, see ane_bridge.m makeWeightBlob),
+// so this probe's arithmetic over the dense fp16 blob describes the layout
+// at the time of its measurement. Bead quip-miner-metal-kyk records the
+// outcome; the probe is kept as that record and is not maintained.
+//
 // Task 4 probe: does overwriting the weight blob on disk and calling
 // unloadWithQoS: then loadWithQoS: change a compiled program's couplings,
 // without a new compileWithQoS: pass?
@@ -108,8 +114,8 @@ int main(void) {
         buildSpins(x, kChannels);
 
         // === Step 1: compile a program and keep the staging directory ===
-        NSData *mil = [makeMIL(kChannels, kLengths, kTiles, kSweeps, fields) dataUsingEncoding:NSUTF8StringEncoding];
-        NSData *blobA = makeWeightBlob(weightsA, kChannels, kLengths, kTiles, weightCount);
+        NSData *mil = [makeMIL(kChannels, kLengths, kTiles, kSweeps, fields, weightsA) dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *blobA = makeWeightBlob(weightsA, kChannels, kLengths, kTiles);
 
         if (dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW) == NULL) {
             fprintf(stderr, "ANE framework dlopen failed\n");
@@ -255,7 +261,7 @@ int main(void) {
         int8_t *weightsB = malloc(weightCount);
         if (weightsB == NULL) { fprintf(stderr, "weightsB allocation failed\n"); return 2; }
         for (size_t i = 0; i < weightCount; ++i) weightsB[i] = (int8_t)(-weightsA[i]);
-        NSData *blobB = makeWeightBlob(weightsB, kChannels, kLengths, kTiles, weightCount);
+        NSData *blobB = makeWeightBlob(weightsB, kChannels, kLengths, kTiles);
         // The no-change result below only means something if blob B is
         // provably not the same bytes as blob A. Check that before writing,
         // not by inspecting makeWeightBlob's logic.

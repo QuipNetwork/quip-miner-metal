@@ -2,10 +2,16 @@
 
 ## Result
 
-Keep 128 reads. Reads cost 1.75 microseconds each at the margin, against a
-fixed 0.425 ms per sweep that no read count can remove, so 128 buys four
-times the samples of 32 for 32% more time. Above 128 the cost per read
-roughly doubles.
+Keep 128 reads under dense couplings. Reads cost 1.75 microseconds each at
+the margin, against a fixed 0.425 ms per sweep that no read count can
+remove, so 128 buys four times the samples of 32 for 32% more time. Above
+128 the cost per read roughly doubles.
+
+The fixed part is the dense coupling stream, and the sparse encoding that
+shipped later the same day removes it. Under sparse couplings a sweep costs
+about 3 microseconds per read from 64 to 1,024 reads, so this report's
+ladder describes the dense program only.
+`2026-09-18-ane-utilization.md` carries the sparse ladder.
 
 Cutting reads saves far less time than it gives up in samples. Dropping from
 128 to 32 removes three quarters of the arithmetic and returns only 25% of

@@ -16,9 +16,11 @@
 // would bring it near 3.6 s.
 //
 // The probe builds its own program text, because the lane count is not a
-// parameter of the production builder. Everything else follows
-// ane_bridge.m's create path, and makeWeightBlob and makeSurface come from
-// that file unchanged. Production entry points are untouched.
+// parameter of the production builder, and its own dense fp16 weight blob,
+// because production moved to the sparse encoding on 2026-09-18 and this
+// probe measures the dense program its report describes. Everything else
+// follows ane_bridge.m's create path, and makeSurface and stageSurface come
+// from that file unchanged. Production entry points are untouched.
 //
 // This measures dispatch cost only. Fewer reads means fewer parallel
 // replicas, so time to a valid solution can worsen even when time per sweep
@@ -36,6 +38,31 @@ static const size_t kLengths[4] = {1148, 1145, 1145, 1139};
 static const size_t kTiles = 4;
 static const size_t kSweeps = 1;
 static const size_t kDefaultCalls = 200;
+
+// The dense fp16 blob the production bridge wrote before the sparse
+// encoding: one fp16 chunk per tile behind a 64-byte record.
+static NSData *makeDenseWeightBlob(const int8_t *weights, size_t channels, const size_t *lengths, size_t tiles, size_t count) {
+    NSMutableData *blob = [NSMutableData dataWithLength:64 + 64 * tiles + count * sizeof(_Float16)];
+    uint8_t *bytes = blob.mutableBytes;
+    uint32_t chunkCount = CFSwapInt32HostToLittle((uint32_t)tiles);
+    memcpy(bytes, &chunkCount, sizeof(chunkCount));
+    bytes[4] = 2;
+    size_t offset = 64, weightOffset = 0;
+    for (size_t tile = 0; tile < tiles; ++tile) {
+        size_t elements = ((lengths[tile] + 31) / 32 * 32) * channels;
+        writeBlobRecord(bytes + offset, kBlobFP16, elements * sizeof(_Float16), offset + 64);
+        for (size_t i = 0; i < elements; ++i) {
+            _Float16 value = (_Float16)weights[weightOffset + i];
+            uint16_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            bits = CFSwapInt16HostToLittle(bits);
+            memcpy(bytes + offset + 64 + i * sizeof(bits), &bits, sizeof(bits));
+        }
+        weightOffset += elements;
+        offset += 64 + elements * sizeof(_Float16);
+    }
+    return blob;
+}
 
 // shape() and slice() from ane_bridge.m with the lane count lifted out of
 // the literal. Named apart from that file's statics, which this includes.
@@ -182,7 +209,7 @@ static BOOL timeLanes(size_t lanes, size_t calls, double *msPerSweep, double *co
         NSString *weightDirectory = [directory stringByAppendingPathComponent:@"weights"];
         [NSFileManager.defaultManager createDirectoryAtPath:weightDirectory withIntermediateDirectories:NO attributes:nil error:&error];
         [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"] options:NSDataWritingAtomic error:&error];
-        NSData *blob = makeWeightBlob(weights, kChannels, kLengths, kTiles, weightCount);
+        NSData *blob = makeDenseWeightBlob(weights, kChannels, kLengths, kTiles, weightCount);
         [blob writeToFile:[weightDirectory stringByAppendingPathComponent:@"weight_data.bin"] options:NSDataWritingAtomic error:&error];
         free(weights);
         free(fields);

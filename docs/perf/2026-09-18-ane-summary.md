@@ -5,15 +5,18 @@ that carries the evidence.
 
 ## Where the ANE stands
 
-Two changes shipped. Both are measured, and neither depends on a judgment
+Three changes shipped. All are measured, and none depends on a judgment
 about solution quality.
 
 | Change | Effect | Report |
 | --- | --- | --- |
 | `BLOCK_SWEEPS` 2 to 1 | compile 277.6 ms to 155.0 ms | `2026-09-17-ane-setup-profile.md` |
 | Greedy eight-colouring to the Advantage2 four-colouring | 1.0384 to 0.8818 ms per sweep, compile 208.3 to 129.9 ms | `2026-09-18-ane-four-coloring.md` |
+| Sparse coupling encoding | 0.66 to 0.46 ms per sweep on dispatch, a 16,384-sweep job 16.6 to 13.7 s, compile 0.10 to 0.82 s | `2026-09-18-ane-utilization.md` |
 
-The four-colouring is the larger of the two by about four times.
+The sparse encoding stores each tile's couplings as a one-bit mask and the
+nonzero values, and the engine consumes that form directly. The output is
+bit-identical to the dense program.
 
 ## Cost of a 16,384-sweep job
 
@@ -23,11 +26,14 @@ The four-colouring is the larger of the two by about four times.
 | --- | ---: | ---: | ---: |
 | Greedy eight colours, one sweep per dispatch | 208.3 | 17.01 | 17.2 |
 | Four colours, one sweep per dispatch | 129.9 | 14.45 | 14.6 |
+| Four colours, sparse couplings, whole `--solve` process | 820 | | 13.7 |
 
-The branch takes a 16,384-sweep job from about 17.2 s to about 14.6 s, a
-15% reduction. Both figures cover dispatch and compile only. Nothing in them
-passes through the miner channel, the governor, or result scoring, so
-neither is a production throughput claim.
+The first two rows cover dispatch and compile only. The last row is the
+whole `--solve` process on a testnet block, against 16.6 s for the same
+binary with dense couplings, so it is the production figure. The host now
+spends about as long generating and staging thresholds between dispatches
+as the engine spends on them. Bead `quip-miner-metal-fjo.9` carries the
+overlap.
 
 A second concurrent worker raises throughput about 15%, and that figure now
 holds for real mining because compile scales with process count rather than
@@ -39,17 +45,18 @@ serialising. Four workers reach about 25%.
 Four. Each is closed with evidence rather than opinion, so none needs
 revisiting without new information.
 
-**Read count below 128.** A sweep costs 0.425 ms plus 1.75 microseconds per
-read, fitted over 32 to 128 reads at an R-squared of 0.94. That fixed part
-is 65% of a 128-read sweep, and it matches streaming the 43.35 MB coupling
-blob at 102 GB/s. Every dispatch pays it whatever the read count, which leaves
-cutting to 32 reads giving up three quarters of the samples to save a
-quarter of the time. Above 128 the cost per read roughly doubles. The engine refuses fewer
-than 32 reads outright. The result held against run order, against
-alternating the counts, and against running each in its own process.
-`2026-09-18-ane-read-count.md`. The testnet study below confirms it on
-real blocks: 32 reads gives 0.026 valid proofs per second on the ANE
-against 0.037 at 128.
+**Read count below 128, under dense couplings.** A sweep cost 0.425 ms plus
+1.75 microseconds per read, fitted over 32 to 128 reads at an R-squared of
+0.94. That fixed part was 65% of a 128-read sweep, and it matched streaming
+the 43.35 MB coupling blob at 102 GB/s. Every dispatch paid it whatever the
+read count, which left cutting to 32 reads giving up three quarters of the
+samples to save a quarter of the time. Above 128 the cost per read roughly
+doubled. The engine refuses fewer than 32 reads outright.
+`2026-09-18-ane-read-count.md`. The sparse encoding removes that fixed
+stream, and with it the reason to hold 128 reads: from 64 to 1,024 reads
+the sparse sweep costs about 3 microseconds per read-sweep, so 64 reads
+would give about 1.6 times the valid proofs per second once the lane width
+follows the job. Bead `quip-miner-metal-fjo.8`.
 
 **Couplings as a runtime graph input.** Works and validates, but the best
 variant runs 1.752 ms per sweep against 1.13, so the trade turns negative
@@ -82,19 +89,25 @@ attention. It mattered when jobs were 2,048 sweeps and it was 277 ms.
 
 ## Models in flight, and the GPU next to the ANE
 
-The ANE runs one model at a time, because the runtime overlaps at most
-two dispatches, and that overlap is the whole source of the 15% at two
-workers and 25% at four. Fewer reads make no room for a second model
-either, since two 64-read models contend for the coupling stream that
-each carries on its own. Together they deliver 80% of the samples per
-second of one 128-read model, which nets to the same valid proofs per
-second.
-`2026-09-18-ane-read-count.md`. The GPU holds 40 threadgroups of 32
+The ANE executes one program at a time under every encoding. One dense
+model at 128 reads already runs the engine at 60% of its measured MAC
+ceiling and 74% of its weight-stream ceiling, so a second process takes
+only what is left, 1.23 times one. Under sparse couplings two 128-read
+models reach 1.22, two 1,024-read models 1.04, and two 64-read models
+0.80, slower than one. The packing dimension is reads per model, and from
+64 to 1,024 reads the sparse program delivers about 340,000 lane-sweeps per
+second, 1.7 times the dense program at 128 reads.
+`2026-09-18-ane-utilization.md`. The GPU holds 40 threadgroups of 32
 replicas each, one per core, so
 it holds 10 models at 128 reads and 40 at 32, with two batches in flight
-on top. At 16,384 sweeps and 128 reads the GPU runs 7.3 jobs per second
-and the ANE 0.068, or 0.086 with four workers. The ANE adds about 1% to
+on top. At 16,384 sweeps and 128 reads the GPU runs 6.2 to 7.3 jobs per
+second and the ANE 0.073 on the production path. The ANE adds about 1% to
 the GPU. `2026-09-18-gpu-reads-and-models.md`.
+
+The engine draws about 1 W with a model in flight and 0 W idle, whatever
+the encoding, because a sweep over a 99.6%-zero matrix switches few
+multiplier bits. Engine energy per 16,384-sweep job is about 10 J dense
+and 6 J sparse.
 
 The GPU trades reads for models linearly down to 64 reads, at 1.8 times
 the jobs per second of 128. At 32 reads the default two-batch overlap puts
@@ -111,7 +124,16 @@ beats the energy that won the block is 0.16, 0.20, 0.32, and 0.47. Reads
 raise the chance per job, and the GPU's jobs per second fall faster than
 the chance rises, so on the GPU 64 reads gives the most valid proofs per
 second under the default streaming, at about 5.0 against 3.9 at 128, and
-32 reads with one batch at a time gives 6.1. The ANE keeps 128.
+32 reads with one batch at a time gives 6.1. The ANE keeps 128 until its
+lane width can follow the job.
+
+Sweeps below 16,384 do not help. At 64 reads, 8,192 sweeps gives 1.53
+times the baseline's valid proofs per second but only 1.07 times its
+winner-beating proofs, with an interval that spans parity, and under the
+chain's default `min_solutions` of 5 it falls to 0.55 of the baseline.
+The chance per job collapses between 4,096 and 2,048 sweeps. 64 reads at
+16,384 sweeps beats the baseline on both rates, 1.46 and 1.24, under both
+settings. That study ran on the GPU against the same 60 blocks.
 
 The testnet mines zero-field problems on the Advantage2 graph with one
 read below target as a valid proof. Winners self-report 1.0 to 3.9 s of

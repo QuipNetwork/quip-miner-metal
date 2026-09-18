@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires Apple Silicon ANE"]
-    fn hardware_two_sweeps_one_dispatch_exact_oracle() {
+    fn hardware_two_sweeps_exact_oracle() {
         let graph = IsingGraph::new(
             vec![-1.0, 0.0, 1.0, 0.0, -1.0, 1.0, 0.0],
             vec![1.0, -1.0, 1.0],
@@ -342,8 +342,9 @@ mod tests {
         let actual = solve_in_process(&graph, &parameters).unwrap();
         assert_eq!(actual.spins, oracle_solve(&graph, &parameters));
         assert_eq!(
-            actual.stats.dispatches, 1,
-            "two ordered sweeps must complete in one ANE dispatch"
+            actual.stats.dispatches,
+            2u64.div_ceil(BLOCK_SWEEPS as u64),
+            "two ordered sweeps take one dispatch per block of BLOCK_SWEEPS"
         );
     }
 

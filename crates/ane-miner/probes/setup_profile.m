@@ -62,12 +62,12 @@ int main(void) {
 
         // mil_build_ms: brief step 2, bracketing only the makeMIL call.
         t0 = now();
-        NSData *mil = [makeMIL(kChannels, kLengths, kTiles, kSweeps, fields) dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *mil = [makeMIL(kChannels, kLengths, kTiles, kSweeps, fields, weights) dataUsingEncoding:NSUTF8StringEncoding];
         double mil_build_ms = tb_ms(now() - t0);
 
         // blob_build_ms: brief step 2, bracketing only makeWeightBlob.
         t0 = now();
-        NSData *blob = makeWeightBlob(weights, kChannels, kLengths, kTiles, weightCount);
+        NSData *blob = makeWeightBlob(weights, kChannels, kLengths, kTiles);
         double blob_build_ms = tb_ms(now() - t0);
 
         // Framework dlopen, private class lookups, plist/descriptor/model

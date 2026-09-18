@@ -210,13 +210,15 @@ Static slices remove that padding before spin updates.
 Requested reads may be 1 through 128.
 Execution always uses 128 physical lanes.
 
-Measurement keeps that count. A sweep costs 0.425 ms plus 1.75 microseconds
-per read, and the fixed part is the coupling stream, so 32 reads saves a
-quarter of the time for three quarters fewer samples.
-`docs/perf/2026-09-18-ane-read-count.md` records the sweep. Against the
-testnet's own blocks, 32 reads produces fewer valid proofs per second on
-the ANE than 128 does. `docs/perf/2026-09-18-testnet-reads-study.md`
-records that result.
+Measurement keeps that count for now. Under dense couplings a sweep cost
+0.425 ms plus 1.75 microseconds per read, and the fixed part was the
+coupling stream, so 32 reads saved a quarter of the time for three
+quarters fewer samples. `docs/perf/2026-09-18-ane-read-count.md` records
+that sweep. The sparse encoding removes the fixed stream: from 64 to 1,024
+reads a sweep costs about 3 microseconds per read, so 64 reads would give
+more valid proofs per second once the lane width follows the job. Bead
+`quip-miner-metal-fjo.8` carries that change, and
+`docs/perf/2026-09-18-ane-utilization.md` the measurement.
 
 At each node and sweep, each group of 32 replicas shares one threshold value.
 The four groups use independent streams.
@@ -235,14 +237,21 @@ Node reordering preserves the original node and replica assignments for every ra
 
 ## Memory
 
-One program carries all dense FP16 tile matrices in one weight file.
-Each matrix is a separate aligned chunk, reused across dispatches.
-Each tile matrix may use at most 128 MiB.
+One program carries every tile's couplings in one weight file, as a one-bit
+mask over the padded tile matrix and an FP16 vector of the nonzero values
+in mask order, which the program expands with `constexpr_sparse_to_dense`.
+Each mask and each vector is a separate aligned chunk, reused across
+dispatches. The engine consumes the sparse form directly, so a sweep
+streams the mask and the values rather than the dense matrix: 2.8 MB
+instead of 42.5 MB on the Advantage2 graph, and the output is bit-identical
+to the dense program. `docs/perf/2026-09-18-ane-utilization.md` records the
+measurement. The compile takes about 0.8 s at that size, against 0.1 s for
+the dense form.
+Each tile matrix may use at most 128 MiB dense.
 The largest four-tile shape is four matrices of 16,384 by 4,096.
-That raw dense FP16 payload is 512 MiB.
-Padded worst-case payload stays below 544 MiB.
+That raw dense FP16 payload is 512 MiB, and the mask for it is 32 MiB.
 
-Those caps bound dense weight bytes.
+Those caps bound the dense weight bytes the validation still applies.
 They are not a total ANE memory budget.
 Measured peak resident set size belongs to the test process.
 It excludes separate runtime and driver allocations.

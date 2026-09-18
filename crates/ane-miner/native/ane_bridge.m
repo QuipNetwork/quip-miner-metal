@@ -139,7 +139,42 @@ static void slice(NSMutableString *mil, NSString *name, NSString *source, size_t
     [mil appendFormat:@"    %@ %@ = slice_by_size(x=%@, begin=%@begin, size=%@size)[name=string(\"%@\")];\n", shape(count), name, source, name, name, name];
 }
 
-static NSString *makeMIL(size_t channels, const size_t *lengths, size_t tiles, size_t sweeps, const int8_t *fields) {
+// Coupling weights travel sparse: per tile a one-bit mask over the padded
+// [rows, channels] matrix and the nonzero values in mask order, which the
+// program expands with constexpr_sparse_to_dense. The engine consumes that
+// form directly, so a sweep streams the mask and the values rather than the
+// dense fp16 matrix, and the output is bit-identical to the dense program.
+// docs/perf/2026-09-18-ane-utilization.md records the measurement.
+typedef struct { uint64_t maskOffset, dataOffset; size_t nonzero; } QuipTileWeights;
+static const uint32_t kBlobFP16 = 1, kBlobUInt1 = 9;
+
+static size_t align64(size_t bytes) {
+    return (bytes + 63) & ~(size_t)63;
+}
+
+// Blob layout shared by makeMIL and makeWeightBlob: a 64-byte header, then
+// per tile a 64-byte record and payload for the mask, and the same for the
+// values, each payload 64-byte aligned. A tile without a nonzero weight
+// gets one explicit 0.0 under its first mask bit so that no tensor is empty.
+static void layoutTiles(const int8_t *weights, size_t channels, const size_t *lengths, size_t tiles, QuipTileWeights *layout) {
+    uint64_t offset = 64;
+    size_t weightOffset = 0;
+    for (size_t tile = 0; tile < tiles; ++tile) {
+        size_t elements = ((lengths[tile] + 31) / 32 * 32) * channels, nonzero = 0;
+        for (size_t i = 0; i < elements; ++i) nonzero += weights[weightOffset + i] != 0;
+        if (nonzero == 0) nonzero = 1;
+        layout[tile].maskOffset = offset;
+        offset += 64 + align64(elements / 8);
+        layout[tile].dataOffset = offset;
+        offset += 64 + align64(nonzero * sizeof(_Float16));
+        layout[tile].nonzero = nonzero;
+        weightOffset += elements;
+    }
+}
+
+static NSString *makeMIL(size_t channels, const size_t *lengths, size_t tiles, size_t sweeps, const int8_t *fields, const int8_t *weights) {
+    QuipTileWeights layout[24];
+    layoutTiles(weights, channels, lengths, tiles, layout);
     NSMutableString *mil = [NSMutableString stringWithFormat:
         @"program(1.3)\n[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}, {\"quip-ane-msa\", \"%@\"}})]\n{\n  func main<ios18>(%@ a_state", NSUUID.UUID.UUIDString, shape(channels)];
     for (size_t sweep = 0; sweep < sweeps; ++sweep) [mil appendFormat:@", %@ t%zu", shape(channels), sweep];
@@ -154,11 +189,12 @@ static NSString *makeMIL(size_t channels, const size_t *lengths, size_t tiles, s
         "    fp16 zero = const()[name=string(\"zero\"), val=fp16(0.0)];\n"
         "    fp16 one = const()[name=string(\"one\"), val=fp16(1.0)];\n"
         "    fp16 minusTwo = const()[name=string(\"minusTwo\"), val=fp16(-2.0)];\n"];
-    size_t begin = 0, blobOffset = 64;
+    size_t begin = 0;
     for (size_t tile = 0; tile < tiles; ++tile) {
         size_t count = lengths[tile], padded = (count + 31) / 32 * 32;
-        [mil appendFormat:@"    tensor<fp16, [%zu, %zu, 1, 1]> w%zu = const()[name=string(\"w%zu\"), val=tensor<fp16, [%zu, %zu, 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/weight_data.bin\"), offset=uint64(%zu)))];\n", padded, channels, tile, tile, padded, channels, blobOffset];
-        blobOffset += 64 + padded * channels * sizeof(_Float16);
+        [mil appendFormat:@"    tensor<uint1, [%zu, %zu, 1, 1]> m%zu = const()[name=string(\"m%zu\"), val=tensor<uint1, [%zu, %zu, 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/weight_data.bin\"), offset=uint64(%llu)))];\n", padded, channels, tile, tile, padded, channels, (unsigned long long)layout[tile].maskOffset];
+        [mil appendFormat:@"    tensor<fp16, [%zu]> v%zu = const()[name=string(\"v%zu\"), val=tensor<fp16, [%zu]>(BLOBFILE(path=string(\"@model_path/weights/weight_data.bin\"), offset=uint64(%llu)))];\n", layout[tile].nonzero, tile, tile, layout[tile].nonzero, (unsigned long long)layout[tile].dataOffset];
+        [mil appendFormat:@"    tensor<fp16, [%zu, %zu, 1, 1]> w%zu = constexpr_sparse_to_dense(nonzero_data=v%zu, mask=m%zu)[name=string(\"w%zu\")];\n", padded, channels, tile, tile, tile, tile];
         NSMutableArray *values = [NSMutableArray new];
         for (size_t row = 0; row < count; ++row) [values addObject:[NSString stringWithFormat:@"%d.0", (int)fields[begin + row]]];
         [mil appendFormat:@"    tensor<fp16, [%zu]> hFlat%zu = const()[name=string(\"hFlat%zu\"), val=tensor<fp16, [%zu]>([%@])];\n", count, tile, tile, count, [values componentsJoinedByString:@","]];
@@ -216,34 +252,47 @@ static NSString *makeMIL(size_t channels, const size_t *lengths, size_t tiles, s
     return mil;
 }
 
-static NSData *makeWeightBlob(const int8_t *weights, size_t channels, const size_t *lengths, size_t tiles, size_t count) {
-    NSMutableData *blob = [NSMutableData dataWithLength:64 + 64 * tiles + count * sizeof(_Float16)];
+// One 64-byte blob record: sentinel, MIL dtype, payload size, payload offset.
+static void writeBlobRecord(uint8_t *record, uint32_t dtype, uint64_t size, uint64_t payloadOffset) {
+    uint32_t sentinel = CFSwapInt32HostToLittle(0xDEADBEEF), littleType = CFSwapInt32HostToLittle(dtype);
+    uint64_t littleSize = CFSwapInt64HostToLittle(size), littleOffset = CFSwapInt64HostToLittle(payloadOffset);
+    memcpy(record, &sentinel, sizeof(sentinel));
+    memcpy(record + 4, &littleType, sizeof(littleType));
+    memcpy(record + 8, &littleSize, sizeof(littleSize));
+    memcpy(record + 16, &littleOffset, sizeof(littleOffset));
+}
+
+static NSData *makeWeightBlob(const int8_t *weights, size_t channels, const size_t *lengths, size_t tiles) {
+    QuipTileWeights layout[24];
+    layoutTiles(weights, channels, lengths, tiles, layout);
+    QuipTileWeights last = layout[tiles - 1];
+    NSMutableData *blob = [NSMutableData dataWithLength:last.dataOffset + 64 + align64(last.nonzero * sizeof(_Float16))];
     uint8_t *bytes = blob.mutableBytes;
-    uint32_t chunkCount = CFSwapInt32HostToLittle((uint32_t)tiles);
+    uint32_t chunkCount = CFSwapInt32HostToLittle((uint32_t)(2 * tiles));
     memcpy(bytes, &chunkCount, sizeof(chunkCount));
     bytes[4] = 2;
-    size_t offset = 64, weightOffset = 0;
+    size_t weightOffset = 0;
     for (size_t tile = 0; tile < tiles; ++tile) {
         size_t elements = ((lengths[tile] + 31) / 32 * 32) * channels;
-        const size_t positions[] = {0, 4};
-        const uint32_t values[] = {0xDEADBEEF, 1};
-        for (size_t i = 0; i < 2; ++i) {
-            uint32_t little = CFSwapInt32HostToLittle(values[i]);
-            memcpy(bytes + offset + positions[i], &little, sizeof(little));
-        }
-        uint64_t size = CFSwapInt64HostToLittle(elements * sizeof(_Float16));
-        uint64_t payload = CFSwapInt64HostToLittle(offset + 64);
-        memcpy(bytes + offset + 8, &size, sizeof(size));
-        memcpy(bytes + offset + 16, &payload, sizeof(payload));
+        uint8_t *mask = bytes + layout[tile].maskOffset + 64;
+        uint8_t *data = bytes + layout[tile].dataOffset + 64;
+        size_t nonzero = 0;
         for (size_t i = 0; i < elements; ++i) {
-            _Float16 value = (_Float16)weights[weightOffset + i];
+            int8_t weight = weights[weightOffset + i];
+            if (weight == 0) continue;
+            mask[i / 8] |= (uint8_t)(1 << (i % 8));
+            _Float16 value = (_Float16)weight;
             uint16_t bits;
             memcpy(&bits, &value, sizeof(bits));
             bits = CFSwapInt16HostToLittle(bits);
-            memcpy(bytes + offset + 64 + i * sizeof(bits), &bits, sizeof(bits));
+            memcpy(data + nonzero * sizeof(bits), &bits, sizeof(bits));
+            nonzero += 1;
         }
+        // An empty tile carries one explicit zero, as layoutTiles counted.
+        if (nonzero == 0) { mask[0] = 1; nonzero = 1; }
+        writeBlobRecord(bytes + layout[tile].maskOffset, kBlobUInt1, elements / 8, layout[tile].maskOffset + 64);
+        writeBlobRecord(bytes + layout[tile].dataOffset, kBlobFP16, nonzero * sizeof(_Float16), layout[tile].dataOffset + 64);
         weightOffset += elements;
-        offset += 64 + elements * sizeof(_Float16);
     }
     return blob;
 }
@@ -300,7 +349,7 @@ int32_t quip_ane_create(size_t input_channels, const size_t *lengths, size_t til
             NSError *nativeError = nil;
             NSData *plist = [NSPropertyListSerialization dataWithPropertyList:@{} format:NSPropertyListXMLFormat_v1_0 options:0 error:&nativeError];
             if (plist == nil) return fail(error, error_capacity, describe(@"Serialize ANE options", nativeError));
-            NSData *mil = [makeMIL(input_channels, lengths, tile_count, sweeps, fields) dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *mil = [makeMIL(input_channels, lengths, tile_count, sweeps, fields, weights) dataUsingEncoding:NSUTF8StringEncoding];
             id descriptor = [[descriptorClass alloc] initWithNetworkText:mil weights:@{} optionsPlist:plist isMILModel:YES];
             if (descriptor == nil) return fail(error, error_capacity, @"ANE descriptor creation failed");
             QuipAneProgram *result = [QuipAneProgram new];
@@ -328,7 +377,7 @@ int32_t quip_ane_create(size_t input_channels, const size_t *lengths, size_t til
                 return fail(error, error_capacity, describe(@"Stage ANE program", nativeError));
             }
             NSString *weightPath = [weightDirectory stringByAppendingPathComponent:@"weight_data.bin"];
-            if (![makeWeightBlob(weights, input_channels, lengths, tile_count, weight_count) writeToFile:weightPath options:NSDataWritingAtomic error:&nativeError]) return fail(error, error_capacity, describe(@"Stage ANE weights", nativeError));
+            if (![makeWeightBlob(weights, input_channels, lengths, tile_count) writeToFile:weightPath options:NSDataWritingAtomic error:&nativeError]) return fail(error, error_capacity, describe(@"Stage ANE weights", nativeError));
             requireSelector(result.model, @selector(compileWithQoS:options:error:));
             if (![result.model compileWithQoS:21 options:@{} error:&nativeError]) return fail(error, error_capacity, describe(@"Compile ANE program", nativeError));
             requireSelector(result.model, @selector(loadWithQoS:options:error:));
