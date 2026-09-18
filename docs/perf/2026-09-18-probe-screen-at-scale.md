@@ -8,13 +8,13 @@ the target?
 
 ## Result
 
-It holds, and the screen is worth about 14.6 times the valid proofs per
-second of an unscreened miner on one M4 Max.
+It holds, and the screen is worth 15.6 times the valid proofs per second of
+an unscreened miner on one M4 Max, with a spread of 0.7 across five rounds.
 
 A 512-sweep probe at 64 reads ranks 50,000 fresh nonces against the full
 14,336-sweep job at Spearman +0.923. Keeping the 390 nonces the probe ranks
 deepest, 1 in 128, holds all 10 of the deepest by the full job and 46 of the
-deepest 50. The screened miner examines 186 nonces per second against 12.8
+deepest 50. The screened miner examines 203 nonces per second against 13.0
 for the unscreened one.
 
 The probe picks instances whose energy floor is deep for any solver, rather
@@ -27,7 +27,7 @@ short of the chain's target of −14,625,068. The random control's deepest
 stops 103,068 short.
 
 The accuracy of the screen is not what limits it. The probe's own rate is.
-Keeping 1 in 128 already captures 89% of the speed an infinitely selective
+Keeping 1 in 128 already captures 88% of the speed an infinitely selective
 screen would reach, and keeping less than that trades recall for almost
 nothing.
 
@@ -68,17 +68,23 @@ one M4 Max:
 
 | Miner | Nonces examined per second | Expected time to one valid proof |
 | --- | ---: | ---: |
-| No screen, 64 reads, 14,336 sweeps | 12.8 | 76 hours |
-| 512-sweep probe, keep 1 in 128 | 186 | 5.2 hours |
+| No screen, 64 reads, 14,336 sweeps | 13.0 | 74 hours |
+| 512-sweep probe, keep 1 in 128 | 203 | 4.8 hours |
 
 Those hours are an extrapolation one standard deviation beyond the deepest
-of 50,000 nonces, not a measurement. The ratio between the two rows, 14.6,
+of 50,000 nonces, not a measurement. The ratio between the two rows, 15.6,
 rests only on the measured rates and the measured recall.
 
 The composite rate is the series sum of the two stages: one probe for every
-nonce, plus one full solve for every one hundred and twenty-eighth nonce. A screen that keeps a smaller
-fraction approaches the probe's own rate of 210 nonces per second and no
-higher.
+nonce, plus one full solve for every one hundred and twenty-eighth nonce. A
+screen that keeps a smaller fraction approaches the probe's own rate of 232
+nonces per second and no higher.
+
+The full stage needs its kept nonces buffered. At 1 in 128 they arrive at
+1.6 per second and a batch holds 20 jobs, so a miner that dispatches each
+kept nonce as it arrives would run batches of one or two and leave most of
+the device idle. Accumulate 40 kept nonces, about 25 seconds of probing,
+before dispatching, so the streaming loop keeps two full batches in flight.
 
 ## Choosing the probe and the keep fraction
 
@@ -87,9 +93,9 @@ instances.
 
 | Probe | Rate, nonces per second | Spearman against the full job | Best speedup | Keep fraction at the best speedup |
 | --- | ---: | ---: | ---: | ---: |
-| 64 reads, 512 sweeps | 210.4 | +0.923 | 14.6× | 1 in 128 |
-| 64 reads, 1,024 sweeps | 141.1 | +0.942 | 10.2× | 1 in 128 |
-| 64 reads, 4,096 sweeps | 38.3 | +0.965 | 2.9× | 1 in 128 |
+| 64 reads, 512 sweeps | 232 ± 9 | +0.923 | 15.6 ± 0.7× | 1 in 128 |
+| 64 reads, 1,024 sweeps | 144 ± 5 | +0.942 | 10.2 ± 0.2× | 1 in 128 |
+| 64 reads, 4,096 sweeps | 41 ± 4 | +0.965 | 3.1 ± 0.3× | 1 in 128 |
 
 The shortest probe wins. A longer probe ranks better and costs more, and the
 cost grows faster than the ranking improves. The 800-nonce study could not
@@ -99,12 +105,12 @@ Recall as the screen tightens, for the 512-sweep probe:
 
 | Keep | Nonces kept of 50,000 | Probe cutoff, milli | Deepest 50 held | Deepest 10 held | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 in 32 | 1,562 | −14,366,000 | 50 of 50 | 10 of 10 | 10.9× |
-| 1 in 64 | 781 | −14,380,000 | 50 of 50 | 10 of 10 | 13.1× |
-| 1 in 128 | 390 | −14,396,000 | 46 of 50 | 10 of 10 | 14.6× |
-| 1 in 256 | 195 | −14,408,000 | 39 of 50 | 10 of 10 | 15.5× |
-| 1 in 512 | 97 | −14,418,000 | 32 of 50 | 9 of 10 | 16.0× |
-| 1 in 1,024 | 48 | −14,430,000 | 25 of 50 | 9 of 10 | 16.2× |
+| 1 in 32 | 1,562 | −14,366,000 | 50 of 50 | 10 of 10 | 11.4× |
+| 1 in 64 | 781 | −14,380,000 | 50 of 50 | 10 of 10 | 13.9× |
+| 1 in 128 | 390 | −14,396,000 | 46 of 50 | 10 of 10 | 15.6× |
+| 1 in 256 | 195 | −14,408,000 | 39 of 50 | 10 of 10 | 16.7× |
+| 1 in 512 | 97 | −14,418,000 | 32 of 50 | 9 of 10 | 17.2× |
+| 1 in 1,024 | 48 | −14,430,000 | 25 of 50 | 9 of 10 | 17.5× |
 
 Past 1 in 128 the speedup gains 12% in total while the deepest 50 lose more
 than half their members. A miner sets the cutoff as an absolute energy, not
@@ -147,46 +153,83 @@ lowers the energy on 98 of 100 nonces.
 
 ## Rates on the streaming path
 
-The preceding rates come from the batched streaming path, which is how a miner
-runs. Earlier reports used `scripts/testnet/run_reads_study.py`, which
-starts one process per nonce and runs eight at a time. The two paths differ
-only in fixed cost per job.
+Every rate here comes from one controlled test of five rounds. A round runs
+all four budgets back to back in one process. The order of the budgets
+rotates each round, so drift and ordering cannot look like a budget effect.
+The machine was not quiet. Load averages ran from 3 to 20 on 16 cores, and
+so each rate carries a spread.
 
-| Budget | Streaming, nonces per second | One process per nonce |
-| --- | ---: | ---: |
-| 64 reads, 512 sweeps | 210.4 | |
-| 64 reads, 1,024 sweeps | 141.1 | 90.6 |
-| 64 reads, 4,096 sweeps | 38.3 | 41.5 |
-| 64 reads, 14,336 sweeps | 12.8 | 14.0 |
-
-Fitting each path as a fixed cost plus a cost per 1,024 sweeps gives 2.4 ms
-fixed and 4.7 ms per 1,024 sweeps for the streaming path, against 6.7 ms and
-4.35 ms of wall time per job for the process path at its eight-way width.
-The two agree on the cost of a sweep within 8%. The process path pays a
-device open, a kernel compile and a problem parse for every nonce, which is
-most of a 1,024-sweep job and none of a 14,336-sweep one. That is why
-streaming wins on short probes and loses on full jobs.
-
-A debug-logged run confirms the device time directly. At 64 reads the batch
-holds 20 jobs, which is 40 threadgroups, one per GPU core.
-
-| Budget | Device time per job | Device time per sweep | Device busy against wall |
+| Budget | Streaming, nonces per second | Spread over five rounds | One process per nonce |
 | --- | ---: | ---: | ---: |
-| 64 reads, 1,024 sweeps | 9.3 ms | 9.08 µs | 109% |
-| 64 reads, 14,336 sweeps | 137.1 ms | 9.56 µs | 183% |
+| 64 reads, 512 sweeps | 232 ± 9 | 11% | |
+| 64 reads, 1,024 sweeps | 144 ± 5 | 11% | 90.6 |
+| 64 reads, 4,096 sweeps | 41 ± 4 | 26% | 41.5 |
+| 64 reads, 14,336 sweeps | 13.0 ± 0.7 | 14% | 14.0 |
 
-Device time per sweep is constant across a 14-fold range of sweep counts,
-which is the check that the short budget runs the sweeps it claims. Device
-busy time past 100% of wall time is the two batches the streaming loop keeps
-in flight.
+The ratio of a probe's rate to the full job's, taken inside a single round,
+is far steadier than either rate on its own, and the screen's speedup
+depends only on that ratio. The 1,024-sweep probe runs 11.05 times the full
+job's rate with a spread of 0.21 across the five rounds, the 512-sweep probe
+17.83 with a spread of 0.94.
 
-The largest single chunk in that run was 366 ms, against the 400 ms bound
-the GPU watchdog enforces. Bead `quip-miner-metal-fjo.3` closed on the
-envelope that produces it.
+`scripts/testnet/run_reads_study.py` produced the last column. It starts one
+process per nonce and runs eight at a time. Fitting each path as a fixed
+cost plus a cost per sweep gives 1.98 ms and 5.24 µs per sweep for the
+streaming path, against 6.4 ms and 4.54 µs per sweep of pool time for the
+process path. The process path pays a device open, a kernel compile, and a
+problem parse for every nonce, and streaming removes nearly that whole cost. The
+process path in exchange keeps eight independent dispatches on the device
+and fills it slightly better than two overlapping batches of 20 jobs at 64
+reads. The two curves cross near 6,300 sweeps, so streaming wins on the
+probes, draws at 4,096 sweeps, and loses on the full job.
+
+That one fit describes every budget measured:
+
+| Budget | Wall per job, predicted | Observed | Difference |
+| --- | ---: | ---: | ---: |
+| 64 reads, 512 sweeps | 4.67 ms | 4.32 ms | −8.1% |
+| 64 reads, 1,024 sweeps | 7.35 ms | 6.96 ms | −5.7% |
+| 64 reads, 4,096 sweeps | 23.46 ms | 24.45 ms | +4.0% |
+| 64 reads, 14,336 sweeps | 77.16 ms | 76.92 ms | −0.3% |
+
+One straight line covers a 28-fold range of sweep counts within 8%, which is
+the check that each budget runs the sweeps it claims. A budget that skipped
+work would sit below the line.
+
+Device time tells the same story from the other side, and it also shows what
+holds the probes back. At 64 reads a batch holds 20 jobs, which is 40
+threadgroups, one per GPU core.
+
+| Budget | Device time per job | Device busy against wall |
+| --- | ---: | ---: |
+| 64 reads, 512 sweeps | 3.3 ms | 77% |
+| 64 reads, 1,024 sweeps | 7.3 ms | 105% |
+| 64 reads, 4,096 sweeps | 38.2 ms | 155% |
+| 64 reads, 14,336 sweeps | 139.0 ms | 181% |
+
+Device busy time past 100% of wall time counts two overlapping command
+buffers twice, so that column measures overlap rather than work, and device
+time per sweep is not comparable between budgets for that reason. Below 100%
+it means the opposite: at 512 sweeps the device stands idle for 23% of the
+run because the host cannot feed it. The host rescores every job's 64
+samples over 41,514 edges, a cost per job that does not shrink with the
+sweep count, so the shortest probe is the budget that competes with whatever
+else the machine is doing. A miner on a quiet machine should reach the top
+of the measured range or better.
+
+The chunk planner does not hold its bound on this envelope. Across 95
+batches at 64 reads and 14,336 sweeps, two chunks ran past the 400 ms the
+GPU watchdog allows, the longest at 444 ms. None passed 500 ms, and an
+earlier run on a quieter machine peaked at 366 ms, so host contention
+appears to stretch a chunk past what the planner expects. Bead
+`quip-miner-metal-fjo.11` carries it.
 
 ## Limits
 
-The study covers one machine, one topology, and one target. Every energy is
+The study covers one machine, one topology, and one target. The machine
+carried other work throughout, so every rate is a range rather than a point,
+and the probe rates are the ones that suffer most from it. The energies do
+not depend on machine load. Every energy is
 the best of 64 reads at a fixed budget, not the lowest the solver can reach.
 The keep fractions and cutoffs come from a fit on these 50,000 nonces, with
 no out-of-sample test. The hours per valid proof extrapolate a normal tail one standard
@@ -223,10 +266,18 @@ QUIP_SCREEN_SEEDS=deep-seeds.txt QUIP_SCREEN_STAGES=256x65536 QUIP_SCREEN_OUT=de
   cargo test --release --test probe_screen probe_then_solve -- --ignored --nocapture
 scripts/testnet/annealer/screen_deep.py report docs/perf/data/2026-09-18-screen-50k/deep-members.csv docs/perf/data/2026-09-18-screen-50k/deep-256x65536.csv
 
-# Device time
-QUIP_SCREEN_NONCES=400 QUIP_SCREEN_STAGES=64x1024,64x14336 RUST_LOG=quip_miner_metal=debug \
+# Rates and device time: one round of five, budgets rotated between rounds.
+# The third field of a stage caps how many nonces it takes, so budgets of
+# different cost run for a similar time.
+QUIP_SCREEN_NONCES=7000 QUIP_SCREEN_STAGES=64x512x7000,64x1024x4000,64x4096x1100,64x14336x380 \
+  RUST_LOG=quip_miner_metal=debug \
   cargo test --release --test probe_screen probe_then_solve -- --ignored --nocapture
 ```
+
+The harness reports how the producer thread split its time. Drawing one
+instance takes 0.25 ms and the producer spends more than 90% of a run
+blocked on a full channel, so the device sets the rate rather than the
+harness.
 
 `docs/perf/data/2026-09-18-screen-50k/` holds the best energy of all four
 budgets for every nonce, gzipped, and the deep stage's energies with the

@@ -18,7 +18,10 @@
 //! Knobs: `QUIP_SCREEN_NONCES` (default 500), `QUIP_SCREEN_SEED` (run seed
 //! for the nonce draw, default 20260918), `QUIP_SCREEN_SEEDS` (a file of
 //! 32-byte hex nonce seeds, one per line, which replaces the draw),
-//! `QUIP_SCREEN_STAGES` (`READSxSWEEPS` list, default `64x1024,64x14336`),
+//! `QUIP_SCREEN_STAGES` (`READSxSWEEPS[xNONCES]` list, default
+//! `64x1024,64x14336`; the optional third field caps how many of the run's
+//! nonces that stage takes, so shapes of different cost can run for a
+//! similar time),
 //! `QUIP_SCREEN_TARGET` (milli, default the Aglais target of 2026-09-18),
 //! `QUIP_SCREEN_OUT` (CSV path, default `probe-screen.csv`).
 //!
@@ -38,7 +41,7 @@ use quip_miner_metal::{IsingGraph, Kernel};
 use quip_solver_core::quip_protocol::chacha8::draw_ising_milli;
 use quip_solver_core::{CancelToken, SampleParams, StreamJob, StreamOutcome};
 use std::io::Write;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct NoGovernor;
 
@@ -159,16 +162,25 @@ fn hex(seed: &[u8; 32]) -> String {
 struct Stage {
     num_reads: usize,
     num_sweeps: usize,
+    /// How many of the run's nonces this stage takes, from the front. `None`
+    /// takes all of them. A rate comparison needs a long shape and a short
+    /// shape to run for a similar time, which needs different counts.
+    nonces: Option<usize>,
 }
 
 fn parse_stages(spec: &str) -> Vec<Stage> {
     spec.split(',')
         .map(|s| {
-            let (reads, sweeps) = s.trim().split_once('x').expect("READSxSWEEPS");
-            Stage {
+            let mut fields = s.trim().split('x');
+            let reads = fields.next().expect("READSxSWEEPS[xNONCES]");
+            let sweeps = fields.next().expect("READSxSWEEPS[xNONCES]");
+            let stage = Stage {
                 num_reads: reads.parse().expect("reads"),
                 num_sweeps: sweeps.parse().expect("sweeps"),
-            }
+                nonces: fields.next().map(|n| n.parse().expect("nonces")),
+            };
+            assert!(fields.next().is_none(), "READSxSWEEPS[xNONCES]");
+            stage
         })
         .collect()
 }
@@ -203,11 +215,19 @@ fn run_stage(
     let producer = {
         let edges = edges.to_vec();
         let seeds = seeds.to_vec();
+        // Report how the producer split its time. Drawing one instance copies
+        // about a megabyte, so a short probe can starve on the producer rather
+        // than the device. `blocked` is time waiting on a full channel, which
+        // is the device holding the producer back and the state we want.
         std::thread::spawn(move || {
+            let (mut drawing, mut blocked) = (Duration::ZERO, Duration::ZERO);
             for (i, seed) in seeds.iter().enumerate() {
+                let t = Instant::now();
+                let graph = instance(*seed, &edges);
+                drawing += t.elapsed();
                 let job = StreamJob {
                     job_id: i.to_string().into_bytes(),
-                    graph: instance(*seed, &edges),
+                    graph,
                     params: SampleParams {
                         num_reads: stage.num_reads,
                         num_sweeps: stage.num_sweeps,
@@ -217,10 +237,14 @@ fn run_stage(
                     },
                     watermark: None,
                 };
-                if job_tx.blocking_send(job).is_err() {
-                    return;
+                let t = Instant::now();
+                let sent = job_tx.blocking_send(job);
+                blocked += t.elapsed();
+                if sent.is_err() {
+                    break;
                 }
             }
+            (drawing, blocked)
         })
     };
 
@@ -268,7 +292,14 @@ fn run_stage(
     }
     let wall_s = start.elapsed().as_secs_f64();
     worker.join().expect("stream worker");
-    producer.join().expect("producer");
+    let (drawing, blocked) = producer.join().expect("producer");
+    eprintln!(
+        "  producer: drawing {:.1} s, blocked on the device {:.1} s, of {wall_s:.1} s wall;\
+         {:.2} ms per instance",
+        drawing.as_secs_f64(),
+        blocked.as_secs_f64(),
+        1000.0 * drawing.as_secs_f64() / count as f64
+    );
     (summaries, wall_s)
 }
 
@@ -330,15 +361,17 @@ fn probe_then_solve_on_fresh_nonces() {
 
     let mut columns = Vec::with_capacity(stages.len());
     for (k, stage) in stages.iter().enumerate() {
-        let (summaries, wall_s) = run_stage(&edges, &seeds, *stage, k, target);
+        let run = &seeds[..stage.nonces.unwrap_or(seeds.len()).min(seeds.len())];
+        let (mut summaries, wall_s) = run_stage(&edges, run, *stage, k, target);
         let done = summaries.iter().flatten().count();
         eprintln!(
             "stage {}x{}: {done} of {} jobs in {wall_s:.1} s = {:.2} jobs/s; wall_seconds={wall_s:.6}",
             stage.num_reads,
             stage.num_sweeps,
-            seeds.len(),
+            run.len(),
             done as f64 / wall_s
         );
+        summaries.resize(seeds.len(), None);
         columns.push(summaries);
     }
 

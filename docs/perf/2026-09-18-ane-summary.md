@@ -151,8 +151,8 @@ On 50,000 fresh nonces the solver at 64 reads and 14,336 sweeps lands 5.0
 standard deviations short of today's target, none valid, and the instance
 sets 98% of a job's energy. A 512-sweep probe ranks those nonces at Spearman
 +0.923, and solving only the 1 in 128 it ranks deepest keeps all 10 of the
-deepest and 46 of the deepest 50, worth 14.6 times the valid proofs per
-second on one M4 Max. A solver at 256 reads and 65,536 sweeps agrees with
+deepest and 46 of the deepest 50, worth 15.6 times the valid proofs per
+second on one M4 Max, with a spread of 0.7 over five rounds. A solver at 256 reads and 65,536 sweeps agrees with
 the probe at +0.95 on an unrestricted sample, and its deepest probe-picked
 nonce stops 11,068 milli short of the target against 103,068 for a random
 control, so the probe reads the instance rather than the budget. An annealer
