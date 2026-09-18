@@ -469,17 +469,32 @@ mod tests {
 
     #[test]
     fn startup_cancellation_reaps_worker_and_cleans_artifacts() {
+        // The worker sleeps for this long. Cancellation that failed to
+        // interrupt it would block for the whole duration, so the property
+        // under test is "returned without waiting for the child", not
+        // "returned inside some fixed budget". Half the child's sleep is the
+        // widest margin that still proves it, and it leaves enough headroom
+        // to survive a loaded machine: observed cancellations take 0.17 to
+        // 0.20 s, so this trips only on a real regression.
+        const CHILD_SLEEP: Duration = Duration::from_secs(30);
+
         let fixture = tempfile::tempdir().unwrap();
         let receipt = fixture.path().join("receipt");
         let body = format!(
-            "printf '%s\\n%s\\n' \"$$\" \"$TMPDIR\" > '{}'\nexec /bin/sleep 30",
-            receipt.display()
+            "printf '%s\\n%s\\n' \"$$\" \"$TMPDIR\" > '{}'\nexec /bin/sleep {}",
+            receipt.display(),
+            CHILD_SLEEP.as_secs()
         );
         let (_script_dir, path) = script(&body);
         let start = Instant::now();
         let result = AneSampler::open_with_cancel(path, &|| receipt.exists());
         assert!(matches!(result, Err(OpenError(message)) if message.contains("cancelled")));
-        assert!(start.elapsed() < Duration::from_secs(2));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < CHILD_SLEEP / 2,
+            "cancellation took {elapsed:?}, not clearly faster than waiting out \
+             the child's {CHILD_SLEEP:?} sleep"
+        );
         let text = std::fs::read_to_string(receipt).unwrap();
         let mut lines = text.lines();
         let pid = lines.next().unwrap().parse().unwrap();
