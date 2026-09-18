@@ -549,7 +549,7 @@ has narrowed from Task 7's 33.0% best figure to 21.7%.
 
 Four spots hold part of the remaining 110.069 ms, named here rather than
 estimated by assertion. This section did not instrument any of the four
-directly. It bounds all of them together with one arithmetic check. Add
+directly. It bounds the four together with one arithmetic check. Add
 `child_arg_parse_us` (0.064 ms), `setup_us` (346.355 ms), and `anneal_us`
 (6.705 ms), the child's own compute Tasks 1, 7, and this section's own
 `RunStats` figures already name, and subtract that sum from `wait_us`'s
@@ -620,6 +620,44 @@ persistent worker would also remove the 283.887 ms `compile_ms` median
 from Task 1's stage table, for a combined saving of 284.918 ms per job. If
 it does not, the saving stays at 1.031 ms. State which figure you use, and
 why, alongside Task 4's result.
+
+## Weight swap
+
+Task 4 tested whether overwriting `weights/weight_data.bin` in the staging
+directory, then calling `unloadWithQoS:` followed by `loadWithQoS:`, can
+change a compiled program's couplings without a new `compileWithQoS:` pass.
+If it could, a persistent worker could reuse one compiled program across
+jobs instead of paying `compile_ms` on every job.
+
+**Outcome 3.** Across three runs, each in its own process with a 3-second
+sleep before it, the output after the weight swap and reload equals the
+output before it, byte for byte, not the host-computed prediction for the
+negated weights. The runtime caches the couplings at compile time. The
+283.887 ms `compile_ms` median in the preceding Stage table stays in the
+fixed-setup budget. Nothing in this section changes it.
+
+| Quantity | Median across 3 runs, ms |
+| --- | ---: |
+| unload_ms | 0.777 |
+| reload_ms | 2.662 |
+| compile_ms this task's outcome fails to remove | 283.887 |
+
+The unload-plus-reload time, 3.439 ms at the median, is far below
+`compile_ms`. That speed is moot: outcome 3 means the reload path produces
+the wrong (unchanged) result regardless of how fast it runs.
+
+Given outcome 3, the remaining option to remove the per-job compile is to
+make the couplings a runtime input rather than a compile-time constant.
+`docs/perf/2026-09-16-ane-local-routing.md` already measured one
+runtime-input design, the local sweep, at 3.4 to 3.6 times slower than the
+matched dense (compiled) control (`docs/perf/2026-09-16-ane-local-routing.md:6`).
+Any runtime-input redesign for this bridge starts from that gap, not from
+zero.
+
+Full method, receipts, commands, and the host-side integer check, plus a
+separate finding on whether production jobs' fields (`h`) can differ from
+the fields used to compile a program, are in
+`.superpowers/sdd/2026-09-17-ane-throughput/task-4-report.md`.
 
 ## Platform
 
