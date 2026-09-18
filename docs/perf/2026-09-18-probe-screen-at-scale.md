@@ -20,7 +20,7 @@ for the unscreened one, and waits 3.4 seconds for its first answer against
 
 The probe picks instances whose energy floor is deep for any solver, rather
 than instances that suit a 14,336-sweep anneal. On the 100 nonces the probe ranked deepest, a
-solver at 256 reads and 65,536 sweeps, 45 times the effort, reaches a median
+solver at 256 reads and 65,536 sweeps, 18 times the effort, reaches a median
 of −14,555,000 milli against −14,412,000 on 100 random nonces. All 20 of the
 deepest nonces under that solver came from the probe's picks and none from
 the random control. Its deepest is **−14,614,000**, which is 11,068 milli
@@ -124,9 +124,9 @@ probe energy on full energy gives a slope of 0.976 and a residual spread of
 ## Does a stronger solver agree
 
 A screen that only predicted what a 14,336-sweep anneal does would be
-circular. The deep stage tests the ranking against a solver 45 times
-stronger: 256 reads and 65,536 sweeps, run on three sets of 100 nonces drawn
-from the same 50,000.
+circular. The deep stage tests the ranking against a solver 18 times
+stronger by reads and sweeps: 256 reads and 65,536 sweeps, at 0.79 nonces
+per second, run on three sets of 100 nonces drawn from the same 50,000.
 
 | Subset | Median at 14,336 sweeps | Median at 65,536 sweeps, 256 reads | Deepest |
 | --- | ---: | ---: | ---: |
