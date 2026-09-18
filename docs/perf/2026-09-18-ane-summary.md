@@ -47,7 +47,9 @@ cutting to 32 reads giving up three quarters of the samples to save a
 quarter of the time. Above 128 the cost per read roughly doubles. The engine refuses fewer
 than 32 reads outright. The result held against run order, against
 alternating the counts, and against running each in its own process.
-`2026-09-18-ane-read-count.md`.
+`2026-09-18-ane-read-count.md`. The testnet study below confirms it on
+real blocks: 32 reads gives 0.026 valid proofs per second on the ANE
+against 0.037 at 128.
 
 **Couplings as a runtime graph input.** Works and validates, but the best
 variant runs 1.752 ms per sweep against 1.13, so the trade turns negative
@@ -77,6 +79,38 @@ Treat it as a fixed per-job cost.
 
 At 16,384 sweeps the compile is 0.9% of the job, so it no longer merits
 attention. It mattered when jobs were 2,048 sweeps and it was 277 ms.
+
+## Models in flight, and the GPU next to the ANE
+
+The ANE runs one model at a time. The runtime overlaps at most two
+dispatches, which is where the 15% at two workers and 25% at four come
+from. The GPU holds 40 threadgroups of 32 replicas each, one per core, so
+it holds 10 models at 128 reads and 40 at 32, with two batches in flight
+on top. At 16,384 sweeps and 128 reads the GPU runs 7.3 jobs per second
+and the ANE 0.068, or 0.086 with four workers. The ANE adds about 1% to
+the GPU. `2026-09-18-gpu-reads-and-models.md`.
+
+The GPU trades reads for models linearly down to 64 reads, at 1.8 times
+the jobs per second of 128. At 32 reads the default two-batch overlap puts
+80 distinct problems in flight and the per-batch GPU time rises 2.7 times,
+so 32 reads reaches 2.1 times under the default and 2.8 times with one
+batch at a time. Reads and the overlap policy interact.
+
+## Read count against the testnet's own blocks
+
+Sixty recent Aglais blocks, regenerated exactly from their nonces, and run
+at 16,384 sweeps. The chance that one job produces a valid proof is 0.30
+at 32 reads, 0.40 at 64, 0.54 at 128, and 0.68 at 256. The chance that it
+beats the energy that won the block is 0.16, 0.20, 0.32, and 0.47. Reads
+raise the chance per job, and the GPU's jobs per second fall faster than
+the chance rises, so on the GPU 64 reads gives the most valid proofs per
+second under the default streaming, at about 5.0 against 3.9 at 128, and
+32 reads with one batch at a time gives 6.1. The ANE keeps 128.
+
+The testnet mines zero-field problems on the Advantage2 graph with one
+read below target as a valid proof. Winners self-report 1.0 to 3.9 s of
+compute. `2026-09-18-testnet-reads-study.md` carries the fetch, the
+regeneration with its nonce check, and the run.
 
 ## Open questions
 

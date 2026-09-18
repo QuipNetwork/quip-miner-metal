@@ -210,9 +210,13 @@ Static slices remove that padding before spin updates.
 Requested reads may be 1 through 128.
 Execution always uses 128 physical lanes.
 
-Measurement keeps that count. It costs 5.09 microseconds per read, against
-15.31 at 32 lanes and 9.99 at 256, so it is a minimum rather than a plateau.
-`docs/perf/2026-09-18-ane-read-count.md` records the sweep.
+Measurement keeps that count. A sweep costs 0.425 ms plus 1.75 microseconds
+per read, and the fixed part is the coupling stream, so 32 reads saves a
+quarter of the time for three quarters fewer samples.
+`docs/perf/2026-09-18-ane-read-count.md` records the sweep. Against the
+testnet's own blocks, 32 reads produces fewer valid proofs per second on
+the ANE than 128 does. `docs/perf/2026-09-18-testnet-reads-study.md`
+records that result.
 
 At each node and sweep, each group of 32 replicas shares one threshold value.
 The four groups use independent streams.
