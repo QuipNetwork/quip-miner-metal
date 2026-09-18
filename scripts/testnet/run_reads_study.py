@@ -11,6 +11,10 @@ time. The CSV records each job's best energy against the block's target
 Knobs: `READS` (default `32,64,128,256`), `SEEDS` per block and read count
 (default 5), `SWEEPS` (default 16384), `WIDTH` (default 8). Rows are written
 as they finish, so a partial run still has usable data.
+
+The RNG seed of a job comes from `(qblock_id, reads, k)`, so two runs at
+different sweep counts share seeds. `K0` (default 0) offsets `k` when a run
+needs seeds that no other run on the same problems has used.
 """
 
 import csv
@@ -25,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 BIN, PROBLEMS, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
 READS = [int(x) for x in os.environ.get("READS", "32,64,128,256").split(",")]
 SEEDS = int(os.environ.get("SEEDS", "5"))
+K0 = int(os.environ.get("K0", "0"))
 SWEEPS = int(os.environ.get("SWEEPS", "16384"))
 WIDTH = int(os.environ.get("WIDTH", "8"))
 FIELDS = [
@@ -99,7 +104,7 @@ def run(job):
 
 
 def main():
-    jobs = [(e, r, k) for e in INDEX for r in READS for k in range(SEEDS)]
+    jobs = [(e, r, k) for e in INDEX for r in READS for k in range(K0, K0 + SEEDS)]
     # Interleave read counts so drift in machine state falls on all of them alike.
     jobs.sort(key=lambda j: (j[2], j[0]["qblock_id"], j[1]))
     done = 0

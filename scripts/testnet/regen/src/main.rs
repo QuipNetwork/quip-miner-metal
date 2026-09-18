@@ -13,6 +13,11 @@
 //! drawing, the tool recomputes each nonce as
 //! `BLAKE3(last_proof_block_hash || blake2_256(miner) || salt)` and stops on
 //! a mismatch, which pins the nonce byte order.
+//!
+//! A block marked `"fresh": true` skips the nonce check and draws from its
+//! `nonce_seed` as given. `scripts/testnet/make_fresh.py` writes such blocks
+//! with random seeds, which sample the same instance distribution as real
+//! nonces because a BLAKE3 output is uniform.
 
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use quip_protocol::chacha8::draw_ising_milli;
@@ -27,13 +32,18 @@ struct Difficulty {
 #[derive(Deserialize)]
 struct Block {
     qblock_id: u64,
+    #[serde(default)]
     miner: String,
+    #[serde(default)]
     salt: String,
     energy_milli: i64,
     difficulty: Difficulty,
+    #[serde(default)]
     last_proof_block_hash: String,
     topology_hash: String,
     nonce_seed: String,
+    #[serde(default)]
+    fresh: bool,
 }
 
 #[derive(Deserialize)]
@@ -73,18 +83,20 @@ fn main() {
 
     let mut index = Vec::new();
     for b in &input.blocks {
-        let miner32: [u8; 32] = Blake2b::<U32>::digest(hex32(&b.miner)).into();
-        let recomputed = quip_protocol::derive::derive_nonce(
-            hex32(&b.last_proof_block_hash),
-            miner32,
-            hex32(&b.salt),
-        );
-        assert_eq!(
-            hex::encode(recomputed),
-            b.nonce_seed,
-            "nonce mismatch on qblock {}",
-            b.qblock_id
-        );
+        if !b.fresh {
+            let miner32: [u8; 32] = Blake2b::<U32>::digest(hex32(&b.miner)).into();
+            let recomputed = quip_protocol::derive::derive_nonce(
+                hex32(&b.last_proof_block_hash),
+                miner32,
+                hex32(&b.salt),
+            );
+            assert_eq!(
+                hex::encode(recomputed),
+                b.nonce_seed,
+                "nonce mismatch on qblock {}",
+                b.qblock_id
+            );
+        }
 
         let t = &input.topologies[&b.topology_hash];
         let (h, j) = draw_ising_milli(
@@ -122,7 +134,12 @@ fn main() {
         &index,
     )
     .expect("write index");
-    eprintln!("wrote {} problems, nonce check passed on all", index.len());
+    let checked = input.blocks.iter().filter(|b| !b.fresh).count();
+    eprintln!(
+        "wrote {} problems, nonce check passed on {checked}, fresh {}",
+        index.len(),
+        index.len() - checked
+    );
 }
 
 #[cfg(test)]
