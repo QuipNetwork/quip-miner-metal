@@ -118,6 +118,14 @@ Conformance/golden and handshake tests drive the binary in isolation via
 device; CI runs it on a macOS runner, which is the only configuration this
 crate builds in.
 
+Two harnesses carry `#[ignore]` because they take minutes to hours of device
+time. `tests/msa_bench.rs` times one problem through both kernels at a job
+shape the environment sets. `tests/probe_screen.rs` draws fresh nonces on the
+testnet's own instance distribution and runs each nonce through a list of
+read and sweep shapes. That measures what a short probe says about the full
+job. Each file's module comment carries its commands and its environment
+knobs.
+
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).

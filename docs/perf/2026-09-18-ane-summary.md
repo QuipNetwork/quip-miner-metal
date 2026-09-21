@@ -147,14 +147,21 @@ block of that era is reachable. The annealer's winning energy ranks those
 blocks by the solver's energy at Spearman +0.74 to +0.77.
 `2026-09-18-testnet-annealer-blocks.md`.
 
-On 800 fresh nonces the solver at 64 reads and 16,384 sweeps lands 4.7
+On 50,000 fresh nonces the solver at 64 reads and 14,336 sweeps lands 5.0
 standard deviations short of today's target, none valid, and the instance
-sets 98% of a job's energy. A 1,024-sweep probe ranks fresh nonces at
-Spearman +0.95, and keeping the deepest 1 in 8 by probe holds 38 of the 40
-deepest, worth about 3.7 times the valid proofs per second on one M4 Max.
-An annealer at the chain's schedule screens a quarter to a third as many
-nonces per second as that probe, so it pays only with a much faster call
-or a stronger signal than +0.95. `2026-09-18-qpu-screen.md`.
+sets 98% of a job's energy. A 512-sweep probe ranks those nonces at Spearman
++0.923, and solving only the 1 in 128 it ranks deepest keeps all 10 of the
+deepest and 46 of the deepest 50, worth 16.2 times the valid proofs per
+second on one M4 Max, with a spread of 1.4 over ten rounds. The screened
+miner answers its first nonce in 3.4 s against 2.8 s unscreened, so it keeps
+16.1 of those times over the chain's qblock windows, as long as it solves
+each kept nonce on arrival rather than filling a batch first. A solver at 256 reads and 65,536 sweeps agrees with
+the probe at +0.95 on an unrestricted sample, and its deepest probe-picked
+nonce stops 11,068 milli short of the target against 103,068 for a random
+control, so the probe reads the instance rather than the budget. An annealer
+at the chain's schedule screens a seventh to a tenth as many nonces per
+second as that probe. `2026-09-18-probe-screen-at-scale.md` and
+`2026-09-18-qpu-screen.md`.
 
 The testnet mines zero-field problems on the Advantage2 graph with one
 read below target as a valid proof. Winners self-report 1.0 to 3.9 s of
