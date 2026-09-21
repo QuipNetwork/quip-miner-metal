@@ -1,18 +1,19 @@
 # Validation
 
-This file records Apple Neural Engine (ANE) multi-spin simulated annealing results.
+This file records results for multi-spin simulated annealing on the Apple
+Neural Engine (ANE).
 The first standalone version is commit `7c2b1b2`.
-The earlier measurements remain below.
-The sweep redesign has a separate section with new release measurements.
+The earlier results remain below.
+The sweep redesign section has new release data.
 
 ## Host and tools
 
-The host is an Apple M4 Max, model Mac16,5, with 128 GiB memory.
-The operating system is macOS 26.5.2, build 25F84.
+The host is an Apple M4 Max, model Mac16,5. It has 128 GiB of memory.
+The operating system is macOS 26.5.2. Its build is 25F84.
 
-Actual compiler and Cargo versions are 1.98.1.
+The compiler is version 1.98.1. Cargo is also version 1.98.1.
 The rustc commit is `48a229cea`, dated 2026-09-01.
-The local `+1.97.1` toolchain name aliases that compiler.
+The local `+1.97.1` toolchain name refers to that compiler.
 The crate rust-version field is 1.97.
 These checks did not run a Rust 1.97 compiler.
 
@@ -43,7 +44,7 @@ cargo test --manifest-path crates/ane-miner/Cargo.toml --lib
 49 host tests passed.
 That run ignored 18 hardware tests.
 Do not add those 49 host tests to the hardware counts.
-Hardware tests have separate passing receipts below.
+Hardware tests have their own passing receipts below.
 
 Ordinary protocol tests:
 
@@ -53,7 +54,7 @@ cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --test protocol
 
 4 tests passed. The runner ignored 4 hardware tests.
 
-The four passing tests drive the real `quip-ane-msa` binary:
+The four passing tests run the real `quip-ane-msa` binary:
 
 - `--capabilities` JSON matches `ane`, `msa`, width 1, 16,384 nodes, and 163,840 edges
 - `--version` contains `protocol 1`
@@ -66,8 +67,8 @@ Release `--capabilities` output:
 {"backend":"ane","algorithm":"msa","supportedKinds":["ISING_SAMPLE"],"maxNodes":16384,"maxEdges":163840,"features":["streaming"],"protocolVersion":1,"streamWidth":1}
 ```
 
-Protocol 1 capabilities cannot advertise degree or coefficient limits.
-A coordinator must honor the documented degree and coefficient domain.
+Protocol 1 capabilities omit degree and coefficient limits.
+A coordinator must use the documented limits.
 
 Format and Clippy after solver integration:
 
@@ -77,7 +78,7 @@ cargo clippy --manifest-path crates/ane-miner/Cargo.toml --locked --all-targets 
 ```
 
 Both exited 0.
-Clippy reported no warnings.
+Clippy found no warnings.
 
 ## Hardware tests
 
@@ -89,7 +90,7 @@ Ordinary native tests:
 cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --lib native::tests
 ```
 
-That run passed 5 tests and ignored 6 hardware tests.
+That run passed 5 tests. It ignored 6 hardware tests.
 
 Native hardware tests:
 
@@ -108,21 +109,23 @@ That command passed all 6 hardware tests.
 | Rectangular row-major matrix | 1 | Correct 64-input, 32-output mapping |
 | Zero weights and invalid inputs | 1 | Correct flips and eight rejected inputs |
 
-The suite completed 16 dispatches across six tests.
-It recorded nine successful explicit closes.
-The rectangular test reported staging of 45 microseconds and dispatch of 208 microseconds.
-Those single timings exclude compilation.
-They do not establish mining throughput.
+The suite ran 16 dispatches across six tests.
+Nine explicit closes succeeded.
+The rectangular test took 45 microseconds for staging. It took 208
+microseconds for dispatch.
+Those single times exclude compilation.
+They do not show mining throughput.
 This file makes no speed claim versus Metal.
 
-Release `--check` opened one startup worker on the same host and exited 0.
+Release `--check` opened one startup worker on the same host. It exited 0.
 
 ## Capacity tests
 
 Every capacity gate passed.
-Advertised limits stay 16,384 variables, 163,840 supplied edges, degree 20, 128 reads, and 65,536 sweeps.
+The variable limit stays at 16,384. The supplied edge limit stays at 163,840.
+The degree limit is 20. The other limits are 128 reads and 65,536 sweeps.
 
-The capacity tests used 128 reads and four sweeps.
+The capacity tests used 128 reads. Each test used four sweeps.
 Each capacity ran in a fresh process under `/usr/bin/time -l`.
 
 ```sh
@@ -132,8 +135,10 @@ Each capacity ran in a fresh process under `/usr/bin/time -l`.
 /usr/bin/time -l cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --lib solver::tests::hardware_isolated_16384 -- --ignored --exact
 ```
 
-Production setup, staging, dispatch, anneal, and wall values come from `solve_in_process`.
-Production wall includes validation, setup, annealing, result conversion, and program close.
+The production values come from `solve_in_process`. They cover setup, staging,
+dispatch, anneal, and wall time.
+Production wall includes validation and setup. It includes annealing and
+result conversion. It also includes program close.
 
 | Variables | Graph | Colors | Tiles and shapes | Dispatches | Production setup | Production staging | Production dispatch | Production anneal | Production wall | Peak resident set size |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -142,41 +147,47 @@ Production wall includes validation, setup, annealing, result conversion, and pr
 | 16,384 | degree 20 | 4 | 4 × 16384 by 4096 | 16 | 7,009,489 µs | 154,515 µs | 427,784 µs | 683,073 µs | 7,734,679 µs | 319,389,696 B, 304.59 MiB |
 | 16,384 | isolated | 1 | 4 × 16384 by 4096 | 16 | 6,740,010 µs | 155,364 µs | 424,704 µs | 676,492 µs | 7,458,534 µs | 295,960,576 B, 282.25 MiB |
 
-Each test then ran a separate CPU oracle and a second ANE run for per-color comparison.
-Those validation setup and anneal times were 1,029,000 and 1,016,797 microseconds at 6,016 variables.
-The times were 1,793,591 and 1,402,240 at 8,192 variables.
-The degree 20 case at 16,384 variables took 6,845,511 and 3,086,040.
-The isolated case took 6,703,811 and 1,012,468.
+Each test then ran a CPU oracle. It also ran ANE a second time for a per-color
+check. At 6,016 variables, validation setup took 1,029,000
+microseconds. Annealing took 1,016,797 microseconds. At 8,192 variables, the
+times were 1,793,591 and 1,402,240 microseconds. The degree 20 case at 16,384
+variables took 6,845,511 and 3,086,040 microseconds. The isolated case took
+6,703,811 and 1,012,468 microseconds.
 Validation anneal values include CPU oracle comparisons inside the color loop.
 They are not production miner timings.
 
 Peak resident set size is for the test process.
-That measurement includes the production run and both validation runs.
-It excludes separate runtime and driver allocations.
+That value includes the production run. It also includes both validation runs.
+It excludes memory that the runtime and driver hold outside the test process.
 The value is not a total ANE memory budget.
-The `/usr/bin/time -l` full-test wall times were 4.20, 6.48, 20.09, and 15.76 seconds in table order.
+The `/usr/bin/time -l` full-test wall times follow the table order. They were
+4.20, 6.48, 20.09, and 15.76 seconds.
 
 The largest four-tile shape is four 16,384 by 4,096 matrices.
 Raw dense FP16 payload at that shape is 512 MiB.
-Padded worst-case payload stays below 544 MiB.
+The padded payload stays below 544 MiB in the worst case.
 
 Irregular-color oracles covered complete graphs with 1, 3, and 21 variables.
-Those 21-variable complete graphs have degree 20 and use the same path.
+The 21-variable graphs have degree 20. They use the same path.
 
 ```sh
 cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --lib solver::tests::hardware_irregular_colors -- --ignored --exact
 ```
 
-Read-count runs matched 1, 31, 32, 33, 127, and 128 reads with zero mismatches.
+Read-count runs found zero mismatches. They covered 1, 31, 32, 33, 127, and
+128 reads.
 
 ```sh
 cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --lib solver::tests::hardware_read_counts -- --ignored --exact
 ```
 
 Logical reads may be 1 through 128.
-Execution always uses 128 physical lanes.
+The first runs used 128 physical lanes for every job.
+The current program allocates physical lanes in groups of 32.
+Hardware checks on 2026-09-21 matched the oracle. They covered 1, 16, 31, 32,
+33, 64, 65, 96, 127, and 128 reads.
 At each node and sweep, each group of 32 replicas shares one threshold value.
-The four groups use independent streams.
+The active groups use independent streams, up to four at 128 reads.
 Nodes do not share one global threshold.
 
 ## Lifetime tests
@@ -190,7 +201,8 @@ cargo build --manifest-path crates/ane-miner/Cargo.toml --locked --bin quip-ane-
 ```
 
 Process hardware tests load `crates/ane-miner/target/debug/quip-ane-msa`.
-Each test builds that path from `CARGO_MANIFEST_DIR` plus `target/debug/quip-ane-msa`.
+Each test starts that path with `CARGO_MANIFEST_DIR`. It then adds
+`target/debug/quip-ane-msa`.
 
 Focused library tests:
 
@@ -199,7 +211,7 @@ cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --lib worker::te
 cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --lib process::tests
 ```
 
-Those commands passed 7 worker tests and 16 process tests.
+Those commands passed 7 worker tests. They also passed 16 process tests.
 The host command ignored five hardware tests.
 
 Process hardware tests:
@@ -220,16 +232,17 @@ The hardware filters are:
 - `process::tests::watchdog_exits_when_test_parent_exits`
 
 Startup dispatch used `crates/ane-miner/target/debug/quip-ane-msa`.
-Child process 75801 completed one dispatch.
+Child process 75801 finished one dispatch.
 Wait removed its job directory.
 
 The 64-job gate used distinct child processes.
-It compiled 256 programs and compared 8,192 reads with the count-based oracle.
-Each child completed 64 dispatches and then exited.
+It compiled 256 programs. It compared 8,192 reads with the count-based oracle.
+Each child finished 64 dispatches. It then exited.
 Wait removed every job directory.
 
-Large-job cancellation used 16,384 variables, 128 reads, and 65,536 sweeps.
-Wait reaped child 91645 in 63,085 microseconds and removed its directory.
+Large-job cancellation used 16,384 variables and 128 reads. It used 65,536
+sweeps. Wait reaped child 91645 in 63,085 microseconds. It removed the job
+directory.
 
 Stream closure passed for child 94219.
 Cleanup took 17,269 microseconds after the receiver closed.
@@ -245,8 +258,8 @@ crates/ane-miner/target/release/quip-ane-msa --check
 ```
 
 The release build exited 0.
-`--capabilities` printed the identity JSON from Host tests and exited 0.
-`--check` opened the real ANE. Native startup completed. The process then exited 0.
+`--capabilities` printed the identity JSON from Host tests. It exited 0.
+`--check` opened the real ANE. Native startup finished. The process then exited 0.
 
 Supported-fixture hardware protocol tests must use the release binary:
 
@@ -256,23 +269,26 @@ cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --release --test
 
 All four hardware tests passed in 3.89 seconds.
 
-The suite covers the 33-read solve, empty graphs, zero sweeps, and unsupported limits.
+The suite covers the 33-read solve. It covers empty graphs and zero sweeps. It
+also covers unsupported limits.
 The 33-read fixture with seed 123 returned 33 consensus-scored reads.
 Each energy was `-1000`.
 A second run returned identical bytes.
-Empty graphs and zero sweeps succeeded.
-Degree 21, 129 reads, 65,537 sweeps, and coefficient `0.5` failed with no JSON array.
-The two coefficient jobs emit the production rejection diagnostic.
+Empty graphs succeeded. Zero sweeps also succeeded.
+Degree 21 failed with no JSON array. A request for 129 reads also failed. The
+same result occurred for 65,537 sweeps and coefficient `0.5`.
+The two coefficient jobs print the production rejection message.
 
-The supported coordinator session uses a local test-only coordinator.
+The supported session uses a local test coordinator.
 It keeps the public `DriverReport::is_conformant` checks.
-The stock `quip-solver-conformance` 0.0.1 driver is not this gate.
+This gate does not use the stock `quip-solver-conformance` 0.0.1 driver.
 That stock driver still cannot pass. See Stock driver below.
 
-Inline and dense cached jobs use h `[1, -1]` and J `[1]`.
+Inline jobs use h `[1, -1]` and J `[1]`. Dense cached jobs use the same values.
 The sparse job uses h `[1, -1, 0]` and J `[1, -1]`.
 Sparse native node IDs stay `[0, 12, 2400]` with their original edges.
-Separate jobs send fractional h `0.5` and fractional J `0.5` before the supported jobs.
+Two jobs send fractional coefficients before the supported jobs. One sends h
+`0.5`, and one sends J `0.5`.
 
 Observed supported-fixture session:
 
@@ -296,15 +312,16 @@ Observed supported-fixture session:
 
 Six expected rejects occurred.
 Each of the twelve dispatched jobs refunded one credit.
-The session recovered after the fractional rejects and then scored the four supported jobs.
+The session resumed after the fractional-coefficient rejects. It then scored
+the four jobs.
 
 Unit coefficients remain the only supported domain.
-Protocol 1 capabilities cannot advertise degree or coefficient restrictions.
-Coordinator routing must honor the documented limits.
+Protocol 1 capabilities omit degree and coefficient limits.
+Coordinator routing must use the documented limits.
 
 ### Debug phase budget
 
-The same hardware command without `--release` failed the supported-job phase.
+The same hardware command failed the supported-job phase without `--release`.
 Three tests passed. The coordinator session exceeded the unchanged ten-second budget.
 
 A direct 512-sweep `--solve` diagnostic used this JSON:
@@ -317,7 +334,7 @@ Debug took 12.211 seconds. Release took 0.837 seconds.
 Debug used 11.93 seconds of user CPU time.
 Default sessions use one sweep per inverse-temperature rung.
 Each rung fills four 8,192-entry threshold arrays on the CPU.
-Those times diagnose the test profile.
+Those times describe the test profile.
 They are not a Metal comparison.
 
 ### Stock driver
@@ -328,32 +345,38 @@ The stock `quip-solver-conformance` 0.0.1 `drive_miner` fixtures still fail.
 cargo test --manifest-path crates/ane-miner/Cargo.toml --locked --test protocol -- --ignored --test-threads=1
 ```
 
-That older stock-driver run passed three solve tests and failed the coordinator walk.
-No phase timed out. The process exited 0 and closed the stream.
+That older stock-driver run passed three solve tests. It failed the coordinator
+walk.
+No phase timed out. The process exited 0. It also closed the stream.
 
-The stock fixtures use `j_milli=500`, which is coupling 0.5, for the two-spin jobs.
+The stock fixtures use `j_milli=500` for the two-spin jobs. This value is
+coupling 0.5.
 The sparse stock job uses `h=[1.0, -1.0, 0.25]` and `j=[0.5, -0.75]`.
-The miner rejected `job-1`, `job-2`, `job-hash`, and `job-sparse` as `TooLarge`.
+The miner rejected four jobs as `TooLarge`. They were `job-1`, `job-2`,
+`job-hash`, and `job-sparse`.
 The parent logged `coefficient must be -1, 0, or 1` before each reject.
 `--solve` also rejects coefficient `0.5`.
 
-The supported-fixture gate does not change that stock incompatibility.
-This miner does not accept fractional coefficients.
-It does not claim unrestricted coordinator compatibility.
+The supported-fixture gate does not change the stock mismatch.
+This miner accepts only integer unit coefficients.
+It does not claim support for all coordinator inputs.
 
 ## Sweep redesign, September 15, 2026
 
 These changes start from merge commit `4ec7ed8746ce5bcd41b2c5e5584cc9d2dba8dbc8`.
-Programs share one neighbor input surface and upload changed rows after the first dispatch.
+Programs share one neighbor input surface. They upload changed rows after the
+first dispatch.
 Tile buffers persist across sweeps.
-Threshold draws use binary search with the same cutoff comparisons and random streams.
+Threshold draws use binary search. They keep the same cutoff checks. They also
+keep the same random streams.
 
 The adaptive range changes from 64–256 to 2,048–8,192 sweeps, with 128 reads.
 The hard cap remains 65,536 sweeps.
-A zero-field target of `-14612` on 4,577 nodes and 41,514 edges selects 8,049 sweeps.
+A zero-field target of `-14612` selects 8,049 sweeps. This problem has 4,577
+nodes and 41,514 edges.
 The new regression test first failed with the old result of 251 sweeps.
-Explicit job and target overrides keep their precedence.
-The configured sweep count remains a fallback after adaptation.
+Job overrides come first. Target overrides come next.
+The miner still uses the set sweep count as a fallback after adaptation.
 
 ### Release checks
 
@@ -378,25 +401,30 @@ cargo clippy --manifest-path crates/ane-miner/Cargo.toml --target-dir target --l
 | Hardware protocol tests | 4 passed |
 | Clippy, formatting, and diff whitespace | pass |
 
-The native and solver totals include host tests from the ordinary run.
-The exhaustive native check covered 32,384 integer acceptance cases with zero mismatches.
-Shared surface tests covered owner lifetime and different output shapes.
-Row update tests checked changed data and invalid row metadata.
-Capacity tests passed at 6,016, 8,192, and 16,384 nodes.
-Final states and each checked color matched the CPU oracle.
+The native totals include host tests from the normal run. The solver totals
+include those tests too.
+The exhaustive native check covered 32,384 integer acceptance cases. It found
+zero mismatches.
+Shared surface tests covered owner lifetime. They also covered different output
+shapes. Row update tests checked changed data. They also checked invalid row
+metadata.
+Capacity tests passed at 6,016 nodes. They also passed at 8,192 and 16,384
+nodes. Final states matched the CPU oracle. Each checked color also matched.
 
-The selected process tests used a local symlink from their fixed debug path to the release executable.
-A 16,384-node job with 65,536 requested sweeps stopped after 62.8 milliseconds when cancellation began at 50 milliseconds.
-The parent reaped the child and removed its temporary directory.
-Closing the output channel also stopped the worker and removed its directory.
-The protocol check covered live cancellation and credit refunds.
+The selected process tests used a local symlink. It connected their fixed debug
+path to the release executable. A 16,384-node job requested 65,536 sweeps.
+Cancellation began at 50 milliseconds. The job stopped after 62.8 milliseconds.
+The parent reaped the child. It also removed the temporary directory.
+Closing the output channel stopped the worker. It also removed the directory.
+The protocol check covered live cancellation. It covered credit refunds too.
 
 ### Controlled mining replay
 
-The saved live problem has 4,577 variables, 41,514 edges, zero fields, and unit signed couplings.
+The saved live problem has 4,577 variables and 41,514 edges. It has zero fields
+and unit signed couplings.
 Each run returned 128 states.
-An independent scorer checked every returned energy using the original graph.
-The local mining process did not run during these new measurements.
+A second scorer checked every returned energy using the original graph.
+The local mining process did not run during these new tests.
 
 Binary `SHA-256` hashes:
 
@@ -405,7 +433,8 @@ Before: fb24ec381f618de275032841d03788df1b4ccd22b748905e901f5849c76c7a6e
 After:  5c93e4f688a008910e2695d0c64fbf09544632266ad7bd230572a1f4ff8f68e1
 ```
 
-Three paired runs used 1,024 sweeps and consecutive seeds starting at `3302488336868276095`.
+Three paired runs used 1,024 sweeps. They used consecutive seeds starting at
+`3302488336868276095`.
 The order was before/after, after/before, then before/after.
 
 | Seed offset | Before, seconds | After, seconds | Lowest energy |
@@ -415,9 +444,9 @@ The order was before/after, after/before, then before/after.
 | 12 | 11.2235 | 8.6062 | -14336 |
 
 Each pair produced byte-identical JSON.
-Every spin and energy matched.
+Every spin matched. Every energy also matched.
 The median paired speed ratio was 1.314, or 23.9% less elapsed time.
-Comparisons at 251 and 4,096 sweeps also produced byte-identical JSON.
+The 251-sweep check produced byte-identical JSON. The 4,096-sweep check did too.
 
 The following new-binary runs use seed `3302488336868276085`:
 
@@ -428,25 +457,30 @@ The following new-binary runs use seed `3302488336868276085`:
 | 8049 | 55.1571 | -14386 | -14344 | 0 |
 
 The 8,049-sweep run made 64,392 dispatches through eight color programs.
-It spent 0.308 seconds in setup, 19.677 seconds staging data, and 11.032 seconds in device dispatch.
-Total annealing time was 54.714 seconds, including host work outside those counters.
+It spent 0.308 seconds in setup and 19.677 seconds staging data. Device dispatch
+took 11.032 seconds.
+Total annealing time was 54.714 seconds. This time includes host work outside
+those counters.
 More sweeps improved this job, but no returned state reached the target.
-These measurements do not establish a qualifying rate across mining jobs.
+These runs do not show a qualifying rate across mining jobs.
 
 ### Comparison with the reference miner
 
-[MR 27](https://gitlab.com/quip.network/quip-miner-cuda/-/merge_requests/27) sets the `CUDA` miner to 7,392–29,568 adaptive sweeps and 128 reads.
-The same target and topology select 29,053 sweeps there.
-Both implementations use ordered color updates and Metropolis acceptance.
+[MR 27](https://gitlab.com/quip.network/quip-miner-cuda/-/merge_requests/27)
+sets the `CUDA` miner to 7,392–29,568 adaptive sweeps. It uses 128 reads.
+That target and topology select 29,053 sweeps there.
+Both miners use ordered color updates. Both use Metropolis acceptance.
 
 Source inspection points to a benchmark mismatch in [MR 26](https://gitlab.com/quip.network/quip-miner-cuda/-/merge_requests/26).
-The default benchmark preset permits fields in `{-1, 0, 1}` and has 41,515 edges.
-The captured live problem has zero fields and 41,514 edges.
-The MR does not publish the full command and raw records needed to reconstruct all 24 benchmark jobs.
+The default benchmark preset permits fields in `{-1, 0, 1}`. It has 41,515
+edges. The captured live problem has zero fields. It has 41,514 edges.
+The MR does not publish the full command. It also omits the raw records needed
+to reconstruct all 24 benchmark jobs.
 Its absolute energy values do not establish quality for this live problem.
 
-Same-problem comparisons with Metal and CPU solvers showed similar energy distributions at matched sweep counts.
-All returned energies passed independent scoring.
+Same-problem comparisons used Metal and CPU solvers. They showed similar energy
+distributions at matched sweep counts.
+All returned energies passed the second scoring check.
 This evidence does not identify an ANE-specific Metropolis or scoring defect.
 
 ## Follow-up work

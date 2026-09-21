@@ -105,7 +105,7 @@ int main(int argc, const char **argv) {
 
         uint64_t createStart = monotonicUS();
         void *program = NULL;
-        int created = quip_ane_create(channels, lengths, tiles, kSweeps, weights, weightCount,
+        int created = quip_ane_create(channels, 128, lengths, tiles, kSweeps, weights, weightCount,
             fields, channels, &program, error, sizeof(error));
         uint64_t createEnd = monotonicUS();
         if (created != 0) {

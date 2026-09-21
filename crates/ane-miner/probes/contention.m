@@ -78,7 +78,7 @@ int main(int argc, const char **argv) {
         for (size_t i = 0; i < weightCount; ++i) weights[i] = (random() & 1) ? (int8_t)1 : (int8_t)-1;
 
         void *program = NULL;
-        if (quip_ane_create(channels, lengths, tiles, kSweeps, weights, weightCount, fields, channels,
+        if (quip_ane_create(channels, 128, lengths, tiles, kSweeps, weights, weightCount, fields, channels,
                 &program, error, sizeof(error)) != 0) {
             fprintf(stderr, "create failed: %s\n", error);
             return 2;

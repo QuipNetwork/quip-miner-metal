@@ -9,7 +9,7 @@ use crate::AneError;
 pub(crate) const MAX_NODES: usize = 16_384;
 pub(crate) const MAX_EDGES: usize = 163_840;
 pub(crate) const MAX_DEGREE: usize = 20;
-pub(crate) const LANES: usize = 128;
+pub(crate) const MAX_LANES: usize = 128;
 pub(crate) const TILE_CHANNELS: usize = 4_096;
 pub(crate) const MAX_TILES: usize = 24;
 
@@ -154,7 +154,7 @@ fn fp16_payload_bytes(output_channels: usize, input_channels: usize) -> Result<u
 }
 
 fn aligned_surface_bytes(channels: usize) -> Result<usize, AneError> {
-    let cells = checked_mul(channels, LANES, "surface cells")?;
+    let cells = checked_mul(channels, MAX_LANES, "surface cells")?;
     let bytes = checked_mul(cells, FP16_BYTES, "surface bytes")?;
     let blocks = bytes.max(1).div_ceil(SURFACE_ALIGNMENT);
     checked_mul(blocks, SURFACE_ALIGNMENT, "aligned surface bytes")
@@ -183,6 +183,18 @@ fn check_program_bytes(tiles: &[ColorTile], input_channels: usize) -> Result<(),
 }
 
 pub(crate) fn prepare(graph: &IsingGraph) -> Result<PreparedGraph, AneError> {
+    // Keep the measurement control fixed for the worker process lifetime.
+    static FOUR_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let four_color = *FOUR_COLOR.get_or_init(|| {
+        !matches!(
+            std::env::var("QUIP_ANE_MSA_FOUR_COLOR").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    });
+    prepare_with_coloring(graph, four_color)
+}
+
+fn prepare_with_coloring(graph: &IsingGraph, four_color: bool) -> Result<PreparedGraph, AneError> {
     let node_count = graph.h.len();
     if node_count > MAX_NODES {
         return Err(AneError::Capacity(format!(
@@ -239,7 +251,7 @@ pub(crate) fn prepare(graph: &IsingGraph) -> Result<PreparedGraph, AneError> {
     // sweep walks and costs slightly less padded work, which measured 1.178
     // times faster per sweep with a 37.6% cheaper compile. Greedy remains
     // the fallback for every other graph.
-    let colors = match advantage2_colors(graph) {
+    let colors = match four_color.then(|| advantage2_colors(graph)).flatten() {
         Some(colors) => colors,
         None => greedy_colors(&neighbors)?,
     };
@@ -366,6 +378,18 @@ mod tests {
         let mut lengths: Vec<usize> = prepared.tiles.iter().map(|tile| tile.nodes.len()).collect();
         lengths.sort_unstable();
         assert_eq!(lengths, vec![1139, 1145, 1145, 1148]);
+    }
+
+    #[test]
+    fn greedy_control_preserves_graph_and_has_eight_colors() {
+        let graph = advantage2_graph();
+        let four = super::prepare_with_coloring(&graph, true).unwrap();
+        let greedy = super::prepare_with_coloring(&graph, false).unwrap();
+        assert_eq!(four.color_count, 4);
+        assert_eq!(greedy.color_count, 8);
+        assert_eq!(four.neighbors, greedy.neighbors);
+        assert_eq!(four.fields, greedy.fields);
+        assert_prepared_invariants(&greedy);
     }
 
     /// A graph the recogniser does not know must still colour, by the greedy

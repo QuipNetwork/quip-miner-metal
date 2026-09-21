@@ -114,7 +114,7 @@ int main(void) {
         buildSpins(x, kChannels);
 
         // === Step 1: compile a program and keep the staging directory ===
-        NSData *mil = [makeMIL(kChannels, kLengths, kTiles, kSweeps, fields, weightsA) dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *mil = [makeMIL(kChannels, 128, kLengths, kTiles, kSweeps, fields, weightsA) dataUsingEncoding:NSUTF8StringEncoding];
         NSData *blobA = makeWeightBlob(weightsA, kChannels, kLengths, kTiles);
 
         if (dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW) == NULL) {
@@ -359,7 +359,7 @@ int main(void) {
         // anything the reload path above measured.
         void *controlProgram = NULL;
         char controlError[1024];
-        if (quip_ane_create(kChannels, kLengths, kTiles, kSweeps, weightsB, weightCount,
+        if (quip_ane_create(kChannels, 128, kLengths, kTiles, kSweeps, weightsB, weightCount,
                 fields, kChannels, &controlProgram, controlError, sizeof(controlError)) != 0) {
             fprintf(stderr, "positive control: fresh compile with negated weights failed: %s\n", controlError);
             printf("positive_control=FAILED reason=compile\n");

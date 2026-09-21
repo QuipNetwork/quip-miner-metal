@@ -1,0 +1,5 @@
+{"repeat": 0, "validate_us": 0, "graph_prep_us": 2069, "schedule_us": 239, "initial_spins_us": 621, "reset_us": 2341, "setup_us": 889824, "dispatches": 512, "staging_us": 132376, "dispatch_us": 197000, "anneal_us": 227927}
+{"repeat": 1, "validate_us": 0, "graph_prep_us": 2092, "schedule_us": 230, "initial_spins_us": 606, "reset_us": 2314, "setup_us": 875237, "dispatches": 512, "staging_us": 132270, "dispatch_us": 196009, "anneal_us": 228164}
+{"repeat": 2, "validate_us": 0, "graph_prep_us": 2000, "schedule_us": 229, "initial_spins_us": 609, "reset_us": 2356, "setup_us": 874379, "dispatches": 512, "staging_us": 132493, "dispatch_us": 190620, "anneal_us": 228611}
+{"repeat": 3, "validate_us": 0, "graph_prep_us": 2059, "schedule_us": 240, "initial_spins_us": 639, "reset_us": 2328, "setup_us": 867541, "dispatches": 512, "staging_us": 131864, "dispatch_us": 197309, "anneal_us": 227875}
+{"repeat": 4, "validate_us": 0, "graph_prep_us": 2021, "schedule_us": 228, "initial_spins_us": 624, "reset_us": 2328, "setup_us": 880435, "dispatches": 512, "staging_us": 131823, "dispatch_us": 197020, "anneal_us": 227438}

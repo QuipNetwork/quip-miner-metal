@@ -1,0 +1,6 @@
+
+running 1 test
+test production_channel_study has been running for over 60 seconds
+test production_channel_study ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 451.61s

@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "quip-miner-metal"
-version = "0.3.3-rc2"
+version = "0.3.3-rc3"
 dependencies = [
  "clap",
  "core-foundation-sys",

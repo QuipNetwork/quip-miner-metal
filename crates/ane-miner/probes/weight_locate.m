@@ -178,7 +178,7 @@ int main(void) {
 
         char error[1024];
         void *program = NULL;
-        if (quip_ane_create(kChannels, kLengths, kTiles, kSweeps, weights, weightCount,
+        if (quip_ane_create(kChannels, 128, kLengths, kTiles, kSweeps, weights, weightCount,
                 fields, kChannels, &program, error, sizeof(error)) != 0) {
             fprintf(stderr, "create failed: %s\n", error);
             return 2;

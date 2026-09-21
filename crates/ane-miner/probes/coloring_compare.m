@@ -74,7 +74,7 @@ static BOOL timeLayout(const char *name, const size_t *lengths, size_t tiles,
 
     void *program = NULL;
     uint64_t compileStart = monotonicUS();
-    if (quip_ane_create(kChannels, lengths, tiles, sweeps, weights, weightCount,
+    if (quip_ane_create(kChannels, 128, lengths, tiles, sweeps, weights, weightCount,
             fields, kChannels, &program, error, sizeof(error)) != 0) {
         fprintf(stderr, "%s: create failed: %s\n", name, error);
         return NO;

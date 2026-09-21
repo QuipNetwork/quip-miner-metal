@@ -441,6 +441,17 @@ impl Router<'_> {
                     loop {
                         match receivers[engine].try_recv() {
                             Ok(reply) => {
+                                tracing::debug!(
+                                    engine = if engine == 0 { "metal" } else { "ane" },
+                                    job_id = %String::from_utf8_lossy(&reply.job_id),
+                                    outcome = match &reply.outcome {
+                                        StreamOutcome::Completed(Ok(_)) => "completed",
+                                        StreamOutcome::Completed(Err(_)) => "error",
+                                        StreamOutcome::Cancelled => "cancelled",
+                                    },
+                                    device_access_time_us = reply.device_access_time_us,
+                                    "combined route completed"
+                                );
                                 if let Some(index) =
                                     active[engine].iter().position(|id| *id == reply.job_id)
                                 {
@@ -530,6 +541,13 @@ impl Router<'_> {
                     });
                     if let Some(engine) = selected {
                         let job_id = job.job_id.clone();
+                        tracing::debug!(
+                            engine = if engine == 0 { "metal" } else { "ane" },
+                            job_id = %String::from_utf8_lossy(&job_id),
+                            metal_eligible = eligible[0],
+                            ane_eligible = eligible[1],
+                            "combined route assigned"
+                        );
                         if let Some(sender) = &senders[engine] {
                             match sender.try_send(job) {
                                 Ok(()) => active[engine].push(job_id),

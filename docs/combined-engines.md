@@ -36,4 +36,16 @@ A device fault follows the existing session error path. It can end the session b
 `--capabilities` opens neither engine. For MSA, `--check` tests both default engines. For SA and Gibbs, it tests Metal.
 The MSA binary contains its own hidden ANE worker entry point. It needs no separate worker binary on the path.
 
-The route has host tests and a small device smoke test. This does not establish a throughput gain on mining jobs.
+## Measured workload policy
+
+For finite batches of 300 Advantage2 jobs at 64 reads and 14,336 sweeps,
+use `enable_metal = true` and `enable_ane = false`. Four balanced rounds
+produced 4.609 valid proofs per second on Metal alone and 3.811 with both
+engines. Each window includes queue drain. The combined runs sent 13 of
+1200 jobs to ANE.
+
+This policy applies to the measured batch mix. It does not establish a gain
+for an endless stream or a different mix. The engine flags still default to
+true. If a workload needs ANE, the router keeps its one-job slot and Metal
+batching. See the [study report](perf/2026-09-21-coloring-router.md) for
+uncertainty, per-window results, and limits.

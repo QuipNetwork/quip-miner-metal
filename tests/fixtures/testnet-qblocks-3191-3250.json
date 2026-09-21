@@ -1,0 +1,362 @@
+[
+  {
+    "qblock_id": 3250,
+    "nonce_seed": "f72f174fdb5d8d7fd56c6c30c4d03f41cb26fee3d8e1ccf4866009253c82a4bd",
+    "target_energy_milli": -14629583,
+    "winning_energy_milli": -14634000
+  },
+  {
+    "qblock_id": 3249,
+    "nonce_seed": "09d8ca3b393a25ad7bc6e79dc6c5e19d87af9e7676348bf73651999f0f55a0e6",
+    "target_energy_milli": -14628583,
+    "winning_energy_milli": -14632000
+  },
+  {
+    "qblock_id": 3248,
+    "nonce_seed": "45ef2c30efda39658f69c822085f121a1d0651f9eb8b5d863f2ad87d8745cdec",
+    "target_energy_milli": -14627583,
+    "winning_energy_milli": -14630000
+  },
+  {
+    "qblock_id": 3247,
+    "nonce_seed": "a4472cb85f8eacd306345e5f1dab6ce27ad5ee892596ddbb042d491959fb1072",
+    "target_energy_milli": -14626583,
+    "winning_energy_milli": -14630000
+  },
+  {
+    "qblock_id": 3246,
+    "nonce_seed": "a6750d1d6fee595e9483903d7c297d6b58c0f0ee3cf0589bc6c899c74d02db60",
+    "target_energy_milli": -14625583,
+    "winning_energy_milli": -14630000
+  },
+  {
+    "qblock_id": 3245,
+    "nonce_seed": "4b60b2e2d26373aefc6dc55f252c8af895c3659a29a8c500a967cdcbc87ad4ef",
+    "target_energy_milli": -14624583,
+    "winning_energy_milli": -14634000
+  },
+  {
+    "qblock_id": 3244,
+    "nonce_seed": "f1955d8742a8685c6034e597cc8a612bf97ee3a3b2a48dedb6905ab900a76af9",
+    "target_energy_milli": -14623583,
+    "winning_energy_milli": -14624000
+  },
+  {
+    "qblock_id": 3243,
+    "nonce_seed": "f1a806563dbaae396fece28842a65b89aa199a1eb1cfe76d0b63a961fe903654",
+    "target_energy_milli": -14622583,
+    "winning_energy_milli": -14632000
+  },
+  {
+    "qblock_id": 3242,
+    "nonce_seed": "6d341f3d413626c314b907d199d0078b204ae9f9542655396ab3abac99648537",
+    "target_energy_milli": -14621583,
+    "winning_energy_milli": -14626000
+  },
+  {
+    "qblock_id": 3241,
+    "nonce_seed": "a7344b35692ee2f10935884d37889dbbcf3bb225d4325d968027fea6a183beb7",
+    "target_energy_milli": -14620583,
+    "winning_energy_milli": -14630000
+  },
+  {
+    "qblock_id": 3240,
+    "nonce_seed": "2d458e86f93e86f3e1a9a27c4c140e2e307981f86cf08d1fb63e0ccfbdd31ea9",
+    "target_energy_milli": -14619583,
+    "winning_energy_milli": -14620000
+  },
+  {
+    "qblock_id": 3239,
+    "nonce_seed": "8eec6546169cdef668768a372186548dff517870090d562f1acb72f17456dd38",
+    "target_energy_milli": -14618583,
+    "winning_energy_milli": -14630000
+  },
+  {
+    "qblock_id": 3238,
+    "nonce_seed": "5a7f68d86e32a12a75d33f6afb9736ad42e86b711028dec6447c99e238cc2553",
+    "target_energy_milli": -14617583,
+    "winning_energy_milli": -14624000
+  },
+  {
+    "qblock_id": 3237,
+    "nonce_seed": "4a5d28d5a190eaee81046519ada6b458ca005767aa8ecf1e2e27ff4db33391a2",
+    "target_energy_milli": -14613080,
+    "winning_energy_milli": -14616000
+  },
+  {
+    "qblock_id": 3236,
+    "nonce_seed": "d457146163f0f3a46d12deb369b28fe441b2ed92ef2331676579868b54898a5e",
+    "target_energy_milli": -14605356,
+    "winning_energy_milli": -14608000
+  },
+  {
+    "qblock_id": 3235,
+    "nonce_seed": "7fac1dc4e03c68834916e5d4e2442786b77cf2513315b9413af3ff4009b04d82",
+    "target_energy_milli": -14604356,
+    "winning_energy_milli": -14624000
+  },
+  {
+    "qblock_id": 3234,
+    "nonce_seed": "a52c87a617291f0d57f50b5806796c23083146c4da14a48a20e76c796bc4d405",
+    "target_energy_milli": -14627933,
+    "winning_energy_milli": -14640000
+  },
+  {
+    "qblock_id": 3233,
+    "nonce_seed": "2d8a8811ce7c8925a047014a4f33cf9d310f14fe046b60087fd11a53a5dd4ee1",
+    "target_energy_milli": -14626933,
+    "winning_energy_milli": -14642000
+  },
+  {
+    "qblock_id": 3232,
+    "nonce_seed": "20fdd6340a45e39ae6198330bd3dc70187452f04dd71187d7f3ffafd12e439eb",
+    "target_energy_milli": -14625933,
+    "winning_energy_milli": -14646000
+  },
+  {
+    "qblock_id": 3231,
+    "nonce_seed": "fe3e0d5a9c2d37e250d222b31de4c80cba5afd4c222a842ee28bfd9e9a9dfa32",
+    "target_energy_milli": -14624933,
+    "winning_energy_milli": -14632000
+  },
+  {
+    "qblock_id": 3230,
+    "nonce_seed": "6e80256b158260be09c541e377753b2ee157ca3ae9d21e92b4ec787fa3dfe5a5",
+    "target_energy_milli": -14623933,
+    "winning_energy_milli": -14628000
+  },
+  {
+    "qblock_id": 3229,
+    "nonce_seed": "544039b5e4a5e0230e0faf0fd8282027365d2e6ec2aacce8b0c84b354367ca02",
+    "target_energy_milli": -14622933,
+    "winning_energy_milli": -14624000
+  },
+  {
+    "qblock_id": 3228,
+    "nonce_seed": "6f75bba1fe10b8ab1529502780bb9693d71b2dbf9262df0783e2b99c6e99e915",
+    "target_energy_milli": -14621933,
+    "winning_energy_milli": -14634000
+  },
+  {
+    "qblock_id": 3227,
+    "nonce_seed": "ae258949087497122710cb761dd9cc8faeb81dabc30a3cfe3509dc3e5442a6f5",
+    "target_energy_milli": -14620933,
+    "winning_energy_milli": -14622000
+  },
+  {
+    "qblock_id": 3226,
+    "nonce_seed": "467f2607f83e90e9b433f60f9fa3fd593e839d8546a38c2c7fbcb123c9e86ea4",
+    "target_energy_milli": -14619933,
+    "winning_energy_milli": -14620000
+  },
+  {
+    "qblock_id": 3225,
+    "nonce_seed": "4d96eee5e4fa8e44e48d8ade90506645a308436f03a7eadbcfbb98109ff22534",
+    "target_energy_milli": -14618933,
+    "winning_energy_milli": -14628000
+  },
+  {
+    "qblock_id": 3224,
+    "nonce_seed": "8bd0d214b58a9e7cfcf172a7af2998a602650db78a917a5371d7c03d8db69454",
+    "target_energy_milli": -14617933,
+    "winning_energy_milli": -14620000
+  },
+  {
+    "qblock_id": 3223,
+    "nonce_seed": "855aceb6241fe35b29c095b7095eee4cf1334e72c0e21c75567c73e48b4c47bd",
+    "target_energy_milli": -14616933,
+    "winning_energy_milli": -14620000
+  },
+  {
+    "qblock_id": 3222,
+    "nonce_seed": "c7a23cc2b0854b9251e730062c13daac99b94d975e1c779792a246c3dfb10bd9",
+    "target_energy_milli": -14614839,
+    "winning_energy_milli": -14618000
+  },
+  {
+    "qblock_id": 3221,
+    "nonce_seed": "1edc8b56afb533154ea74b49a49d067bacd9da0d63c87407e00685f637d750af",
+    "target_energy_milli": -14610696,
+    "winning_energy_milli": -14620000
+  },
+  {
+    "qblock_id": 3220,
+    "nonce_seed": "685e30cc4e157d0c3fa7512a31bbc6a64bd07516388f740ec00130c4a2283c21",
+    "target_energy_milli": -14596849,
+    "winning_energy_milli": -14606000
+  },
+  {
+    "qblock_id": 3219,
+    "nonce_seed": "a6bd7ef4d1c80192bef355ece8390f364e55e41fa1ff5cc90f0ac1fbb3165fb3",
+    "target_energy_milli": -14595849,
+    "winning_energy_milli": -14618000
+  },
+  {
+    "qblock_id": 3218,
+    "nonce_seed": "0d3e1221a5c1ec1135f324c5ce73441358b44456ecf00954e4ba358ab30c2fa7",
+    "target_energy_milli": -14619208,
+    "winning_energy_milli": -14630000
+  },
+  {
+    "qblock_id": 3217,
+    "nonce_seed": "8cf0f66526cc486e1ce0fc88548f57e739c894f46723bca51ccc4a21b1d8a14c",
+    "target_energy_milli": -14616963,
+    "winning_energy_milli": -14620000
+  },
+  {
+    "qblock_id": 3216,
+    "nonce_seed": "fbb4f49dc400246d32916fd743eaee4e880ea3e2f18af48456e25221d8977195",
+    "target_energy_milli": -14612585,
+    "winning_energy_milli": -14622000
+  },
+  {
+    "qblock_id": 3215,
+    "nonce_seed": "c592864152386c47045667e1940dd4296aeff7766bcee53e900e654179133557",
+    "target_energy_milli": -14611585,
+    "winning_energy_milli": -14632000
+  },
+  {
+    "qblock_id": 3214,
+    "nonce_seed": "ff578b9308fe80dcaf926382259acdb98485c815c4b451dadb18bb2489a7afd9",
+    "target_energy_milli": -14635347,
+    "winning_energy_milli": -14638000
+  },
+  {
+    "qblock_id": 3213,
+    "nonce_seed": "03c12c4dad9a67ce72d1f77329d6e133789bbcc2cedd7c2f8ec81fa2021c2b0b",
+    "target_energy_milli": -14634347,
+    "winning_energy_milli": -14636000
+  },
+  {
+    "qblock_id": 3212,
+    "nonce_seed": "36afd3996700ae7482875fd12fba41e18c964446ff90c9be8a61d78b96e4d94f",
+    "target_energy_milli": -14633347,
+    "winning_energy_milli": -14640000
+  },
+  {
+    "qblock_id": 3211,
+    "nonce_seed": "ac48118e34ed51d4bbc6c7e39767bce6b51e56f0374c0a59d194289e29bc9c29",
+    "target_energy_milli": -14632347,
+    "winning_energy_milli": -14638000
+  },
+  {
+    "qblock_id": 3210,
+    "nonce_seed": "ff3b62dc4d053e62ba4dd40fe7db2e2177af06463660f441c2cfe069c9b87bb3",
+    "target_energy_milli": -14631347,
+    "winning_energy_milli": -14632000
+  },
+  {
+    "qblock_id": 3209,
+    "nonce_seed": "5d22634aef93cf413c7ca2af22134cad6d467765600e7e043d77ddd140894a37",
+    "target_energy_milli": -14630347,
+    "winning_energy_milli": -14632000
+  },
+  {
+    "qblock_id": 3208,
+    "nonce_seed": "12fe72f9d8d025ece61cb2943e4d001864c7967021ee61723fda5e09fc32a49b",
+    "target_energy_milli": -14629347,
+    "winning_energy_milli": -14632000
+  },
+  {
+    "qblock_id": 3207,
+    "nonce_seed": "22ea5e341dd4a8adeec524418e38777cf6b1367f076902ca2e5873930290c97a",
+    "target_energy_milli": -14628347,
+    "winning_energy_milli": -14630000
+  },
+  {
+    "qblock_id": 3206,
+    "nonce_seed": "3333998a48c740d78984ad836027db32179fca945ca72e833b753ef1cf4933ba",
+    "target_energy_milli": -14627347,
+    "winning_energy_milli": -14628000
+  },
+  {
+    "qblock_id": 3205,
+    "nonce_seed": "2891601e7fa329bb7675dec1152837627da3c76572424e39a468ff3227becdb4",
+    "target_energy_milli": -14626347,
+    "winning_energy_milli": -14628000
+  },
+  {
+    "qblock_id": 3204,
+    "nonce_seed": "2555cbeb6545136177646082cb97d2000278716596db3e95daa0c3e980c46896",
+    "target_energy_milli": -14625347,
+    "winning_energy_milli": -14640000
+  },
+  {
+    "qblock_id": 3203,
+    "nonce_seed": "f98254270b9816e3ee3f30bc8965689c96b8dbfb7fd8c353c378b98b6b21339d",
+    "target_energy_milli": -14624347,
+    "winning_energy_milli": -14626000
+  },
+  {
+    "qblock_id": 3202,
+    "nonce_seed": "95a1bb973beacb7607df05b9e402f205568aca6f9c2f4bf924385490cf1a738c",
+    "target_energy_milli": -14623347,
+    "winning_energy_milli": -14624000
+  },
+  {
+    "qblock_id": 3201,
+    "nonce_seed": "93c4973c0ef70a8976a0dbab6d37952f0db9c501995d628bbcfba2aee7b4fad4",
+    "target_energy_milli": -14622347,
+    "winning_energy_milli": -14634000
+  },
+  {
+    "qblock_id": 3200,
+    "nonce_seed": "54c569891a194662c5ddcc2bea4f5dba351f333ee4a4a065af59850510617bcc",
+    "target_energy_milli": -14621347,
+    "winning_energy_milli": -14634000
+  },
+  {
+    "qblock_id": 3199,
+    "nonce_seed": "15f0b9052ef9f80ff132197062755dc6629b3ad955cc905a78c4fdc717b45157",
+    "target_energy_milli": -14620347,
+    "winning_energy_milli": -14642000
+  },
+  {
+    "qblock_id": 3198,
+    "nonce_seed": "24e87138dcbeb152ea5e574358cd80a8be139f25595258c7af6667341b1875a8",
+    "target_energy_milli": -14619347,
+    "winning_energy_milli": -14630000
+  },
+  {
+    "qblock_id": 3197,
+    "nonce_seed": "e4a0b257dc10216f033ac7493f17e9f6593c6f5adf4d96e7fbfe145c1112d4d9",
+    "target_energy_milli": -14618347,
+    "winning_energy_milli": -14622000
+  },
+  {
+    "qblock_id": 3196,
+    "nonce_seed": "e503c003f645794e49f63e84d71d8914d0e90292c1a4fc83586740cf8ede1aff",
+    "target_energy_milli": -14616932,
+    "winning_energy_milli": -14618000
+  },
+  {
+    "qblock_id": 3195,
+    "nonce_seed": "92895bbf47409104014e37e455e632f46f2be9d627e2487fe24d1aa797335466",
+    "target_energy_milli": -14614422,
+    "winning_energy_milli": -14620000
+  },
+  {
+    "qblock_id": 3194,
+    "nonce_seed": "380f14136952f27b77f28bc9125fb931f4bd194691d87c713ba1b1250a45914d",
+    "target_energy_milli": -14607389,
+    "winning_energy_milli": -14628000
+  },
+  {
+    "qblock_id": 3193,
+    "nonce_seed": "d7beef9181e6b809a40538223ee6f5127d8bdd06d79c58dee295bf3364f8acad",
+    "target_energy_milli": -14601825,
+    "winning_energy_milli": -14608000
+  },
+  {
+    "qblock_id": 3192,
+    "nonce_seed": "9ab5c82e7a67dc7ab640a1202b5845ba533ba04376b1d586d58f240cd997a326",
+    "target_energy_milli": -14600017,
+    "winning_energy_milli": -14604000
+  },
+  {
+    "qblock_id": 3191,
+    "nonce_seed": "08bb4546188a5eac7cbcaa6baf50773e29a58da4643c5d11d3c988648d07cad2",
+    "target_energy_milli": -14599017,
+    "winning_energy_milli": -14614000
+  }
+]

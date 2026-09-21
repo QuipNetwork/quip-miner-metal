@@ -1,0 +1,17 @@
+{
+  "base_revision": "66471a3de865d941fb43fa4254557708cfe4492e",
+  "branch": "feat/fjo-completion",
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t26.5.2\nBuildVersion:\t\t25F84",
+  "hardware": "Mac16,5\n137438953472\nApple M4 Max",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+  "serial_ane_binary_sha256": "b9e40575a4045665bace4adf3198e90fdc6743cbef64fa429872e008b94107d5",
+  "production_miner_paused_by_user": true,
+  "worktree": "/Users/carback1/Code/quip/quip-miner-metal/.codex/worktrees/fjo-completion",
+  "baseline_command": "python3 /tmp/fjo-run-baseline.py",
+  "serial_baseline_limit": "Exploratory timing only: compilation overlapped part of this run. Repeat against the saved serial binary after all builds finish.",
+  "measurement_environment": {
+    "QUIP_METAL_TG_PER_CORE": null,
+    "QUIP_SCORE_THREADS": null
+  }
+}

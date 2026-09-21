@@ -5,7 +5,7 @@ use std::time::Duration;
 use quip_solver_core::{IsingGraph, SampleParams};
 use serde::{Deserialize, Serialize};
 
-use crate::graph::LANES;
+use crate::graph::MAX_LANES;
 use crate::native::{self, AneProgram};
 use crate::solver::{solve_in_process, RunOutput};
 use crate::AneError;
@@ -145,13 +145,13 @@ pub(crate) fn write_message<T: Serialize>(
 fn check_device() -> Result<WorkerResult, AneError> {
     let graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 1)]);
     let prepared = crate::graph::prepare(&graph)?;
-    let mut program = AneProgram::compile(&prepared, crate::native::BLOCK_SWEEPS)?;
-    program.reset(&vec![1; 32 * LANES])?;
-    program.advance(&vec![0; 32 * LANES * crate::native::BLOCK_SWEEPS])?;
-    let mut output = vec![0; 32 * LANES];
+    let mut program = AneProgram::compile(&prepared, MAX_LANES, crate::native::BLOCK_SWEEPS)?;
+    program.reset(&vec![1; 32 * MAX_LANES])?;
+    program.advance(&vec![0; 32 * MAX_LANES * crate::native::BLOCK_SWEEPS])?;
+    let mut output = vec![0; 32 * MAX_LANES];
     program.read(&mut output)?;
-    let valid = output[..LANES].iter().all(|&spin| spin == -1)
-        && output[LANES..].iter().all(|&spin| spin == 1);
+    let valid = output[..MAX_LANES].iter().all(|&spin| spin == -1)
+        && output[MAX_LANES..].iter().all(|&spin| spin == 1);
     program.close()?;
     if !valid {
         return Err(AneError::Runtime(

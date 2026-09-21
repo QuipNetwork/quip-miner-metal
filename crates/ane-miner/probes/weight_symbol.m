@@ -106,7 +106,7 @@ int main(int argc, const char **argv) {
 
         char nativeError[1024];
         void *program = NULL;
-        if (quip_ane_create(kChannels, kLengths, kTiles, kSweeps, weightsA, weightCount,
+        if (quip_ane_create(kChannels, 128, kLengths, kTiles, kSweeps, weightsA, weightCount,
                 fields, kChannels, &program, nativeError, sizeof(nativeError)) != 0) {
             fprintf(stderr, "create with couplings A failed: %s\n", nativeError);
             return 2;
@@ -225,7 +225,7 @@ int main(int argc, const char **argv) {
         printf("after_instance_load: matches_A=%d matches_B=%d\n", matchesA, matchesB);
 
         void *controlProgram = NULL;
-        if (quip_ane_create(kChannels, kLengths, kTiles, kSweeps, weightsB, weightCount,
+        if (quip_ane_create(kChannels, 128, kLengths, kTiles, kSweeps, weightsB, weightCount,
                 fields, kChannels, &controlProgram, nativeError, sizeof(nativeError)) != 0) {
             fprintf(stderr, "control create failed: %s\n", nativeError);
             return 2;

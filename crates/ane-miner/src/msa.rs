@@ -1,4 +1,4 @@
-use crate::graph::LANES;
+use crate::graph::MAX_LANES;
 use crate::AneError;
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 use quip_solver_core::{IsingGraph, SampleParams};
@@ -19,9 +19,9 @@ pub(crate) struct Rung {
 }
 
 pub(crate) fn validate_params(params: &SampleParams) -> Result<(), AneError> {
-    if !(1..=LANES).contains(&params.num_reads) {
+    if !(1..=MAX_LANES).contains(&params.num_reads) {
         return Err(AneError::Capacity(format!(
-            "read count must be between 1 and {LANES}"
+            "read count must be between 1 and {MAX_LANES}"
         )));
     }
     if params.num_sweeps > MAX_SWEEPS {
@@ -73,13 +73,17 @@ pub(crate) fn schedule(graph: &IsingGraph, params: &SampleParams) -> Result<Vec<
     Ok(rungs)
 }
 
-pub(crate) fn initial_spins(nodes: usize, seed: u64) -> Vec<i8> {
+pub(crate) fn initial_spins(nodes: usize, lanes: usize, seed: u64) -> Vec<i8> {
     let mut stream = SplitMix64(seed ^ SPIN_STREAM_DOMAIN);
-    let mut spins = Vec::with_capacity(nodes * LANES);
+    let mut spins = Vec::with_capacity(nodes * lanes);
     for _node in 0..nodes {
-        for _read in 0..LANES {
+        // Consume the original stream stride so retained lanes keep their seed
+        // identity when a narrower program replaces the padded 128-lane one.
+        for read in 0..MAX_LANES {
             let spin = if stream.next_u64() & 1 == 0 { 1 } else { -1 };
-            spins.push(spin);
+            if read < lanes {
+                spins.push(spin);
+            }
         }
     }
     spins
@@ -113,8 +117,8 @@ impl ThresholdRows {
     }
 
     #[must_use]
-    pub(crate) fn expand(&self, nodes: usize, rung: usize, sweep: usize) -> Vec<u8> {
-        let mut expanded = vec![0; nodes * LANES];
+    pub(crate) fn expand(&self, nodes: usize, lanes: usize, rung: usize, sweep: usize) -> Vec<u8> {
+        let mut expanded = vec![0; nodes * lanes];
         let offsets: [usize; GROUPS] = std::array::from_fn(|group| {
             let key = self.seed
                 ^ OFFSET_STREAM_DOMAIN
@@ -124,10 +128,14 @@ impl ThresholdRows {
             (SplitMix64(key).next_u64() as usize) & (ROW_LEN - 1)
         });
         for node in 0..nodes {
-            for (group, &offset) in offsets.iter().enumerate() {
+            for (group, &offset) in offsets
+                .iter()
+                .enumerate()
+                .take(lanes.div_ceil(READS_PER_GROUP))
+            {
                 let threshold = self.rows[group][(node + offset) & (ROW_LEN - 1)];
-                let start = node * LANES + group * READS_PER_GROUP;
-                expanded[start..start + READS_PER_GROUP].fill(threshold);
+                let start = node * lanes + group * READS_PER_GROUP;
+                expanded[start..(start + READS_PER_GROUP).min((node + 1) * lanes)].fill(threshold);
             }
         }
         expanded
@@ -165,6 +173,33 @@ mod tests {
     use quip_solver_core::{IsingGraph, SampleParams};
 
     #[test]
+    fn narrow_lanes_preserve_full_width_spins_and_thresholds() {
+        let nodes = 7;
+        let full = initial_spins(nodes, MAX_LANES, 19);
+        let mut rows = ThresholdRows::new(19);
+        for rung in 0..3 {
+            rows.begin_rung(0.05 + rung as f64 * 0.1);
+            let full_thresholds = rows.expand(nodes, MAX_LANES, rung, 3);
+            for lanes in [1, 7, 31, 32, 33, 64, 127, 128] {
+                let narrow = initial_spins(nodes, lanes, 19);
+                let thresholds = rows.expand(nodes, lanes, rung, 3);
+                assert_eq!(narrow.len(), nodes * lanes);
+                assert_eq!(thresholds.len(), nodes * lanes);
+                for node in 0..nodes {
+                    assert_eq!(
+                        narrow[node * lanes..(node + 1) * lanes],
+                        full[node * MAX_LANES..node * MAX_LANES + lanes]
+                    );
+                    assert_eq!(
+                        thresholds[node * lanes..(node + 1) * lanes],
+                        full_thresholds[node * MAX_LANES..node * MAX_LANES + lanes]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn splitmix64_matches_reference_outputs() {
         let mut rng = SplitMix64(0);
         assert_eq!(rng.next_u64(), 0xe220_a839_7b1d_cdaf);
@@ -174,9 +209,9 @@ mod tests {
 
     #[test]
     fn initial_spins_are_physical_lane_order_and_reproducible() {
-        let first = initial_spins(2, 7);
-        let rerun = initial_spins(2, 7);
-        let other = initial_spins(2, 8);
+        let first = initial_spins(2, MAX_LANES, 7);
+        let rerun = initial_spins(2, MAX_LANES, 7);
+        let other = initial_spins(2, MAX_LANES, 8);
 
         assert_eq!(first.len(), 2 * 128);
         assert_eq!(first, rerun);
@@ -269,8 +304,8 @@ mod tests {
     fn expansion_shares_groups_wraps_rows_and_reuses_rung_values() {
         let mut thresholds = ThresholdRows::new(19);
         thresholds.begin_rung(0.05);
-        let first = thresholds.expand(8_193, 3, 5);
-        let rerun = thresholds.expand(8_193, 3, 5);
+        let first = thresholds.expand(8_193, MAX_LANES, 3, 5);
+        let rerun = thresholds.expand(8_193, MAX_LANES, 3, 5);
 
         assert_eq!(first, rerun);
         assert_eq!(first.len(), 8_193 * 128);
@@ -291,13 +326,16 @@ mod tests {
         let mut rerun = ThresholdRows::new(23);
         first.begin_rung(0.75);
         rerun.begin_rung(0.75);
-        assert_eq!(first.expand(64, 0, 0), rerun.expand(64, 0, 0));
+        assert_eq!(
+            first.expand(64, MAX_LANES, 0, 0),
+            rerun.expand(64, MAX_LANES, 0, 0)
+        );
 
-        let prior = first.expand(64, 0, 0);
+        let prior = first.expand(64, MAX_LANES, 0, 0);
         first.begin_rung(0.75);
         // Reuse the same (rung, sweep) so the expansion offsets are identical;
         // the next expansion must differ because the random streams advanced.
-        let next = first.expand(64, 0, 0);
+        let next = first.expand(64, MAX_LANES, 0, 0);
         assert_ne!(prior, next);
     }
 
@@ -321,9 +359,9 @@ mod tests {
     fn expansion_offsets_change_by_sweep_without_mutating_rows() {
         let mut thresholds = ThresholdRows::new(29);
         thresholds.begin_rung(0.5);
-        let first = thresholds.expand(128, 4, 0);
-        let later = thresholds.expand(128, 4, 1);
-        let repeated = thresholds.expand(128, 4, 0);
+        let first = thresholds.expand(128, MAX_LANES, 4, 0);
+        let later = thresholds.expand(128, MAX_LANES, 4, 1);
+        let repeated = thresholds.expand(128, MAX_LANES, 4, 0);
         assert_ne!(first, later);
         assert_eq!(first, repeated);
     }
