@@ -15,6 +15,7 @@
 
 # Agent tooling config (per-machine / per-tool; AGENTS.md is the checked-in source)
 .beads/
+.beads-*/
 .agents/
 .claude/
 .codex/

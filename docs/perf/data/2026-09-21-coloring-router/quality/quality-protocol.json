@@ -1,0 +1,47 @@
+{
+  "binary_sha256": "13b3dbe867cf7704b199c9a29f0a095cd2c5d33852dec9b1928e840cd6c78fd5",
+  "driver_sha256": "e34a8ef98a4ce14e12c5797bef70aad33118cefa9a3f9e36ebe45706efc1b736",
+  "fixture_sha256": "1482bf37a026e09f249c9bb7d7158d723b6bb283d9d5c617f8aaaee32bb4bab4",
+  "rounds": 3,
+  "blocks": 60,
+  "replicates_per_block_per_round": 1,
+  "sweeps": 14336,
+  "k0": 10000,
+  "arms": [
+    [
+      "metal",
+      "greedy",
+      64
+    ],
+    [
+      "metal",
+      "four",
+      64
+    ],
+    [
+      "ane",
+      "greedy",
+      64
+    ],
+    [
+      "ane",
+      "four",
+      64
+    ],
+    [
+      "ane",
+      "four",
+      128
+    ]
+  ],
+  "sampler_seeds": "independent OS seeds, unavailable through protocol",
+  "order": "forward, reverse, rotate-left-two",
+  "position_balance": "incomplete",
+  "timing_uncertainty_included": false,
+  "environment": {
+    "QUIP_METAL_TG_PER_CORE": null,
+    "QUIP_SCORE_THREADS": null
+  },
+  "archived_fixture_sha256": "9224419fb3281990faf7a060f533db0c05fb9cc5ae77fccdfe3ec8551c28dde9",
+  "archive_note": "Trailing blank lines removed from the fixture and text logs after measurement; records are unchanged."
+}

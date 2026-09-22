@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <CoreFoundation/CFByteOrder.h>
+#include <arm_neon.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <stdio.h>
@@ -81,13 +83,19 @@ static uint64_t monotonicUS(void) {
     size_t inputElements;
     size_t sweeps;
     size_t current;
+    size_t nextThresholdBank;
     BOOL initialized;
-    IOSurfaceRef surfaces[10];
+    BOOL pending;
+    IOSurfaceRef surfaces[18];
+    dispatch_queue_t queue;
+    dispatch_group_t group;
+    uint64_t pendingDispatchUS;
 }
 @property(nonatomic, strong) id model;
 @property(nonatomic, strong) NSArray *requests;
 @property(nonatomic, strong) NSArray *wrappers;
 @property(nonatomic, strong) NSString *directory;
+@property(nonatomic, strong) NSString *pendingError;
 @property(nonatomic) BOOL loaded;
 - (BOOL)removeDirectory:(NSError **)error;
 - (BOOL)unload:(NSError **)error;
@@ -108,6 +116,7 @@ static uint64_t monotonicUS(void) {
     return [self.model unloadWithQoS:21 error:error];
 }
 - (void)dealloc {
+    if (pending) dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
     @try {
         NSError *error = nil;
         if (![self unload:&error]) NSLog(@"%@", describe(@"ANE cleanup unload", error));
@@ -123,20 +132,20 @@ static uint64_t monotonicUS(void) {
     _requests = nil;
     _wrappers = nil;
     _model = nil;
-    for (size_t i = 0; i < 10; ++i) {
+    for (size_t i = 0; i < 18; ++i) {
         if (surfaces[i] != NULL) CFRelease(surfaces[i]);
     }
 }
 @end
 
-static NSString *shape(size_t channels) {
-    return [NSString stringWithFormat:@"tensor<fp16, [1, %zu, 1, 128]>", channels];
+static NSString *shape(size_t channels, size_t lanes) {
+    return [NSString stringWithFormat:@"tensor<fp16, [1, %zu, 1, %zu]>", channels, lanes];
 }
 
-static void slice(NSMutableString *mil, NSString *name, NSString *source, size_t begin, size_t count) {
+static void slice(NSMutableString *mil, NSString *name, NSString *source, size_t begin, size_t count, size_t lanes) {
     [mil appendFormat:@"    tensor<int32, [4]> %@begin = const()[name=string(\"%@begin\"), val=tensor<int32, [4]>([0,%zu,0,0])];\n", name, name, begin];
-    [mil appendFormat:@"    tensor<int32, [4]> %@size = const()[name=string(\"%@size\"), val=tensor<int32, [4]>([1,%zu,1,128])];\n", name, name, count];
-    [mil appendFormat:@"    %@ %@ = slice_by_size(x=%@, begin=%@begin, size=%@size)[name=string(\"%@\")];\n", shape(count), name, source, name, name, name];
+    [mil appendFormat:@"    tensor<int32, [4]> %@size = const()[name=string(\"%@size\"), val=tensor<int32, [4]>([1,%zu,1,%zu])];\n", name, name, count, lanes];
+    [mil appendFormat:@"    %@ %@ = slice_by_size(x=%@, begin=%@begin, size=%@size)[name=string(\"%@\")];\n", shape(count, lanes), name, source, name, name, name];
 }
 
 // Coupling weights travel sparse: per tile a one-bit mask over the padded
@@ -172,12 +181,12 @@ static void layoutTiles(const int8_t *weights, size_t channels, const size_t *le
     }
 }
 
-static NSString *makeMIL(size_t channels, const size_t *lengths, size_t tiles, size_t sweeps, const int8_t *fields, const int8_t *weights) {
+static NSString *makeMIL(size_t channels, size_t lanes, const size_t *lengths, size_t tiles, size_t sweeps, const int8_t *fields, const int8_t *weights) {
     QuipTileWeights layout[24];
     layoutTiles(weights, channels, lengths, tiles, layout);
     NSMutableString *mil = [NSMutableString stringWithFormat:
-        @"program(1.3)\n[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}, {\"quip-ane-msa\", \"%@\"}})]\n{\n  func main<ios18>(%@ a_state", NSUUID.UUID.UUIDString, shape(channels)];
-    for (size_t sweep = 0; sweep < sweeps; ++sweep) [mil appendFormat:@", %@ t%zu", shape(channels), sweep];
+        @"program(1.3)\n[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}, {\"quip-ane-msa\", \"%@\"}})]\n{\n  func main<ios18>(%@ a_state", NSUUID.UUID.UUIDString, shape(channels, lanes)];
+    for (size_t sweep = 0; sweep < sweeps; ++sweep) [mil appendFormat:@", %@ t%zu", shape(channels, lanes), sweep];
     [mil appendString:@") {\n"
         "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
         "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
@@ -212,10 +221,10 @@ static NSString *makeMIL(size_t channels, const size_t *lengths, size_t tiles, s
             NSString *threshold = [prefix stringByAppendingString:@"threshold"];
             NSString *raw = [prefix stringByAppendingString:@"raw"];
             NSString *js = [prefix stringByAppendingString:@"js"];
-            slice(mil, own, state, begin, count);
-            slice(mil, threshold, [NSString stringWithFormat:@"t%zu", sweep], begin, count);
-            [mil appendFormat:@"    %@ %@ = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w%zu, x=%@)[name=string(\"%@\")];\n", shape(padded), raw, tile, state, raw];
-            slice(mil, js, raw, 0, count);
+            slice(mil, own, state, begin, count, lanes);
+            slice(mil, threshold, [NSString stringWithFormat:@"t%zu", sweep], begin, count, lanes);
+            [mil appendFormat:@"    %@ %@ = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w%zu, x=%@)[name=string(\"%@\")];\n", shape(padded, lanes), raw, tile, state, raw];
+            slice(mil, js, raw, 0, count, lanes);
             NSArray *ops = @[
                 @[@"field", [NSString stringWithFormat:@"add(x=%@, y=h%zu)", js, tile]],
                 @[@"signed", [NSString stringWithFormat:@"mul(x=%@, y=%@field)", own, prefix]],
@@ -226,24 +235,24 @@ static NSString *makeMIL(size_t channels, const size_t *lengths, size_t tiles, s
                 @[@"factor", [NSString stringWithFormat:@"add(x=one, y=%@negative)", prefix]],
                 @[@"updated", [NSString stringWithFormat:@"mul(x=%@, y=%@factor)", own, prefix]]
             ];
-            for (NSArray *op in ops) [mil appendFormat:@"    %@ %@%@ = %@[name=string(\"%@%@\")];\n", shape(count), prefix, op[0], op[1], prefix, op[0]];
+            for (NSArray *op in ops) [mil appendFormat:@"    %@ %@%@ = %@[name=string(\"%@%@\")];\n", shape(count, lanes), prefix, op[0], op[1], prefix, op[0]];
             NSMutableArray *parts = [NSMutableArray new];
             if (begin > 0) {
                 NSString *head = [prefix stringByAppendingString:@"head"];
-                slice(mil, head, state, 0, begin);
+                slice(mil, head, state, 0, begin, lanes);
                 [parts addObject:head];
             }
             [parts addObject:[prefix stringByAppendingString:@"updated"]];
             if (begin + count < channels) {
                 NSString *tail = [prefix stringByAppendingString:@"tail"];
-                slice(mil, tail, state, begin + count, channels - begin - count);
+                slice(mil, tail, state, begin + count, channels - begin - count, lanes);
                 [parts addObject:tail];
             }
             if (parts.count == 1) {
                 state = parts[0];
             } else {
                 state = [prefix stringByAppendingString:@"state"];
-                [mil appendFormat:@"    %@ %@ = concat(values=(%@), axis=axis, interleave=interleave)[name=string(\"%@\")];\n", shape(channels), state, [parts componentsJoinedByString:@", "], state];
+                [mil appendFormat:@"    %@ %@ = concat(values=(%@), axis=axis, interleave=interleave)[name=string(\"%@\")];\n", shape(channels, lanes), state, [parts componentsJoinedByString:@", "], state];
             }
             begin += count;
         }
@@ -297,7 +306,7 @@ static NSData *makeWeightBlob(const int8_t *weights, size_t channels, const size
     return blob;
 }
 
-int32_t quip_ane_create(size_t input_channels, const size_t *lengths, size_t tile_count, size_t sweeps,
+int32_t quip_ane_create(size_t input_channels, size_t lanes, const size_t *lengths, size_t tile_count, size_t sweeps,
     const int8_t *weights, size_t weight_count, const int8_t *fields, size_t field_count,
     void **program, char *error, size_t error_capacity) {
     @autoreleasepool {
@@ -307,9 +316,9 @@ int32_t quip_ane_create(size_t input_channels, const size_t *lengths, size_t til
             if (error == NULL || error_capacity == 0) return 1;
             error[0] = '\0';
             size_t inputElements, allocationBytes;
-            if (input_channels < 32 || input_channels > 16384 || input_channels % 32 != 0 ||
+            if (input_channels < 32 || input_channels > 16384 || input_channels % 32 != 0 || lanes < 32 || lanes > 128 || lanes % 32 != 0 ||
                 tile_count == 0 || tile_count > 24 || lengths == NULL || sweeps == 0 || sweeps > 8 ||
-                !multiply(input_channels, 128, &inputElements) || !surfaceBytes(inputElements, &allocationBytes)) {
+                !multiply(input_channels, lanes, &inputElements) || !surfaceBytes(inputElements, &allocationBytes)) {
                 return fail(error, error_capacity, @"Invalid ANE channel dimensions or block size");
             }
             size_t rows = 0, weightElements = 0;
@@ -349,12 +358,14 @@ int32_t quip_ane_create(size_t input_channels, const size_t *lengths, size_t til
             NSError *nativeError = nil;
             NSData *plist = [NSPropertyListSerialization dataWithPropertyList:@{} format:NSPropertyListXMLFormat_v1_0 options:0 error:&nativeError];
             if (plist == nil) return fail(error, error_capacity, describe(@"Serialize ANE options", nativeError));
-            NSData *mil = [makeMIL(input_channels, lengths, tile_count, sweeps, fields, weights) dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *mil = [makeMIL(input_channels, lanes, lengths, tile_count, sweeps, fields, weights) dataUsingEncoding:NSUTF8StringEncoding];
             id descriptor = [[descriptorClass alloc] initWithNetworkText:mil weights:@{} optionsPlist:plist isMILModel:YES];
             if (descriptor == nil) return fail(error, error_capacity, @"ANE descriptor creation failed");
             QuipAneProgram *result = [QuipAneProgram new];
             result->inputElements = inputElements;
             result->sweeps = sweeps;
+            result->queue = dispatch_queue_create("org.quip.ane-program", DISPATCH_QUEUE_SERIAL);
+            result->group = dispatch_group_create();
             result.model = [modelClass inMemoryModelWithDescriptor:descriptor];
             requireSelector(result.model, @selector(hexStringIdentifier));
             NSString *identifier = [result.model hexStringIdentifier];
@@ -387,7 +398,7 @@ int32_t quip_ane_create(size_t input_channels, const size_t *lengths, size_t til
             result.loaded = YES;
             if (![result removeDirectory:&nativeError]) return fail(error, error_capacity, describe(@"Remove ANE staging directory", nativeError));
             NSMutableArray *wrappers = [NSMutableArray new];
-            for (size_t i = 0; i < sweeps + 2; ++i) {
+            for (size_t i = 0; i < 2 + 2 * sweeps; ++i) {
                 IOSurfaceRef surface = makeSurface(inputElements);
                 result->surfaces[i] = surface;
                 if (surface == NULL) return fail(error, error_capacity, @"ANE IOSurface allocation failed");
@@ -397,18 +408,20 @@ int32_t quip_ane_create(size_t input_channels, const size_t *lengths, size_t til
             }
             result.wrappers = wrappers;
             NSMutableArray *requests = [NSMutableArray new];
-            for (size_t state = 0; state < 2; ++state) {
-                NSMutableArray *inputs = [NSMutableArray arrayWithObject:wrappers[state]];
-                NSMutableArray *indices = [NSMutableArray arrayWithObject:@0];
-                for (size_t sweep = 0; sweep < sweeps; ++sweep) {
-                    [inputs addObject:wrappers[sweep + 2]];
-                    [indices addObject:@(sweep + 1)];
+            for (size_t bank = 0; bank < 2; ++bank) {
+                for (size_t state = 0; state < 2; ++state) {
+                    NSMutableArray *inputs = [NSMutableArray arrayWithObject:wrappers[state]];
+                    NSMutableArray *indices = [NSMutableArray arrayWithObject:@0];
+                    for (size_t sweep = 0; sweep < sweeps; ++sweep) {
+                        [inputs addObject:wrappers[2 + bank * sweeps + sweep]];
+                        [indices addObject:@(sweep + 1)];
+                    }
+                    id request = [requestClass requestWithInputs:inputs inputIndices:indices
+                        outputs:@[wrappers[1 - state]] outputIndices:@[@0]
+                        weightsBuffer:nil perfStats:nil procedureIndex:@0];
+                    if (request == nil) return fail(error, error_capacity, @"ANE request creation failed");
+                    [requests addObject:request];
                 }
-                id request = [requestClass requestWithInputs:inputs inputIndices:indices
-                    outputs:@[wrappers[1 - state]] outputIndices:@[@0]
-                    weightsBuffer:nil perfStats:nil procedureIndex:@0];
-                if (request == nil) return fail(error, error_capacity, @"ANE request creation failed");
-                [requests addObject:request];
             }
             result.requests = requests;
             *program = (__bridge_retained void *)result;
@@ -419,24 +432,63 @@ int32_t quip_ane_create(size_t input_channels, const size_t *lengths, size_t til
     }
 }
 
+void quip_ane_convert_thresholds(const uint8_t *thresholds, uint16_t *output_bits, size_t count) {
+    size_t index = 0;
+    const uint16x8_t skippedValue = vreinterpretq_u16_s16(vdupq_n_s16(-128));
+    for (; index + 8 <= count; index += 8) {
+        uint16x8_t values = vmovl_u8(vld1_u8(thresholds + index));
+        uint16x8_t skipped = vceqq_u16(values, vdupq_n_u16(255));
+        int16x8_t normalized = vreinterpretq_s16_u16(vbslq_u16(skipped, skippedValue, values));
+        vst1q_u16(output_bits + index, vreinterpretq_u16_f16(vcvtq_f16_s16(normalized)));
+    }
+    for (; index < count; ++index) {
+        _Float16 value = (_Float16)(thresholds[index] == 255 ? -128 : thresholds[index]);
+        memcpy(output_bits + index, &value, sizeof(value));
+    }
+}
+
+static void convertSpins(const int8_t *spins, uint16_t *outputBits, size_t count) {
+    size_t index = 0;
+    for (; index + 8 <= count; index += 8) {
+        int16x8_t values = vmovl_s8(vld1_s8(spins + index));
+        vst1q_u16(outputBits + index, vreinterpretq_u16_f16(vcvtq_f16_s16(values)));
+    }
+    for (; index < count; ++index) {
+        _Float16 value = (_Float16)spins[index];
+        memcpy(outputBits + index, &value, sizeof(value));
+    }
+}
+
 static BOOL stageSurface(IOSurfaceRef surface, const void *values, size_t count, BOOL thresholds, NSString **error) {
     IOReturn status = IOSurfaceLock(surface, 0, NULL);
     if (status != kIOReturnSuccess) { *error = @"ANE input lock failed"; return NO; }
     BOOL valid = YES;
     @try {
-        _Float16 *destination = IOSurfaceGetBaseAddress(surface);
+        uint16_t *destination = IOSurfaceGetBaseAddress(surface);
         if (destination == NULL) { *error = @"ANE input IOSurface has no base address"; valid = NO; }
-        else for (size_t i = 0; i < count; ++i) {
+        else if (thresholds) {
             // 255 represents a skipped sweep. -128 keeps every integer margin
             // negative even at the maximum supported signed local field, 21.
-            int value = thresholds ? ((const uint8_t *)values)[i] : ((const int8_t *)values)[i];
-            destination[i] = (_Float16)(thresholds && value == 255 ? -128 : value);
-        }
+            quip_ane_convert_thresholds(values, destination, count);
+        } else convertSpins(values, destination, count);
     } @finally {
         status = IOSurfaceUnlock(surface, 0, NULL);
         if (status != kIOReturnSuccess) { *error = @"ANE input unlock failed"; valid = NO; }
     }
     return valid;
+}
+
+static BOOL finishDispatch(QuipAneProgram *owned, QuipAneTimes *times, NSString **error) {
+    if (!owned->pending) return YES;
+    dispatch_group_wait(owned->group, DISPATCH_TIME_FOREVER);
+    owned->pending = NO;
+    times->dispatch_us += owned->pendingDispatchUS;
+    if (owned.pendingError != nil) {
+        *error = owned.pendingError;
+        owned.pendingError = nil;
+        return NO;
+    }
+    return YES;
 }
 
 int32_t quip_ane_reset(void *program, const int8_t *spins, size_t count, char *error, size_t error_capacity) {
@@ -447,6 +499,9 @@ int32_t quip_ane_reset(void *program, const int8_t *spins, size_t count, char *e
         QuipAneProgram *owned = (__bridge QuipAneProgram *)program;
         if (!owned.loaded || count != owned->inputElements) return fail(error, error_capacity, @"Invalid ANE reset dimensions");
         for (size_t i = 0; i < count; ++i) if (spins[i] != -1 && spins[i] != 1) return fail(error, error_capacity, @"ANE spin must be -1 or +1");
+        QuipAneTimes ignored = {0, 0};
+        NSString *pendingError = nil;
+        if (!finishDispatch(owned, &ignored, &pendingError)) return fail(error, error_capacity, pendingError);
         owned->initialized = NO;
         NSString *stagingError = nil;
         if (!stageSurface(owned->surfaces[0], spins, count, NO, &stagingError)) return fail(error, error_capacity, stagingError);
@@ -456,7 +511,7 @@ int32_t quip_ane_reset(void *program, const int8_t *spins, size_t count, char *e
     } @catch (NSException *exception) { return fail(error, error_capacity, [NSString stringWithFormat:@"ANE reset exception: %@", exception.reason]); } }
 }
 
-int32_t quip_ane_evaluate(void *program, const uint8_t *thresholds, size_t threshold_count,
+int32_t quip_ane_submit(void *program, const uint8_t *thresholds, size_t threshold_count,
     QuipAneTimes *times, char *error, size_t error_capacity) {
     @autoreleasepool { @try {
         if (error == NULL || error_capacity == 0) return 1;
@@ -464,24 +519,77 @@ int32_t quip_ane_evaluate(void *program, const uint8_t *thresholds, size_t thres
         if (program == NULL || thresholds == NULL || times == NULL) return fail(error, error_capacity, @"Missing ANE evaluation pointer");
         *times = (QuipAneTimes){0, 0};
         QuipAneProgram *owned = (__bridge QuipAneProgram *)program;
-        if (!owned.loaded || !owned->initialized || threshold_count != owned->inputElements * owned->sweeps) return fail(error, error_capacity, @"Invalid ANE evaluation dimensions or uninitialized state");
+        if (!owned.loaded || (!owned->pending && !owned->initialized) || threshold_count != owned->inputElements * owned->sweeps) return fail(error, error_capacity, @"Invalid ANE evaluation dimensions or uninitialized state");
         uint64_t stagingStart = monotonicUS();
         for (size_t i = 0; i < threshold_count; ++i) if (thresholds[i] > 63 && thresholds[i] != 255) return fail(error, error_capacity, @"ANE threshold must be 0..63 or skipped (255)");
         NSString *stagingError = nil;
+        size_t bank = owned->nextThresholdBank;
         for (size_t sweep = 0; sweep < owned->sweeps; ++sweep) {
-            if (!stageSurface(owned->surfaces[sweep + 2], thresholds + sweep * owned->inputElements, owned->inputElements, YES, &stagingError)) return fail(error, error_capacity, stagingError);
+            if (!stageSurface(owned->surfaces[2 + bank * owned->sweeps + sweep], thresholds + sweep * owned->inputElements, owned->inputElements, YES, &stagingError)) {
+                NSString *pendingError = nil;
+                (void)finishDispatch(owned, times, &pendingError);
+                return fail(error, error_capacity, pendingError != nil ? pendingError : stagingError);
+            }
         }
         times->staging_us = monotonicUS() - stagingStart;
-        NSError *nativeError = nil;
-        uint64_t dispatchStart = monotonicUS();
-        owned->initialized = NO;
-        BOOL completed = [owned.model evaluateWithQoS:21 options:@{} request:owned.requests[owned->current] error:&nativeError];
-        times->dispatch_us = monotonicUS() - dispatchStart;
-        if (!completed) { owned->initialized = NO; return fail(error, error_capacity, describe(@"Evaluate ANE program", nativeError)); }
-        owned->current = 1 - owned->current;
-        owned->initialized = YES;
+        NSString *pendingError = nil;
+        if (!finishDispatch(owned, times, &pendingError)) return fail(error, error_capacity, pendingError);
+        id request = owned.requests[bank * 2 + owned->current];
+        owned->nextThresholdBank = 1 - bank;
+        owned->pendingDispatchUS = 0;
+        owned.pendingError = nil;
+        owned->pending = YES;
+        dispatch_group_enter(owned->group);
+        dispatch_async(owned->queue, ^{
+            @autoreleasepool {
+                uint64_t dispatchStart = monotonicUS();
+                @try {
+                    NSError *nativeError = nil;
+                    BOOL completed = [owned.model evaluateWithQoS:21 options:@{} request:request error:&nativeError];
+                    if (completed) {
+                        owned->current = 1 - owned->current;
+                        owned->initialized = YES;
+                    } else {
+                        owned->initialized = NO;
+                        owned.pendingError = describe(@"Evaluate ANE program", nativeError);
+                    }
+                } @catch (NSException *exception) {
+                    owned->initialized = NO;
+                    owned.pendingError = [NSString stringWithFormat:@"ANE evaluate exception: %@", exception.reason];
+                } @finally {
+                    owned->pendingDispatchUS = monotonicUS() - dispatchStart;
+                    dispatch_group_leave(owned->group);
+                }
+            }
+        });
         return 0;
     } @catch (NSException *exception) { return fail(error, error_capacity, [NSString stringWithFormat:@"ANE evaluate exception: %@", exception.reason]); } }
+}
+
+int32_t quip_ane_finish(void *program, QuipAneTimes *times, char *error, size_t error_capacity) {
+    @autoreleasepool { @try {
+        if (error == NULL || error_capacity == 0) return 1;
+        error[0] = '\0';
+        if (program == NULL || times == NULL) return fail(error, error_capacity, @"Missing ANE finish pointer");
+        *times = (QuipAneTimes){0, 0};
+        QuipAneProgram *owned = (__bridge QuipAneProgram *)program;
+        NSString *pendingError = nil;
+        if (!finishDispatch(owned, times, &pendingError)) return fail(error, error_capacity, pendingError);
+        return 0;
+    } @catch (NSException *exception) { return fail(error, error_capacity, [NSString stringWithFormat:@"ANE finish exception: %@", exception.reason]); } }
+}
+
+int32_t quip_ane_evaluate(void *program, const uint8_t *thresholds, size_t threshold_count,
+    QuipAneTimes *times, char *error, size_t error_capacity) {
+    if (error == NULL || error_capacity == 0) return 1;
+    error[0] = '\0';
+    if (times == NULL) return fail(error, error_capacity, @"Missing ANE evaluation timing pointer");
+    QuipAneTimes submitted = {0, 0};
+    if (quip_ane_submit(program, thresholds, threshold_count, &submitted, error, error_capacity) != 0) return 1;
+    QuipAneTimes finished = {0, 0};
+    if (quip_ane_finish(program, &finished, error, error_capacity) != 0) return 1;
+    *times = (QuipAneTimes){submitted.staging_us + finished.staging_us, submitted.dispatch_us + finished.dispatch_us};
+    return 0;
 }
 
 int32_t quip_ane_read(void *program, int8_t *output, size_t count, char *error, size_t error_capacity) {
@@ -490,7 +598,11 @@ int32_t quip_ane_read(void *program, int8_t *output, size_t count, char *error, 
         error[0] = '\0';
         if (program == NULL || output == NULL) return fail(error, error_capacity, @"Missing ANE read pointer");
         QuipAneProgram *owned = (__bridge QuipAneProgram *)program;
-        if (!owned.loaded || !owned->initialized || count != owned->inputElements) return fail(error, error_capacity, @"Invalid ANE read dimensions or uninitialized state");
+        if (!owned.loaded || count != owned->inputElements) return fail(error, error_capacity, @"Invalid ANE read dimensions or uninitialized state");
+        QuipAneTimes ignored = {0, 0};
+        NSString *pendingError = nil;
+        if (!finishDispatch(owned, &ignored, &pendingError)) return fail(error, error_capacity, pendingError);
+        if (!owned->initialized) return fail(error, error_capacity, @"Invalid ANE read dimensions or uninitialized state");
         IOSurfaceRef surface = owned->surfaces[owned->current];
         IOReturn status = IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
         if (status != kIOReturnSuccess) return fail(error, error_capacity, @"ANE output lock failed");
@@ -517,8 +629,12 @@ int32_t quip_ane_destroy(void *program, char *error, size_t error_capacity) {
             if (program == NULL) return fail(error, error_capacity, @"Missing ANE program handle");
             // Consumes create's retain before any operation that can fail.
             QuipAneProgram *owned = CFBridgingRelease(program);
+            QuipAneTimes ignored = {0, 0};
+            NSString *pendingError = nil;
+            BOOL completed = finishDispatch(owned, &ignored, &pendingError);
             NSError *nativeError = nil;
             if (![owned unload:&nativeError]) return fail(error, error_capacity, describe(@"Unload ANE program", nativeError));
+            if (!completed) return fail(error, error_capacity, pendingError);
             if (error == NULL || error_capacity == 0) return 1;
             error[0] = '\0';
             return 0;

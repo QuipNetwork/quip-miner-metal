@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use quip_solver_core::{IsingGraph, SampleParams};
 
-use crate::graph::{prepare, LANES};
+use crate::graph::prepare;
 use crate::msa::{initial_spins, schedule, validate_params, ThresholdRows};
 use crate::native::{AneProgram, BLOCK_SWEEPS};
 use crate::AneError;
@@ -57,6 +57,8 @@ fn solve_with_block(
     let mut stats = RunStats::default();
     let validate_started = Instant::now();
     validate_params(params)?;
+    // ANE surfaces use a 64-byte channel stride (32 fp16 lanes).
+    let lanes = params.num_reads.div_ceil(32) * 32;
     stats.validate_us = elapsed_us(validate_started.elapsed())?;
     let graph_prep_started = Instant::now();
     let prepared = prepare(graph)?;
@@ -65,25 +67,25 @@ fn solve_with_block(
     let rungs = schedule(graph, params)?;
     stats.schedule_us = elapsed_us(schedule_started.elapsed())?;
     let initial_spins_started = Instant::now();
-    let mut state = initial_spins(prepared.node_count, params.seed);
+    let mut state = initial_spins(prepared.node_count, lanes, params.seed);
     stats.initial_spins_us = elapsed_us(initial_spins_started.elapsed())?;
-    state.resize(prepared.input_channels * LANES, 0);
+    state.resize(prepared.input_channels * lanes, 0);
 
     if prepared.node_count == 0 || rungs.is_empty() {
         stats.setup_us = elapsed_us(setup_started.elapsed())?;
         return Ok(RunOutput {
-            spins: read_major_spins(&state, prepared.node_count, params.num_reads),
+            spins: read_major_spins(&state, prepared.node_count, params.num_reads, lanes),
             stats,
         });
     }
 
-    let mut program = AneProgram::compile(&prepared, block_sweeps)?;
+    let mut program = AneProgram::compile(&prepared, lanes, block_sweeps)?;
     stats.programs = 1;
     let order = prepared.storage_order();
-    let mut packed = vec![1; prepared.input_channels * LANES];
+    let mut packed = vec![1; prepared.input_channels * lanes];
     for (row, &node) in order.iter().enumerate() {
-        packed[row * LANES..(row + 1) * LANES]
-            .copy_from_slice(&state[node * LANES..(node + 1) * LANES]);
+        packed[row * lanes..(row + 1) * lanes]
+            .copy_from_slice(&state[node * lanes..(node + 1) * lanes]);
     }
     let reset_started = Instant::now();
     program.reset(&packed)?;
@@ -91,20 +93,20 @@ fn solve_with_block(
     stats.setup_us = elapsed_us(setup_started.elapsed())?;
     let anneal_started = Instant::now();
     let mut rows = ThresholdRows::new(params.seed);
-    let mut block = vec![255; prepared.input_channels * LANES * block_sweeps];
+    let mut block = vec![255; prepared.input_channels * lanes * block_sweeps];
     let mut slot = 0;
     for (rung_index, rung) in rungs.iter().enumerate() {
         rows.begin_rung(rung.beta);
         for sweep in 0..rung.sweeps {
-            let thresholds = rows.expand(prepared.node_count, rung_index, sweep);
+            let thresholds = rows.expand(prepared.node_count, lanes, rung_index, sweep);
             for (row, &node) in order.iter().enumerate() {
-                let start = (slot * prepared.input_channels + row) * LANES;
-                block[start..start + LANES]
-                    .copy_from_slice(&thresholds[node * LANES..(node + 1) * LANES]);
+                let start = (slot * prepared.input_channels + row) * lanes;
+                block[start..start + lanes]
+                    .copy_from_slice(&thresholds[node * lanes..(node + 1) * lanes]);
             }
             slot += 1;
             if slot == block_sweeps {
-                let times = program.advance(&block)?;
+                let times = program.submit(&block)?;
                 stats.dispatches += 1;
                 stats.staging_us += times.staging_us;
                 stats.dispatch_us += times.dispatch_us;
@@ -114,25 +116,28 @@ fn solve_with_block(
         }
     }
     if slot != 0 {
-        let times = program.advance(&block)?;
+        let times = program.submit(&block)?;
         stats.dispatches += 1;
         stats.staging_us += times.staging_us;
         stats.dispatch_us += times.dispatch_us;
     }
+    let times = program.finish()?;
+    stats.staging_us += times.staging_us;
+    stats.dispatch_us += times.dispatch_us;
     program.read(&mut packed)?;
     for (row, &node) in order.iter().enumerate() {
-        state[node * LANES..(node + 1) * LANES]
-            .copy_from_slice(&packed[row * LANES..(row + 1) * LANES]);
+        state[node * lanes..(node + 1) * lanes]
+            .copy_from_slice(&packed[row * lanes..(row + 1) * lanes]);
     }
     stats.anneal_us = elapsed_us(anneal_started.elapsed())?;
-    let spins = read_major_spins(&state, prepared.node_count, params.num_reads);
+    let spins = read_major_spins(&state, prepared.node_count, params.num_reads, lanes);
     program.close()?;
     Ok(RunOutput { spins, stats })
 }
 
-fn read_major_spins(state: &[i8], nodes: usize, reads: usize) -> Vec<Vec<i8>> {
+fn read_major_spins(state: &[i8], nodes: usize, reads: usize, lanes: usize) -> Vec<Vec<i8>> {
     (0..reads)
-        .map(|read| (0..nodes).map(|node| state[node * LANES + read]).collect())
+        .map(|read| (0..nodes).map(|node| state[node * lanes + read]).collect())
         .collect()
 }
 
@@ -141,10 +146,50 @@ mod tests {
     use std::time::Instant;
 
     use super::{solve_in_process, solve_with_block, RunOutput, RunStats};
-    use crate::graph::{prepare, LANES};
+    use crate::graph::{prepare, MAX_LANES};
     use crate::msa::{initial_spins, schedule, ThresholdRows};
     use crate::native::{AneProgram, BLOCK_SWEEPS};
     use quip_solver_core::{IsingGraph, SampleParams};
+
+    #[test]
+    fn invalid_reads_are_rejected_before_lane_rounding() {
+        let graph = IsingGraph::new(Vec::new(), Vec::new(), Vec::new());
+        assert!(matches!(
+            solve_in_process(&graph, &params(usize::MAX, 0)),
+            Err(crate::AneError::Capacity(_))
+        ));
+    }
+
+    #[test]
+    fn readback_omits_physical_padding_lanes() {
+        for reads in [1usize, 33, 65, 127] {
+            let lanes = reads.div_ceil(32) * 32;
+            let mut state = vec![0; 3 * lanes];
+            for node in 0..3 {
+                state[node * lanes..node * lanes + reads].fill(if node == 1 { -1 } else { 1 });
+            }
+            assert_eq!(
+                super::read_major_spins(&state, 3, reads, lanes),
+                vec![vec![1, -1, 1]; reads]
+            );
+        }
+    }
+
+    #[test]
+    fn readback_uses_the_requested_lane_stride() {
+        for reads in [1, 7, 32, 33, 64, 127, 128] {
+            let state: Vec<i8> = (0..3)
+                .flat_map(|node| (0..reads).map(move |read| ((node + read) % 2) as i8 * 2 - 1))
+                .collect();
+            let actual = super::read_major_spins(&state, 3, reads, reads);
+            for (read, spins) in actual.iter().enumerate() {
+                let expected: Vec<i8> = (0..3)
+                    .map(|node| ((node + read) % 2) as i8 * 2 - 1)
+                    .collect();
+                assert_eq!(*spins, expected);
+            }
+        }
+    }
 
     fn params(num_reads: usize, num_sweeps: usize) -> SampleParams {
         SampleParams {
@@ -165,8 +210,8 @@ mod tests {
         let mut expected = before.to_vec();
         for tile in prepared.tiles.iter().filter(|tile| tile.color == color) {
             for &node in &tile.nodes {
-                for read in 0..LANES {
-                    let spin = before[node * LANES + read];
+                for read in 0..MAX_LANES {
+                    let spin = before[node * MAX_LANES + read];
                     let field_term = prepared.fields[node];
                     let mut degree = usize::from(field_term != 0);
                     let mut satisfied = usize::from(i16::from(field_term) * i16::from(spin) < 0);
@@ -174,11 +219,11 @@ mod tests {
                         degree += 1;
                         let product = i16::from(coupling)
                             * i16::from(spin)
-                            * i16::from(before[neighbor * LANES + read]);
+                            * i16::from(before[neighbor * MAX_LANES + read]);
                         satisfied += usize::from(product < 0);
                     }
-                    let threshold = usize::from(thresholds[node * LANES + read]);
-                    expected[node * LANES + read] = if satisfied <= (degree + threshold) / 2 {
+                    let threshold = usize::from(thresholds[node * MAX_LANES + read]);
+                    expected[node * MAX_LANES + read] = if satisfied <= (degree + threshold) / 2 {
                         -spin
                     } else {
                         spin
@@ -192,13 +237,13 @@ mod tests {
     fn oracle_solve(graph: &IsingGraph, params: &SampleParams) -> Vec<Vec<i8>> {
         let prepared = prepare(graph).unwrap();
         let rungs = schedule(graph, params).unwrap();
-        let mut state = initial_spins(prepared.node_count, params.seed);
-        state.resize(prepared.input_channels * LANES, 0);
+        let mut state = initial_spins(prepared.node_count, MAX_LANES, params.seed);
+        state.resize(prepared.input_channels * MAX_LANES, 0);
         let mut rows = ThresholdRows::new(params.seed);
         for (rung_index, rung) in rungs.iter().enumerate() {
             rows.begin_rung(rung.beta);
             for sweep in 0..rung.sweeps {
-                let thresholds = rows.expand(prepared.node_count, rung_index, sweep);
+                let thresholds = rows.expand(prepared.node_count, MAX_LANES, rung_index, sweep);
                 for color in 0..prepared.color_count {
                     state = oracle_color(&prepared, color, &state, &thresholds);
                 }
@@ -207,7 +252,7 @@ mod tests {
         (0..params.num_reads)
             .map(|read| {
                 (0..prepared.node_count)
-                    .map(|node| state[node * LANES + read])
+                    .map(|node| state[node * MAX_LANES + read])
                     .collect()
             })
             .collect()
@@ -353,14 +398,16 @@ mod tests {
     fn hardware_colors_observe_prior_updates() {
         let graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 1)]);
         let prepared = prepare(&graph).unwrap();
-        let mut program = AneProgram::compile(&prepared, BLOCK_SWEEPS).unwrap();
-        let mut state = vec![1; prepared.input_channels * LANES];
+        let mut program = AneProgram::compile(&prepared, MAX_LANES, BLOCK_SWEEPS).unwrap();
+        let mut state = vec![1; prepared.input_channels * MAX_LANES];
         program.reset(&state).unwrap();
-        let thresholds = vec![0; prepared.input_channels * LANES * BLOCK_SWEEPS];
+        let thresholds = vec![0; prepared.input_channels * MAX_LANES * BLOCK_SWEEPS];
         program.advance(&thresholds).unwrap();
         program.read(&mut state).unwrap();
-        assert!(state[..LANES].iter().all(|&spin| spin == -1));
-        assert!(state[LANES..2 * LANES].iter().all(|&spin| spin == 1));
+        assert!(state[..MAX_LANES].iter().all(|&spin| spin == -1));
+        assert!(state[MAX_LANES..2 * MAX_LANES]
+            .iter()
+            .all(|&spin| spin == 1));
         program.close().unwrap();
     }
 
@@ -392,9 +439,10 @@ mod tests {
     #[ignore = "requires Apple Silicon ANE"]
     fn hardware_read_counts() {
         let graph = IsingGraph::new(vec![-1.0, 1.0], vec![1.0], vec![(0, 1)]);
-        for reads in [1, 31, 32, 33, 127, 128] {
+        for reads in [1, 16, 31, 32, 33, 64, 65, 96, 127, 128] {
             let params = params(reads, 16);
-            let output = solve_in_process(&graph, &params).unwrap();
+            let output = solve_in_process(&graph, &params)
+                .unwrap_or_else(|error| panic!("reads={reads}: {error}"));
             let expected = oracle_solve(&graph, &params);
             let mismatches = output
                 .spins

@@ -1,0 +1,131 @@
+   Compiling quip-miner-ane v0.1.0 (/Users/carback1/Code/quip/quip-miner-metal/.codex/worktrees/fjo-completion/crates/ane-miner)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.83s
+     Running unittests src/lib.rs (crates/ane-miner/target/debug/deps/quip_miner_ane-76953b9a7bcb55f2)
+
+running 16 tests
+test native::tests::hardware_async_submission_joins_before_read_reset_and_close ... ok
+test native::tests::hardware_distinct_weights_fields_and_owned_close ... ok
+test native::tests::hardware_exhaustive_integer_acceptance ... integer_cases=32384 mismatches=0 successful_dispatches=9
+ok
+test native::tests::hardware_rejects_invalid_buffers_without_mutating_state ... ok
+test native::tests::hardware_retained_state_and_skipped_tail ... ok
+test process::tests::hardware_64_jobs_use_distinct_children_and_match_oracle ... job receipt: job=0, pid=14591, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=1, pid=14594, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=2, pid=14596, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=3, pid=14600, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=4, pid=14602, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=5, pid=14605, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=6, pid=14607, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=7, pid=14609, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=8, pid=14611, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=9, pid=14613, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=10, pid=14615, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=11, pid=14617, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=12, pid=14619, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=13, pid=14621, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=14, pid=14623, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=15, pid=14625, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=16, pid=14627, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=17, pid=14629, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=18, pid=14631, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=19, pid=14633, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=20, pid=14635, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=21, pid=14637, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=22, pid=14639, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=23, pid=14642, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=24, pid=14644, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=25, pid=14646, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=26, pid=14648, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=27, pid=14650, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=28, pid=14652, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=29, pid=14654, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=30, pid=14656, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=31, pid=14658, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=32, pid=14660, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=33, pid=14662, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=34, pid=14664, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=35, pid=14666, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=36, pid=14668, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=37, pid=14670, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=38, pid=14672, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=39, pid=14674, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=40, pid=14676, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=41, pid=14678, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=42, pid=14681, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=43, pid=14683, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=44, pid=14685, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=45, pid=14687, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=46, pid=14715, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=47, pid=14728, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=48, pid=14731, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=49, pid=14733, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=50, pid=14735, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=51, pid=14737, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=52, pid=14739, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=53, pid=14741, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=54, pid=14819, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=55, pid=14840, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=56, pid=14852, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=57, pid=14854, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=58, pid=14900, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=59, pid=14919, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=60, pid=14929, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=61, pid=14933, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=62, pid=14935, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+job receipt: job=63, pid=14938, programs=1, dispatches=16, oracle_reads=128, directory_removed=true
+64-job receipt: distinct_pids=64, programs=64, oracle_reads=8192
+ok
+test process::tests::hardware_cancellation_reaps_large_job ... cancellation receipt: pid=14940, elapsed_us=53067, directory_removed=true, child_reaped=true
+ok
+test process::tests::hardware_output_channel_close_stops_sampling_worker ... stream-close receipt: pid=14942, shutdown_us=9841, directory_removed=true, child_reaped=true
+ok
+test process::tests::hardware_startup_dispatch_receipt ... startup receipt: pid=14949, dispatches=1, directory_removed=true
+ok
+test solver::tests::hardware_color_block_shapes ... probe nodes=15 block=1
+probe nodes=15 block=2
+probe nodes=15 block=4
+probe nodes=15 block=8
+probe nodes=16 block=1
+probe nodes=16 block=2
+probe nodes=16 block=4
+probe nodes=16 block=8
+probe nodes=21 block=1
+probe nodes=21 block=2
+probe nodes=21 block=4
+probe nodes=21 block=8
+ok
+test solver::tests::hardware_colors_observe_prior_updates ... ok
+test solver::tests::hardware_full_output_4577 ... nodes=4577 reads=128 sweeps=4 colors=2 tiles=2 shapes=[(4608, 2304), (4608, 2304)] production_dispatches=4 final_mismatches=0 production_setup_us=1284431 production_staging_us=8791 production_dispatch_us=1884 production_anneal_us=19142 production_wall_us=1312951
+ok
+test solver::tests::hardware_irregular_colors ... nodes=1 dispatches=16 mismatches=0
+nodes=3 dispatches=16 mismatches=0
+nodes=21 dispatches=16 mismatches=0
+nodes=7 dispatches=16 mismatches=0
+ok
+test solver::tests::hardware_read_counts ... reads=1 dispatches=16 mismatches=0
+reads=16 dispatches=16 mismatches=0
+reads=31 dispatches=16 mismatches=0
+reads=32 dispatches=16 mismatches=0
+reads=33 dispatches=16 mismatches=0
+reads=64 dispatches=16 mismatches=0
+reads=65 dispatches=16 mismatches=0
+reads=96 dispatches=16 mismatches=0
+reads=127 dispatches=16 mismatches=0
+reads=128 dispatches=16 mismatches=0
+ok
+test solver::tests::hardware_tails_and_beta_boundaries ... ok
+test solver::tests::hardware_two_sweeps_exact_oracle ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 36.70s
+
+     Running unittests src/bin/quip_ane_msa.rs (crates/ane-miner/target/debug/deps/quip_ane_msa-951ffec705414d55)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/protocol.rs (crates/ane-miner/target/debug/deps/protocol-579e5e63a0ea359d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s

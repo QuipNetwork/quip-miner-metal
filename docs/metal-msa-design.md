@@ -16,7 +16,7 @@ simulated annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015).
 | `kernels/msc.cu`: 64 replicas per `u64` word, integer Metropolis, bit-sliced neighbour count, colour-parallel updates in shared memory | Yes, with a different word width and threadgroup mapping | Apple GPUs cap threadgroup memory at 32 KB and have 32-bit ALUs (see below) |
 | `KernelKind::Msc` on the device, `AlgoState::Msc`, `launch_msc` | Yes, as a crate-wide `Kernel` enum | The Metal crate keys width and sizing on a type tag with no device, so the kernel must be a first-class value |
 | `cuda_msa_identity` with algorithm `"msa"` and an envelope of 7392 to 29568 sweeps at 128 reads | Yes, with a Metal envelope measured on Apple hardware | Throughput per threadgroup is unknown until measured |
-| Stop on cancel: check `EXIT_NOW` inside the sweep loop | No | Metal cannot stop a committed command buffer. It checks cancellation before each chunk and uses a safety margin tuned for measured chunks below 400 ms. |
+| Stop on cancel: check `EXIT_NOW` inside the sweep loop | No | Metal cannot stop a committed command buffer. It checks cancellation before each chunk and uses a safety margin to target chunks below 400 ms. |
 | Parallel host scoring (`QUIP_SCORE_THREADS`) | Already present | `harvest_batch` scores problems on a rayon pool |
 | `QUIP_MSC_DIAG` compile switches | Yes, in tests only | metal-rs 0.33 exposes no preprocessor defines, so `tests/diagnostics.rs` prepends `#define QUIP_MSA_DIAGNOSTICS` to the kernel source. That build renames the entry point to `msa_anneal_diag` and adds a flip counter at buffer 25 and energy parts at buffer 26. No production code compiles it |
 
@@ -215,10 +215,15 @@ and returns each job's credit after its committed chunk finishes.
   `(0.1, 2.6e8)`, `(0.2, 5.2e8)`, `(0.4, 1.0e9)`, `(0.5, 1.2e9)`, and
   `(1.0, 1.2e9)`. Each pair gives threadgroups per core and word-updates/s.
   Safety 0.7 produced a 580 ms chunk. Safety 0.4 reached 606 ms at 16384
-  sweeps. The factor is 0.2 to cover the measured sweep range.
+  sweeps. The initial factor was 0.2 to cover that sweep range.
   Three verification rounds used T=1, 128 reads, and 7392 sweeps.
   Each round covered 1, 2, 5, 10, and 40 jobs.
   The largest chunk was 261 ms in a 40-job run.
+  The current 64-read envelope uses safety 0.4. The later scale study observed
+  two chunks above the 400 ms target among 95 batches, with a 444 ms peak.
+  No batch reached 500 ms or caused a watchdog termination. The accepted
+  decision in `fjo.11` keeps this setting. See
+  [the scale study](perf/2026-09-18-probe-screen-at-scale.md).
 - **Threadgroup budget.** `MSA_TG_PER_CORE` is 1.0. On the same machine and
   fixture, the 2026-09-15 runs used 80 jobs, 128 reads, and 7392 sweeps.
   Rates were 13.64, 14.23, 12.16, 11.57, and 10.85 jobs/s at T=1, 2, 4, 6,
@@ -275,18 +280,82 @@ opt-in because measurement did not support a new default.
   the paired speed ratios ranged from 1.20 to 1.50, with a median of 1.44. The
   raw driver excludes the miner channel, the governor, and result scoring, so
   this is not a production speed claim. No file under `src/` refers to it.
-- A Zephyr four-colouring. Opt-in behind `QUIP_METAL_MSA_FOUR_COLOR=1` at
-  `src/sampler.rs:401`, and off by default while bead `quip-miner-metal-fjo`
-  settles whether it becomes the default. Advantage2 System 1 has eight greedy
-  classes, with sizes 856, 840, 827, 742, 679, 472, 146, and 15. The four
-  classes hold 1148, 1145, 1145, and 1139 nodes. Two graph seeds gave no clear
-  throughput result: seed 1 gained 4.18 percent in jobs per second, and seed 3
-  took 8.44 percent longer. On seed 1 the largest logged chunk was 439 ms
-  under greedy and 277 ms under four colours, so only the four-colour arm
-  held the 400 ms bound of success criterion 5. Seed 3 has no logged chunk
-  maxima. Mean lowest energy was worse under four colours by 1400 and 250
-  milli on the two seeds, and no run separates that from noise. A failed
-  edge check selects the greedy scheme.
+- A Zephyr four-colouring. Opt-in behind `QUIP_METAL_MSA_FOUR_COLOR=1`
+  and off by default. The September 21 production-channel study used 60
+  historical blocks and three independent random draws per block in each arm.
+  At 64 reads and 14,336 sweeps, four colors changed mean lowest energy by
+  minus 500 milli on Metal and minus 544 milli on ANE. Their 95 percent intervals were
+  [-2056, 1000] and [-2333, 1256] milli. Negative means better energy.
+  Neither interval establishes a penalty or equal quality. Valid-proof rate
+  ratios also include 1. Metal keeps greedy order. ANE keeps four colors.
+  A failed edge check selects the greedy scheme. The
+  [quality report](perf/2026-09-21-coloring-router.md) gives the rates,
+  time to a valid result, and study limits.
+
+## Neural engine execution
+
+The ANE program uses 32, 64, 96, or 128 physical lanes. It rounds the read
+count up to the next group of 32 lanes. Each fp16 surface channel needs a
+64-byte stride. Results contain exactly the requested number of reads.
+The generator keeps the original 128-lane random stream prefix.
+
+The host fills the next threshold bank while the current ANE request runs.
+Two banks keep this work separate. The state surfaces stay in order. Each
+request waits for the prior request before it selects its input state.
+Reset, read-back, and destruction also wait for pending work. The sweep order
+stays the same.
+
+The production path keeps sparse couplings and one sweep per dispatch.
+The controlled comparison used 16,384 sweeps. At 64 reads, median full-run
+wall time fell from 8.406 to 5.706 seconds. At 128 reads, it fell from 14.229
+to 8.222 seconds. Every seeded spin array matched the serial control. The
+[overlap report](perf/2026-09-21-ane-overlap.md) records the hardware checks,
+timing results, and study limits.
+
+## Read and sweep policy
+
+Metal keeps 64 reads, a sweep range of 4096 to 14,336, one threadgroup per
+core, and safety 0.4. These are the shipped settings from the September 18
+studies. The planner targets 400 ms chunks. The accepted scale run reached
+444 ms without watchdog termination. The target is not a strict bound.
+
+Standalone ANE keeps its adaptive default of 128 reads and 2048 to 8192
+sweeps. The new fixed-budget study compares 64 and 128 reads at 14,336 sweeps.
+At 64 reads, the observed valid-proof rate rose from 0.0717 to 0.0811 per
+second. The rate ratio was 1.131, with a 95 percent interval of [0.924, 1.343].
+That interval holds measured times fixed. It does not establish a rate gain.
+
+At 128 reads, 95 of 180 jobs were valid, against 70 at 64 reads. Reducing
+reads worsened mean lowest energy by 4000 milli, with a 95 percent interval
+of [2567, 5422]. Keep 128 reads when the chance per job matters. Use
+64 reads for the measured combined workload.
+This study does not retune the standalone adaptive sweep range.
+
+## Router job-mix policy
+
+For a finite batch of 300 Advantage2 jobs, use Metal alone. The measured
+jobs had unit coefficients, 64 reads, and 14,336 sweeps. All could run on
+either engine. Set these keys in the coordinator's `backend_toml`:
+
+```toml
+enable_metal = true
+enable_ane = false
+```
+
+Four balanced rounds gave 4.609 valid proofs per second on Metal alone and
+3.811 with both engines. The combined-to-Metal rate ratio was 0.827. Its
+95 percent interval was [0.776, 0.874], with observed times held fixed.
+The combined runs sent 13 of 1200 jobs to ANE. Total wall time, including
+queue drain, was 118.344 seconds with both engines and 98.068 on Metal alone.
+The mean change in lowest energy was 183 milli. Its 95 percent interval
+was [-347, 703]. These results support Metal alone for this workload.
+
+The engine flags still default to true. When a workload requires ANE,
+keep the existing one-job ANE slot and Metal batching. The queue lets later
+eligible Metal work pass jobs that must wait for ANE.
+The results apply only to the measured finite workload. The
+[router report](perf/2026-09-21-coloring-router.md) gives all window results.
+Nonce screening remains in `fjo.10` for release 0.3.4.
 
 ## Success criteria
 
@@ -307,4 +376,6 @@ opt-in because measurement did not support a new default.
    With safety 0.2, three rounds at 7392 sweeps peaked at 261 ms.
    Each round covered 1, 2, 5, 10, and 40 jobs at 128 reads.
    The envelope measurements peaked at 258 ms. The README records these results.
-5. The largest chunk stays at or below 400 ms at the tuned rate.
+5. The planner targets chunks below 400 ms. This is a tuning target, not a
+   strict acceptance bound. The accepted 64-read scale study reached 444 ms
+   without watchdog termination, as recorded in `fjo.11`.

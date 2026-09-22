@@ -1,6 +1,9 @@
 //! A test coordinator for the ANE solver's unit-coefficient domain.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +58,20 @@ struct ServerTask(JoinHandle<()>);
 struct DispatchedProblem {
     ising: IsingProblem,
     dense_edges: Vec<(usize, usize)>,
+    dispatch_s: f64,
+}
+
+#[allow(
+    dead_code,
+    reason = "study receipts are consumed only by the combined_study integration target"
+)]
+pub(super) struct StudyResult {
+    pub job_id: Vec<u8>,
+    pub energies: Vec<i64>,
+    pub dispatch_s: f64,
+    pub completed_s: f64,
+    pub device_us: u64,
+    pub rescore_ok: bool,
 }
 
 impl Drop for ServerTask {
@@ -68,16 +85,29 @@ pub(super) struct Session {
     pub report: DriverReport,
     pub sent: Vec<CoordMsg>,
     pub received: Vec<MinerMsg>,
+    pub study_results: Vec<StudyResult>,
     inbound: Streaming<MinerMsg>,
     outbound: Outbound,
     child: Child,
     jobs: HashMap<Vec<u8>, DispatchedProblem>,
+    started: Instant,
+    phase_timeout: Duration,
     _server: ServerTask,
     _directory: tempfile::TempDir,
 }
 
 impl Session {
     pub(super) async fn start(binary: &str) -> Self {
+        Self::start_with(binary, "ane-protocol-test", &[], PHASE_TIMEOUT, None).await
+    }
+
+    pub(super) async fn start_with(
+        binary: &str,
+        miner_id: &str,
+        env: &[(String, String)],
+        phase_timeout: Duration,
+        stderr: Option<&Path>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("socket directory");
         let path = directory.path().join("coord.sock");
         let listener = UnixListener::bind(&path).expect("bind test coordinator");
@@ -89,17 +119,24 @@ impl Session {
                 .await
                 .expect("serve test coordinator");
         }));
-        let child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .args(["--quip-coordinator", &format!("unix://{}", path.display())])
-            .args(["--miner-id", "ane-protocol-test"])
+            .args(["--miner-id", miner_id])
             .env("QUIP_SESSION_TOKEN", "test-token")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("start real ANE miner");
-        let (inbound, outbound) = timeout(PHASE_TIMEOUT, receive)
+            .envs(env.iter().cloned())
+            .kill_on_drop(true);
+        if let Some(path) = stderr {
+            command.stderr(Stdio::from(
+                File::create(path).expect("create miner stderr log"),
+            ));
+        }
+        let child = command.spawn().expect("start real ANE miner");
+        let (inbound, outbound) = timeout(phase_timeout, receive)
             .await
-            .expect("miner must connect within ten seconds")
+            .expect("miner must connect within the phase timeout")
             .expect("coordinator connection");
+        let started = Instant::now();
         Self {
             report: DriverReport {
                 handshake_ok: false,
@@ -121,10 +158,13 @@ impl Session {
             },
             sent: Vec::new(),
             received: Vec::new(),
+            study_results: Vec::new(),
             inbound,
             outbound,
             child,
             jobs: HashMap::new(),
+            started,
+            phase_timeout,
             _server: server,
             _directory: directory,
         }
@@ -132,7 +172,7 @@ impl Session {
 
     pub(super) async fn send(&mut self, message: coord_msg::Msg) {
         let frame = CoordMsg { msg: Some(message) };
-        timeout(PHASE_TIMEOUT, self.outbound.send(Ok(frame.clone())))
+        timeout(self.phase_timeout, self.outbound.send(Ok(frame.clone())))
             .await
             .expect("coordinator send timeout")
             .expect("coordinator send");
@@ -164,6 +204,7 @@ impl Session {
                 DispatchedProblem {
                     ising: ising.clone(),
                     dense_edges: dense_edges.to_vec(),
+                    dispatch_s: self.elapsed_s(),
                 }
             )
             .is_none());
@@ -180,7 +221,7 @@ impl Session {
     }
 
     pub(super) async fn until(&mut self, phase: &str, done: impl Fn(&DriverReport) -> bool) {
-        let deadline = Instant::now() + PHASE_TIMEOUT;
+        let deadline = Instant::now() + self.phase_timeout;
         while !done(&self.report) {
             match timeout_at(deadline, self.inbound.message()).await {
                 Ok(Ok(Some(frame))) => {
@@ -238,8 +279,11 @@ impl Session {
                 self.report.fatal = Some((fatal.exit_code as i32, fatal.reason));
             }
             miner_msg::Msg::Result(result) => {
-                let DispatchedProblem { ising, dense_edges } =
-                    self.jobs.get(&result.job_id).expect("known result job ID");
+                let DispatchedProblem {
+                    ising,
+                    dense_edges,
+                    dispatch_s,
+                } = self.jobs.get(&result.job_id).expect("known result job ID");
                 let decode = |bytes: &[u8]| {
                     decode_i32_le(bytes)
                         .expect("valid coefficients for a returned result")
@@ -254,7 +298,7 @@ impl Session {
                     result.meta.as_ref().expect("SamplerMeta").reads,
                     ising.num_reads
                 );
-                let scored = result
+                let scored: Vec<Option<i64>> = result
                     .solutions
                     .iter()
                     .map(|solution| {
@@ -263,6 +307,28 @@ impl Session {
                         Some(energy_milli(&spins, &h, &j, dense_edges))
                     })
                     .collect();
+                let energies: Vec<_> = result
+                    .solutions
+                    .iter()
+                    .map(|solution| solution.energy_milli)
+                    .collect();
+                let rescore_ok = scored
+                    .iter()
+                    .zip(&energies)
+                    .all(|(scored, energy)| *scored == Some(*energy));
+                let device_us = result
+                    .meta
+                    .as_ref()
+                    .expect("SamplerMeta")
+                    .device_access_time_us;
+                self.study_results.push(StudyResult {
+                    job_id: result.job_id.clone(),
+                    energies: energies.clone(),
+                    dispatch_s: *dispatch_s,
+                    completed_s: self.elapsed_s(),
+                    device_us,
+                    rescore_ok,
+                });
                 self.report.results.push(ObservedResult {
                     job_id: result.job_id,
                     solution_energies_milli: result
@@ -279,17 +345,32 @@ impl Session {
     }
 
     pub(super) async fn finish(&mut self) {
+        self.finish_with_trace(true).await;
+    }
+
+    #[allow(dead_code, reason = "used only by the production-channel study")]
+    pub(super) async fn finish_quiet(&mut self) {
+        self.finish_with_trace(false).await;
+    }
+
+    async fn finish_with_trace(&mut self, trace: bool) {
         self.until("shutdown", |report| report.terminal == Terminal::Closed)
             .await;
-        self.report.exit_code = timeout(PHASE_TIMEOUT, self.child.wait())
+        self.report.exit_code = timeout(self.phase_timeout, self.child.wait())
             .await
             .expect("miner exit within ten seconds")
             .expect("miner exit status")
             .code()
             .unwrap_or(-1);
-        eprintln!(
-            "sent={:#?}\nreceived={:#?}\nreport={:#?}",
-            self.sent, self.received, self.report
-        );
+        if trace || self.report.exit_code != 0 {
+            eprintln!(
+                "sent={:#?}\nreceived={:#?}\nreport={:#?}",
+                self.sent, self.received, self.report
+            );
+        }
+    }
+
+    pub(super) fn elapsed_s(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
     }
 }

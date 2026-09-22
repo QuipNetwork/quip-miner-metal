@@ -1118,22 +1118,22 @@ mod tests {
     }
 
     fn four_color_oracle(graph: &IsingGraph, params: &SampleParams) -> Vec<Vec<i8>> {
-        use crate::graph::LANES;
+        use crate::graph::MAX_LANES;
         use crate::msa::{initial_spins, schedule, ThresholdRows};
         let prepared = prepare(graph).unwrap();
         assert_eq!(prepared.color_count, 4);
-        let mut state = initial_spins(prepared.node_count, params.seed);
+        let mut state = initial_spins(prepared.node_count, MAX_LANES, params.seed);
         let mut rows = ThresholdRows::new(params.seed);
         for (rung_index, rung) in schedule(graph, params).unwrap().iter().enumerate() {
             rows.begin_rung(rung.beta);
             for sweep in 0..rung.sweeps {
-                let thresholds = rows.expand(prepared.node_count, rung_index, sweep);
+                let thresholds = rows.expand(prepared.node_count, MAX_LANES, rung_index, sweep);
                 for color in 0..prepared.color_count {
                     let before = state.clone();
                     for tile in prepared.tiles.iter().filter(|tile| tile.color == color) {
                         for &node in &tile.nodes {
-                            for read in 0..LANES {
-                                let spin = before[node * LANES + read];
+                            for read in 0..MAX_LANES {
+                                let spin = before[node * MAX_LANES + read];
                                 let field = prepared.fields[node];
                                 let mut degree = usize::from(field != 0);
                                 let mut satisfied =
@@ -1143,12 +1143,12 @@ mod tests {
                                     satisfied += usize::from(
                                         i16::from(coupling)
                                             * i16::from(spin)
-                                            * i16::from(before[neighbor * LANES + read])
+                                            * i16::from(before[neighbor * MAX_LANES + read])
                                             < 0,
                                     );
                                 }
-                                let threshold = usize::from(thresholds[node * LANES + read]);
-                                state[node * LANES + read] =
+                                let threshold = usize::from(thresholds[node * MAX_LANES + read]);
+                                state[node * MAX_LANES + read] =
                                     if satisfied <= (degree + threshold) / 2 {
                                         -spin
                                     } else {
@@ -1163,7 +1163,7 @@ mod tests {
         (0..params.num_reads)
             .map(|read| {
                 (0..prepared.node_count)
-                    .map(|node| state[node * LANES + read])
+                    .map(|node| state[node * MAX_LANES + read])
                     .collect()
             })
             .collect()
