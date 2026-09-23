@@ -256,13 +256,10 @@ mod tests {
         // pipeline that admits fewer would silently shrink every colour class
         // stride and break the persistent-RNG layout.
         assert!(dev.msa.max_total_threads_per_threadgroup() >= 256);
-        // Static threadgroup arrays (row + cut) must leave room for the
+        // Static threadgroup arrays (row + cut + lane totals) must leave room for the
         // largest advertised N at 4 bytes per spin under the 32 KB cap.
         let static_bytes = dev.msa.static_threadgroup_memory_length() as usize;
-        assert!(
-            static_bytes <= 8192 + 64 * 4 + 64,
-            "static tg bytes {static_bytes}"
-        );
+        assert!(static_bytes <= 8576, "static tg bytes {static_bytes}");
         assert!(
             static_bytes + 6016 * 4 <= dev.device.max_threadgroup_memory_length() as usize,
             "6016 spins do not fit beside {static_bytes} static bytes"

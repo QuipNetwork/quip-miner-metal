@@ -26,8 +26,10 @@ using namespace metal;
 // - Thresholds are 32-bit: cut[m] = floor(exp(-2 beta m) * 2^32).
 //
 // Preconditions the host checks: J in {-1, 0, +1}, |h| <= 1, CSR degree
-// <= MSA_MAX_DEG. Energies are not computed here; the host rescores every
-// read with energy_milli.
+// <= MSA_MAX_DEG. On the last chunk the kernel writes each read's energy in
+// milli units to final_energies. The value equals energy_milli whenever every
+// coefficient is a whole number in int8 range; the host checks that and
+// rescores otherwise.
 
 #define MSA_LANES      32
 #define MSA_PLANES     6
@@ -147,6 +149,50 @@ inline uint le_constant(thread const uint* planes, int limit) {
     return ~ge;
 }
 
+// Per-lane energy in milli of the spin words in `state` for the nodes this
+// thread owns (var = tid, tid + gsz, ...). h*spin*1000 per node plus one
+// directed CSR half-edge J*si*sj*500 per slot; a self-loop is stored once,
+// so it uses 1000.
+inline void lane_energies(
+    thread int* ener,
+    threadgroup const uint* state,
+    device const int* row_ptr,
+    device const int* col_ind,
+    device const int8_t* j_vals,
+    device const int8_t* h_vals,
+    int n, uint tid, uint gsz
+) {
+    for (int r = 0; r < MSA_LANES; ++r) {
+        ener[r] = 0;
+    }
+    for (uint var = tid; var < uint(n); var += gsz) {
+        int bi = int(state[var]);
+        int pstart = row_ptr[var];
+        int pend = row_ptr[var + 1];
+        int h = h_vals[var];
+        for (int r = 0; r < MSA_LANES; ++r) {
+            int spin = ((bi >> r) & 1) ? -1 : 1;
+            ener[r] += h * spin * 1000;
+        }
+        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+            int p = pstart + q;
+            if (p < pend) {
+                int J = int(j_vals[p]);
+                if (J != 0) {
+                    int nb = col_ind[p];
+                    int nbword = int(state[nb]);
+                    int coeff = (nb == int(var)) ? 1000 : 500;
+                    for (int r = 0; r < MSA_LANES; ++r) {
+                        int spin = ((bi >> r) & 1) ? -1 : 1;
+                        int sj = ((nbword >> r) & 1) ? -1 : 1;
+                        ener[r] += J * spin * sj * coeff;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ==============================================================================
 // Kernel
 // ==============================================================================
@@ -176,7 +222,7 @@ kernel void msa_anneal(
     device const float* beta_schedule [[buffer(9)]],
 
     device int8_t* final_samples [[buffer(10)]],           // [num_problems * num_reads * packed_size]
-    device int* final_energies [[buffer(11)]],             // unused: the host rescores
+    device int* final_energies [[buffer(11)]],             // [num_problems * num_reads] milli, last chunk only
 
     constant int& num_threadgroups [[buffer(12)]],         // num_problems * words
     constant int& num_problems [[buffer(13)]],
@@ -205,6 +251,7 @@ kernel void msa_anneal(
     uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
     uint3 threads_per_group [[threads_per_threadgroup]]
 ) {
+    threadgroup atomic_int lane_total[MSA_LANES];
     threadgroup uchar row[MSA_ROW];              // geometric draws M for the current rung
     threadgroup uint cut[MSA_MAX_FIELD + 1];     // cut[m] = floor(exp(-2 beta m) * 2^32)
 #ifdef QUIP_MSA_DIAGNOSTICS
@@ -219,6 +266,9 @@ kernel void msa_anneal(
     uint gsz = threads_per_group.x;
     uint problem_id = tg / uint(words);
     uint w = tg - problem_id * uint(words);
+    if (tid < uint(MSA_LANES)) {
+        atomic_store_explicit(&lane_total[tid], 0, memory_order_relaxed);
+    }
 
     int row_ptr_start = row_ptr_offsets[problem_id];
     int col_ind_start = col_ind_offsets[problem_id];
@@ -351,54 +401,43 @@ kernel void msa_anneal(
         }
     }
 
+    // Energies. The diagnostic build keeps its per-(thread, lane) partials on
+    // every chunk; the production build reduces them on the last chunk only.
+    bool last_chunk = chunk_end >= num_betas;
 #ifdef QUIP_MSA_DIAGNOSTICS
-    // Per-replica chunk energy in milli, split over threads and lanes so the
-    // host sums i64 partials without atomics. Each thread walks its strided
-    // nodes for all 32 lanes: h*spin*1000 per node, and one directed CSR
-    // half-edge J*si*sj*500 (a self-loop is stored once, so it uses 1000).
-    // Purely diagnostic; compiled out when QUIP_MSA_DIAGNOSTICS is absent.
-    {
+    bool need_energy = true;
+#else
+    bool need_energy = last_chunk;
+#endif
+    if (need_energy) {
         int ener[MSA_LANES];
-        #pragma unroll
-        for (int r = 0; r < MSA_LANES; ++r) {
-            ener[r] = 0;
-        }
-        for (uint var = tid; var < uint(n); var += gsz) {
-            int bi = int(state[var]);
-            int pstart = my_csr_row_ptr[var];
-            int pend = my_csr_row_ptr[var + 1];
-            int h = my_h_vals[var];
-            #pragma unroll
-            for (int r = 0; r < MSA_LANES; ++r) {
-                int spin = ((bi >> r) & 1) ? -1 : 1;
-                ener[r] += h * spin * 1000;
-            }
-            #pragma unroll
-            for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                int p = pstart + q;
-                if (p < pend) {
-                    int J = int(my_csr_J_vals[p]);
-                    if (J != 0) {
-                        int nb = my_csr_col_ind[p];
-                        int nbword = int(state[nb]);
-                        int coeff = (nb == var) ? 1000 : 500;
-                        #pragma unroll
-                        for (int r = 0; r < MSA_LANES; ++r) {
-                            int spin = ((bi >> r) & 1) ? -1 : 1;
-                            int sj = ((nbword >> r) & 1) ? -1 : 1;
-                            ener[r] += J * spin * sj * coeff;
-                        }
-                    }
-                }
-            }
-        }
+        lane_energies(ener, state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals,
+                      my_h_vals, n, tid, gsz);
+#ifdef QUIP_MSA_DIAGNOSTICS
         device int* dst = &diag_energy_partials[(tg * gsz + tid) * MSA_LANES];
-        #pragma unroll
         for (int r = 0; r < MSA_LANES; ++r) {
             dst[r] = ener[r];
         }
+#endif
+        if (last_chunk) {
+            for (int r = 0; r < MSA_LANES; ++r) {
+                int s = simd_sum(ener[r]);
+                if (simd_is_first()) {
+                    atomic_fetch_add_explicit(&lane_total[r], s, memory_order_relaxed);
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (last_chunk && tid < uint(MSA_LANES)) {
+        int read = int(w) * MSA_LANES + int(tid);
+        if (read < num_reads) {
+            final_energies[problem_id * uint(num_reads) + uint(read)] =
+                atomic_load_explicit(&lane_total[tid], memory_order_relaxed);
+        }
     }
 
+#ifdef QUIP_MSA_DIAGNOSTICS
     // Per-thread accepted-flip counter for this chunk (overwritten per chunk;
     // no atomics, one disjoint write per thread).
     diag_accept_counts[tg * gsz + tid] = accept_count;

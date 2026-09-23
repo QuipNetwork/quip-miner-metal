@@ -3,10 +3,10 @@
 //! Kernels are the original v0.2 Metal sources (`GPU/metal_kernels.metal` /
 //! `GPU/metal_gibbs.metal`, copied verbatim into `kernels/`): int8-quantized
 //! CSR, D-Wave incremental delta-energy SA / color-block Gibbs, bit-packed
-//! thread-local state, one thread per read. Solution energies are always
-//! scored on the host with
-//! [`quip_solver_core::quip_protocol::scoring::energy_milli`] (f64
-//! consensus). There is no GPU energy kernel (MSL has no `double`).
+//! thread-local state, one thread per read. The multi-spin kernel computes
+//! energies on the device for whole-unit graphs, with one job in 1,000 audited
+//! on the host. SA, Gibbs, and non-integer graphs are scored on the host with
+//! [`quip_solver_core::quip_protocol::scoring::energy_milli`] (f64 consensus).
 //!
 //! # Batched dispatch (throughput)
 //!
@@ -156,17 +156,18 @@ const _: () = assert!(
 /// Also the per-threadgroup RNG stream count the persistent buffer is sized by.
 const MSA_THREADS: usize = 256;
 /// Static threadgroup bytes `msa_anneal` declares: an 8192-byte threshold row
-/// plus 64 `uint` cut values. `msa_pipeline_compiles_and_admits_256_threads`
-/// checks the compiled figure against a bound using the literal 8448 bytes,
+/// plus 64 `uint` cut values and 32 atomic lane totals.
+/// `msa_pipeline_compiles_and_admits_256_threads` checks the compiled figure
+/// against a bound using the literal 8576 bytes,
 /// rather than reading this constant.
-const MSA_STATIC_TG_BYTES: usize = 8192 + 64 * 4;
+const MSA_STATIC_TG_BYTES: usize = 8192 + 64 * 4 + MSA_LANES * 4;
 /// Threadgroup memory every Apple GPU family offers per threadgroup, bytes.
 /// There is no opt-in above it (CUDA's `MAX_DYNAMIC_SHARED_SIZE_BYTES` has no
 /// counterpart), which is why the kernel uses 32-bit words: one `u64` per
 /// spin does not fit Advantage2's 4577 spins.
 const APPLE_TG_MEMORY_BYTES: usize = 32 * 1024;
 /// Multi-spin kernel `N` cap: `N * 4` bytes of spin words must fit beside the
-/// static arrays under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 8448 = 32,512).
+/// static arrays under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 8576 = 32,640).
 ///
 /// `crate::METAL_MSA_IDENTITY` advertises this same cap, so the identity
 /// const and the dispatch guard have one source.
@@ -421,6 +422,31 @@ fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     }
 }
 
+/// Largest `sum |h| + sum |J|` in whole units for which the kernel's `int`
+/// energy cannot overflow: every term is at most 1000 in magnitude per unit.
+const DEVICE_ENERGY_MAX_UNITS: f64 = (i32::MAX / 1000) as f64;
+
+/// Whether the multi-spin kernel's energy equals consensus `energy_milli` for
+/// `graph`. The kernel truncates each coefficient to `i8` and sums in `int`,
+/// so it matches only when every coefficient is a whole number in `i8` range
+/// and the total magnitude cannot overflow. Consensus instances always pass.
+fn device_energy_exact(graph: &IsingGraph) -> bool {
+    let whole = |v: f64| v.is_finite() && v.fract() == 0.0 && (-128.0..=127.0).contains(&v);
+    let mut units = 0.0;
+    for &v in graph.h.iter().chain(graph.j.iter()) {
+        if !whole(v) {
+            return false;
+        }
+        units += v.abs();
+    }
+    units <= DEVICE_ENERGY_MAX_UNITS
+}
+
+/// Jobs harvested with device energies so far, for the 1-in-1,000 audit.
+static ENERGY_AUDIT_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// One device-energy job in this many is rescored on the host.
+const ENERGY_AUDIT_EVERY: u64 = 1000;
+
 /// Geometric beta schedule cast to f32 for kernel upload, plus sweeps-per-beta.
 ///
 /// Uses the shared f64 schedule and casts each element to f32 — bit-identical
@@ -462,6 +488,8 @@ fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
 /// A prepared batch retaining its inputs and carry-over state between chunks.
 /// Only `commit_next` submits work, with at most one unfinished chunk per batch.
 pub(crate) struct EncodedBatch {
+    /// Energies come from the kernel's `final_energies` buffer instead of the host rescore.
+    device_energy: bool,
     /// Command buffers in submission order. A long anneal is split across
     /// several so no single one trips the macOS GPU watchdog; the last carries
     /// the final state. See [`TARGET_DISPATCH_MS`].
@@ -1082,6 +1110,7 @@ fn encode_batch_inner(
             .collect()
     };
     Ok(EncodedBatch {
+        device_energy: kernel == Kernel::Msa && graphs.iter().all(|g| device_energy_exact(g)),
         cmds: Vec::with_capacity(plan.len()),
         d_samples: out.samples.clone(),
         n,
@@ -1110,15 +1139,14 @@ fn pad_i32(v: &[i32]) -> Vec<i32> {
     }
 }
 
-/// Read a completed batch's bit-packed samples and host-score each read,
-/// returning one `Vec<SamplerResult>` per problem (in `graphs` order).
+/// Read a completed batch's bit-packed samples and return results in `graphs` order.
+/// Whole-unit multi-spin graphs use device energies, with one job in 1,000
+/// audited on the host. SA, Gibbs, and non-integer graphs use host scoring.
 ///
 /// `graphs` must be the exact slice passed to [`encode_batch`] (same order and
-/// length) so each problem's spins are scored against its own `h`/`J`. The
-/// buffer read is on the caller's thread; unpack + `energy_milli` scoring runs
-/// on a rayon pool (one task per problem) — this is the bulk of the per-batch
-/// host cost, overlapped with the next batch's GPU compute by the streaming
-/// pipeline.
+/// length) so each problem's spins are scored against its own `h`/`J`.
+/// Buffer reads run on the caller's thread. Unpacking and host scoring run
+/// on a rayon pool, with one task per problem.
 pub(crate) fn harvest_batch(
     batch: &EncodedBatch,
     graphs: &[&IsingGraph],
@@ -1138,7 +1166,15 @@ pub(crate) fn harvest_batch(
     let count = batch.num_problems * batch.num_reads * batch.packed_size;
     let packed = read_i8_buffer(&batch.d_samples, count)?;
     let (num_reads, packed_size, n) = (batch.num_reads, batch.packed_size, batch.n);
-    let out = graphs
+    let energies = if batch.device_energy {
+        Some(read_i32_buffer(
+            &batch.out.energies,
+            batch.num_problems * num_reads,
+        )?)
+    } else {
+        None
+    };
+    let out: Vec<Vec<SamplerResult>> = graphs
         .par_iter()
         .enumerate()
         .map(|(p, graph)| {
@@ -1146,12 +1182,47 @@ pub(crate) fn harvest_batch(
                 .map(|r| {
                     let start = (p * num_reads + r) * packed_size;
                     let spins = unpack_spins(&packed[start..start + packed_size], n);
-                    score_spins(&spins, graph)
+                    match &energies {
+                        Some(e) => SamplerResult {
+                            spins,
+                            energy_milli: i64::from(e[p * num_reads + r]),
+                        },
+                        None => score_spins(&spins, graph),
+                    }
                 })
                 .collect()
         })
         .collect();
+    if batch.device_energy {
+        audit_device_energies(&out, graphs)?;
+    }
     Ok(out)
+}
+
+/// Rescore one job in [`ENERGY_AUDIT_EVERY`] on the host. A mismatch means the
+/// kernel's reduction is wrong, which would turn into rejected proofs, so it
+/// is a device fault rather than a per-job error.
+fn audit_device_energies(
+    out: &[Vec<SamplerResult>],
+    graphs: &[&IsingGraph],
+) -> Result<(), SampleError> {
+    use std::sync::atomic::Ordering;
+    let first = ENERGY_AUDIT_JOBS.fetch_add(out.len() as u64, Ordering::Relaxed);
+    for (p, (reads, graph)) in out.iter().zip(graphs).enumerate() {
+        if !(first + p as u64).is_multiple_of(ENERGY_AUDIT_EVERY) {
+            continue;
+        }
+        for (r, read) in reads.iter().enumerate() {
+            let want = energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges);
+            if read.energy_milli != want {
+                return Err(SampleError::Driver(format!(
+                    "device energy {} != host energy {want} for problem {p} read {r}",
+                    read.energy_milli
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run `num_reads` independent anneals on the GPU for one explicit problem
@@ -1272,12 +1343,123 @@ fn read_i8_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i8>, SampleEr
     Ok(out)
 }
 
+fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, SampleError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let len = buf.length() as usize;
+    if len < count * 4 {
+        return Err(SampleError::Driver(format!(
+            "Metal buffer holds {len} bytes, need {}",
+            count * 4
+        )));
+    }
+    let ptr = buf.contents() as *const i32;
+    if ptr.is_null() {
+        return Err(SampleError::Driver(
+            "Metal buffer contents() returned null".into(),
+        ));
+    }
+    let mut out = vec![0i32; count];
+    // SAFETY: buffer is StorageModeShared; `contents()` is non-null and
+    // `length() >= count * 4` are checked above. Metal buffers are aligned
+    // for i32; `out` owns `count` initialized i32 values and cannot overlap
+    // the device allocation. The writing command buffer completed before this call.
+    unsafe {
+        std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), count);
+    }
+    Ok(out)
+}
+
 // Host-side (GPU-free) logic only: everything under test here is `cfg(macos)`,
 // so the module carries the same gate. The dispatch itself is covered by
 // `tests/golden_parity.rs`, which needs a real device.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_energy_is_exact_only_for_whole_i8_coefficients() {
+        let unit = IsingGraph::new(vec![1.0, -1.0, 0.0], vec![1.0, -1.0], vec![(0, 1), (1, 2)]);
+        assert!(device_energy_exact(&unit));
+        let half = IsingGraph::new(vec![0.5, 0.0, 0.0], vec![1.0, 1.0], vec![(0, 1), (1, 2)]);
+        assert!(!device_energy_exact(&half));
+        let big = IsingGraph::new(vec![0.0; 3], vec![200.0, 1.0], vec![(0, 1), (1, 2)]);
+        assert!(!device_energy_exact(&big));
+        let nan = IsingGraph::new(
+            vec![f64::NAN, 0.0, 0.0],
+            vec![1.0, 1.0],
+            vec![(0, 1), (1, 2)],
+        );
+        assert!(!device_energy_exact(&nan));
+    }
+
+    #[test]
+    fn msa_device_energies_equal_consensus_energy() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        // 50 reads: not a whole number of 32-lane words.
+        for (graph, sweeps) in [(chain(64), 32), (ring(), 256), (chain(300), 1)] {
+            let mut p = params(sweeps);
+            p.num_reads = 50;
+            let results = sample_ising(&dev, &graph, &p, Kernel::Msa).unwrap();
+            assert_eq!(results.len(), 50);
+            for r in &results {
+                let want = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
+                assert_eq!(r.energy_milli, want);
+            }
+        }
+    }
+
+    #[test]
+    fn msa_non_unit_graph_falls_back_to_host_scoring() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let mut graph = chain(64);
+        graph.h[3] = 0.5;
+        let results = sample_ising(&dev, &graph, &params(32), Kernel::Msa).unwrap();
+        for r in &results {
+            assert_eq!(
+                r.energy_milli,
+                energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
+    }
+
+    #[test]
+    fn msa_chunked_run_writes_energies_on_the_last_chunk_only() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let graph = chain(64);
+        let p = params(64);
+        let graphs = [&graph];
+        let mut batch = encode_batch_inner(
+            &dev,
+            &graphs,
+            &p,
+            Kernel::Msa,
+            1,
+            Some(&[(0, 20), (20, 44)]),
+        )
+        .unwrap();
+        while batch.commit_next(|| false) {
+            batch.wait_until_completed();
+        }
+        assert!(batch.failed_status().is_none());
+        let results = harvest_batch(&batch, &graphs).unwrap();
+        for r in &results[0] {
+            assert_eq!(
+                r.energy_milli,
+                energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
+    }
 
     /// Small ring: 0-1-2-3-0, unit J, ternary h (same fixture as `topology`).
     fn ring() -> IsingGraph {
