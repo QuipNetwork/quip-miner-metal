@@ -1,0 +1,27 @@
+coord=21812 miner=21998
+17:55  up 14 days,  7:04, 10 users, load averages: 18.63 17.41 13.74
+t=5 384.6  85.3 gpu="Device Utilization %"=0
+t=10 297.7  54.6 gpu="Device Utilization %"=26
+t=15 333.3  56.5 gpu="Device Utilization %"=80
+t=20 489.1 103.6 gpu="Device Utilization %"=0
+t=25 578.1 104.9 gpu="Device Utilization %"=70
+t=30 546.0 117.9 gpu="Device Utilization %"=0
+t=35 476.5 113.8 gpu="Device Utilization %"=61
+t=40 530.6  95.2 gpu="Device Utilization %"=71
+t=45 555.2 113.6 gpu="Device Utilization %"=0
+t=50 555.7  92.7 gpu="Device Utilization %"=66
+t=55 569.8 138.2 gpu="Device Utilization %"=21
+t=60 630.9 128.4 gpu="Device Utilization %"=0
+t=65 577.2 124.2 gpu="Device Utilization %"=68
+t=70 615.5 111.0 gpu="Device Utilization %"=66
+t=75 505.2  99.1 gpu="Device Utilization %"=23
+t=80 502.7 121.2 gpu="Device Utilization %"=54
+t=85 566.2 126.4 gpu="Device Utilization %"=72
+t=90 587.2 131.9 gpu="Device Utilization %"=58
+t=95 620.8 134.2 gpu="Device Utilization %"=61
+t=100 634.4 145.8 gpu="Device Utilization %"=0
+t=105 577.5 111.9 gpu="Device Utilization %"=56
+t=110 680.1 115.3 gpu="Device Utilization %"=70
+t=115 597.5 115.2 gpu="Device Utilization %"=75
+t=120 499.6 107.5 gpu="Device Utilization %"=27
+17:57  up 14 days,  7:06, 10 users, load averages: 18.91 17.54 14.25
