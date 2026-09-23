@@ -1427,8 +1427,6 @@ pub(crate) fn harvest_batch(
     batch: &EncodedBatch,
     graphs: &[&IsingGraph],
 ) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
-    use rayon::prelude::*;
-
     // Was a `debug_assert_eq!`, which is compiled out in release — a length
     // mismatch would index `packed` from `graphs` while sizing it from
     // `batch.num_problems` and panic the miner.
@@ -1450,6 +1448,28 @@ pub(crate) fn harvest_batch(
     } else {
         None
     };
+    decode_packed_reads(
+        &packed,
+        energies.as_deref(),
+        graphs,
+        num_reads,
+        packed_size,
+        n,
+    )
+}
+
+/// Decode dense job regions in graph order, then audit device energies.
+/// Callers provide initialized storage for graphs.len() * num_reads reads.
+pub(crate) fn decode_packed_reads(
+    packed: &[i8],
+    energies: Option<&[i32]>,
+    graphs: &[&IsingGraph],
+    num_reads: usize,
+    packed_size: usize,
+    n: usize,
+) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
+    use rayon::prelude::*;
+
     let out: Vec<Vec<SamplerResult>> = graphs
         .par_iter()
         .enumerate()
@@ -1458,7 +1478,7 @@ pub(crate) fn harvest_batch(
                 .map(|r| {
                     let start = (p * num_reads + r) * packed_size;
                     let spins = unpack_spins(&packed[start..start + packed_size], n);
-                    match &energies {
+                    match energies {
                         Some(e) => SamplerResult {
                             spins,
                             energy_milli: i64::from(e[p * num_reads + r]),
@@ -1469,7 +1489,7 @@ pub(crate) fn harvest_batch(
                 .collect()
         })
         .collect();
-    if batch.device_energy {
+    if energies.is_some() {
         audit_device_energies(&out, graphs)?;
     }
     Ok(out)
@@ -1653,6 +1673,27 @@ fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, Sample
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_decode_preserves_jobs_reads_and_host_scoring() {
+        let a = IsingGraph::new(vec![1.0, -1.0, 0.0], vec![], vec![]);
+        let b = IsingGraph::new(vec![-1.0, 1.0, 0.0], vec![], vec![]);
+        let graphs = [&a, &b];
+        let packed = [0, 5, 7, 2];
+        let expected = [[1, 1, 1], [-1, 1, -1], [-1, -1, -1], [1, -1, 1]];
+        let energies = [0, -2000, 0, -2000];
+        for device_energies in [Some(energies.as_slice()), None] {
+            let results = decode_packed_reads(&packed, device_energies, &graphs, 2, 1, 3).unwrap();
+            assert_eq!(results.len(), 2);
+            for (p, reads) in results.iter().enumerate() {
+                assert_eq!(reads.len(), 2);
+                for (r, read) in reads.iter().enumerate() {
+                    assert_eq!(read.spins, expected[p * 2 + r]);
+                    assert_eq!(read.energy_milli, i64::from(energies[p * 2 + r]));
+                }
+            }
+        }
+    }
 
     /// Run one shape at a time, retaining the normal harvest and audit path.
     fn seeded_experiment_batch(

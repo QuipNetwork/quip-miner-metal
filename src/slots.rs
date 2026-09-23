@@ -194,7 +194,8 @@ impl SlotPool {
         let offset = offset
             .checked_mul(std::mem::size_of::<T>())
             .ok_or_else(|| SampleError::Driver("slot write offset overflow".into()))?;
-        if buf.contents().is_null()
+        let contents = buf.contents().cast::<u8>();
+        if contents.is_null()
             || offset
                 .checked_add(bytes)
                 .is_none_or(|end| end > buf.length() as usize)
@@ -208,7 +209,7 @@ impl SlotPool {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr().cast::<u8>(),
-                buf.contents().cast::<u8>().add(offset),
+                contents.add(offset),
                 bytes,
             );
         }
@@ -351,7 +352,13 @@ impl SlotPool {
         }
         let share = sampler::gpu_time_us(command) / self.steps.len() as u64;
         self.command = None;
-        let mut checkpoints = Vec::new();
+        let output_count = self
+            .steps
+            .iter()
+            .filter(|step| step.flags & SLOT_WRITE_OUTPUT != 0)
+            .count();
+        let mut checkpoints = Vec::with_capacity(output_count);
+        let energies = self.buffer(11)?.contents().cast::<i32>();
         for step in &self.steps {
             let slot = step.slot as usize;
             let Some(r) = self.slots[slot].as_mut() else {
@@ -364,8 +371,12 @@ impl SlotPool {
                 r.next_checkpoint += 1;
                 r.has_output = true;
                 let last = r.next_checkpoint == r.job.checkpoints.len();
-                let best = self
-                    .energies(slot)?
+                // SAFETY: the completed output step initialized this live
+                // slot's region. No host mutation or GPU write overlaps it.
+                let slot_energies = unsafe {
+                    std::slice::from_raw_parts(energies.add(slot * self.num_reads), self.num_reads)
+                };
+                let best = slot_energies
                     .iter()
                     .copied()
                     .min()
@@ -382,61 +393,95 @@ impl SlotPool {
         Ok(checkpoints)
     }
 
-    fn energies(&self, slot: SlotId) -> Result<&[i32], SampleError> {
-        let buffer = self.buffer(11)?;
-        // SAFETY: the buffer was sized for every slot's reads. This private
-        // helper is called only for live slots after a completed output step.
-        Ok(unsafe {
-            std::slice::from_raw_parts(
-                buffer.contents().cast::<i32>().add(slot * self.num_reads),
-                self.num_reads,
-            )
-        })
-    }
-
     /// Read the latest checkpoint, which remains valid between output steps.
     pub(crate) fn reads(
         &self,
         slot: SlotId,
         num_reads: usize,
     ) -> Result<Vec<SamplerResult>, SampleError> {
+        self.reads_many(&[slot], num_reads)?
+            .pop()
+            .ok_or_else(|| SampleError::Driver("missing slot read result".into()))
+    }
+
+    /// Harvest checkpoint outputs in requested slot order with one parallel
+    /// decode across jobs. Repeated slots produce repeated results.
+    pub(crate) fn reads_many(
+        &self,
+        slots: &[SlotId],
+        num_reads: usize,
+    ) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
         self.idle()?;
-        let r = self
-            .slots
-            .get(slot)
-            .and_then(Option::as_ref)
-            .filter(|r| r.has_output)
-            .ok_or_else(|| SampleError::Driver("slot has no checkpoint output".into()))?;
         if num_reads > self.num_reads {
             return Err(SampleError::TooLarge(
                 "read count exceeds slot capacity".into(),
             ));
         }
-        let packed_size = self.cached.n.div_ceil(8);
-        let buffer = self.buffer(10)?;
-        // SAFETY: admission and dispatch cannot overlap reads. The completed
-        // checkpoint initialized this slot's output within the allocated range.
-        let packed = unsafe {
-            std::slice::from_raw_parts(
-                buffer
-                    .contents()
-                    .cast::<i8>()
-                    .add(slot * self.num_reads * packed_size),
-                num_reads * packed_size,
-            )
-        };
-        let energies = self.energies(slot)?;
-        let out: Vec<_> = (0..num_reads)
-            .map(|i| SamplerResult {
-                spins: sampler::unpack_spins(
-                    &packed[i * packed_size..(i + 1) * packed_size],
-                    self.cached.n,
-                ),
-                energy_milli: i64::from(energies[i]),
+        let graphs: Vec<_> = slots
+            .iter()
+            .map(|&slot| {
+                self.slots
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .filter(|r| r.has_output)
+                    .map(|r| &r.job.graph)
+                    .ok_or_else(|| SampleError::Driver("slot has no checkpoint output".into()))
             })
-            .collect();
-        sampler::audit_device_energies(std::slice::from_ref(&out), &[&r.job.graph])?;
-        Ok(out)
+            .collect::<Result<_, _>>()?;
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let packed_size = self.cached.n.div_ceil(8);
+        let count = slots
+            .len()
+            .checked_mul(num_reads)
+            .filter(|&count| {
+                count
+                    .checked_mul(packed_size.max(4))
+                    .is_some_and(|bytes| bytes <= isize::MAX as usize)
+            })
+            .ok_or_else(|| {
+                SampleError::TooLarge("slot read output exceeds host capacity".into())
+            })?;
+        let mut packed = Vec::with_capacity(count * packed_size);
+        let mut energies = Vec::with_capacity(count);
+        let sample_ptr = self.buffer(10)?.contents().cast::<i8>();
+        let energy_ptr = self.buffer(11)?.contents().cast::<i32>();
+        let mut first = 0;
+        while first < slots.len() {
+            let mut end = first + 1;
+            // Full-read contiguous slots use one bulk copy per output buffer.
+            // Sparse slots and read prefixes are gathered into the same dense layout.
+            if num_reads == self.num_reads {
+                while end < slots.len() && slots[end] == slots[end - 1] + 1 {
+                    end += 1;
+                }
+            }
+            let read_count = (end - first) * num_reads;
+            let read_offset = slots[first] * self.num_reads;
+            // SAFETY: all requested slots have completed checkpoint output and
+            // idle() excludes GPU writes. Only validated slot regions are read,
+            // including when uninitialized or released slots lie between them.
+            unsafe {
+                packed.extend_from_slice(std::slice::from_raw_parts(
+                    sample_ptr.add(read_offset * packed_size),
+                    read_count * packed_size,
+                ));
+                energies.extend_from_slice(std::slice::from_raw_parts(
+                    energy_ptr.add(read_offset),
+                    read_count,
+                ));
+            }
+            first = end;
+        }
+        sampler::decode_packed_reads(
+            &packed,
+            Some(&energies),
+            &graphs,
+            num_reads,
+            packed_size,
+            self.cached.n,
+        )
     }
 
     pub(crate) fn device_us(&self, slot: SlotId) -> u64 {
@@ -554,9 +599,10 @@ mod tests {
             assert_eq!(energies, reference.0);
             assert_eq!(samples, reference.1);
         }
+        let all_reads = pool.reads_many(&[0, 1, 2], READS).unwrap();
         for (slot, graph) in graphs.iter().enumerate() {
             let packed_size = graph.h.len().div_ceil(8);
-            for (r, read) in pool.reads(slot, READS).unwrap().iter().enumerate() {
+            for (r, read) in all_reads[slot].iter().enumerate() {
                 let idx = slot * READS + r;
                 assert_eq!(read.energy_milli, i64::from(reference.0[idx]));
                 assert_eq!(
@@ -737,6 +783,38 @@ mod tests {
     }
 
     #[test]
+    fn reads_many_preserves_requested_slot_and_read_order() {
+        let Some(device) = device() else {
+            return;
+        };
+        let mut pool = SlotPool::new(&device, &advantage2_system1(7), 33, 4, 32).unwrap();
+        for seed in [7, 19, 43] {
+            pool.admit(job(seed, 32, vec![32])).unwrap();
+        }
+        pool.reads_many(&[0], 33).unwrap_err();
+        assert!(pool.commit_step(32).unwrap());
+        pool.reads_many(&[0], 33).unwrap_err();
+        pool.wait();
+        assert_eq!(pool.take_checkpoints().unwrap().len(), 3);
+        let dense = pool.reads_many(&[0, 1, 2], 33).unwrap();
+        pool.release(1).unwrap();
+        let sparse = pool.reads_many(&[2, 0, 2], 17).unwrap();
+        for (reads, slot) in sparse.iter().zip([2, 0, 2]) {
+            assert_eq!(reads.len(), 17);
+            for (a, b) in reads.iter().zip(&dense[slot]) {
+                assert_eq!(a.spins, b.spins);
+                assert_eq!(a.energy_milli, b.energy_milli);
+            }
+        }
+        assert!(pool.reads_many(&[], 33).unwrap().is_empty());
+        assert!(pool.reads_many(&[0], 0).unwrap()[0].is_empty());
+        pool.reads_many(&[0], 34).unwrap_err();
+        pool.reads_many(&[0, 1], 33).unwrap_err();
+        pool.reads_many(&[3], 33).unwrap_err();
+        pool.reads_many(&[4], 33).unwrap_err();
+    }
+
+    #[test]
     #[ignore = "one-gate S4 throughput study; run only on the controller's GPU"]
     #[expect(
         clippy::print_stderr,
@@ -744,7 +822,14 @@ mod tests {
     )]
     fn pool_probe_rate_against_run_stream() {
         use crate::sampler::{encode_batch, harvest_batch, EncodedBatch};
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
+
+        fn timed<T>(total: &mut Duration, action: impl FnOnce() -> T) -> T {
+            let start = Instant::now();
+            let result = action();
+            *total += start.elapsed();
+            result
+        }
 
         let Some(device) = device() else {
             return;
@@ -763,42 +848,62 @@ mod tests {
             SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
             SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
         ];
+        let mut pool_host = [Duration::ZERO; 6];
+        let mut pool_gpu_us = 0u64;
         let start = Instant::now();
         for batch_index in 0..STEPS + 2 {
             let pool = &mut pools[batch_index % 2];
             if pool.in_flight() {
-                pool.wait();
-                let checkpoints = pool.take_checkpoints().unwrap();
+                timed(&mut pool_host[2], || pool.wait());
+                pool_gpu_us += sampler::gpu_time_us(pool.command.as_ref().unwrap());
+                let checkpoints = timed(&mut pool_host[3], || pool.take_checkpoints().unwrap());
                 assert_eq!(checkpoints.len(), capacity);
-                for checkpoint in checkpoints {
-                    assert!(checkpoint.last);
-                    std::hint::black_box(pool.reads(checkpoint.slot, READS).unwrap());
-                    pool.release(checkpoint.slot).unwrap();
+                let slots: Vec<_> = checkpoints
+                    .iter()
+                    .map(|checkpoint| {
+                        assert!(checkpoint.last);
+                        checkpoint.slot
+                    })
+                    .collect();
+                let reads = timed(&mut pool_host[4], || {
+                    pool.reads_many(&slots, READS).unwrap()
+                });
+                std::hint::black_box(reads);
+                for slot in slots {
+                    timed(&mut pool_host[5], || pool.release(slot).unwrap());
                 }
             }
             if batch_index < STEPS {
                 for (i, graph) in templates.iter().enumerate() {
-                    pool.admit(SlotJob {
+                    let job = SlotJob {
                         graph: graph.clone(),
                         schedule: schedule.clone(),
                         checkpoints: vec![SWEEPS],
                         seed: (batch_index * capacity + i + 1) as u64,
-                    })
-                    .unwrap();
+                    };
+                    timed(&mut pool_host[0], || pool.admit(job).unwrap());
                 }
-                assert!(pool.commit_step(SWEEPS).unwrap());
+                assert!(timed(&mut pool_host[1], || pool
+                    .commit_step(SWEEPS)
+                    .unwrap()));
             }
         }
         let pool_seconds = start.elapsed().as_secs_f64();
         let mut batches: [Option<(EncodedBatch, Vec<IsingGraph>)>; 2] = [None, None];
+        let mut stream_host = [Duration::ZERO; 4];
+        let mut stream_gpu_us = 0u64;
         let start = Instant::now();
         for batch_index in 0..STEPS + 2 {
             let pending = &mut batches[batch_index % 2];
             if let Some((batch, graphs)) = pending.take() {
-                batch.wait_until_completed();
+                timed(&mut stream_host[2], || batch.wait_until_completed());
+                stream_gpu_us += batch.gpu_time_us();
                 assert!(batch.failed_status().is_none());
                 let refs: Vec<_> = graphs.iter().collect();
-                std::hint::black_box(harvest_batch(&batch, &refs).unwrap());
+                let reads = timed(&mut stream_host[3], || {
+                    harvest_batch(&batch, &refs).unwrap()
+                });
+                std::hint::black_box(reads);
             }
             if batch_index < STEPS {
                 let graphs = templates.clone();
@@ -810,9 +915,11 @@ mod tests {
                     seed: (batch_index * capacity + 1) as u64,
                     ..Default::default()
                 };
-                let mut batch = encode_batch(&device, &refs, &params, Kernel::Msa, 2).unwrap();
+                let mut batch = timed(&mut stream_host[0], || {
+                    encode_batch(&device, &refs, &params, Kernel::Msa, 2).unwrap()
+                });
                 assert_eq!(batch.chunk_count(), 1);
-                assert!(batch.commit_next(|| false));
+                assert!(timed(&mut stream_host[1], || batch.commit_next(|| false)));
                 *pending = Some((batch, graphs));
             }
         }
@@ -822,6 +929,47 @@ mod tests {
         let stream_rate = jobs / stream_seconds;
         eprintln!("S4 one gate: {STEPS} steps, capacity={capacity}, reads={READS}, sweeps={SWEEPS}, two in flight, no later gates, no controller, no warmup");
         eprintln!("pool={pool_rate:.2} jobs/s ({pool_seconds:.3}s), run_stream-equivalent={stream_rate:.2} jobs/s ({stream_seconds:.3}s), ratio={:.4}", pool_rate / stream_rate);
+        for (phase, elapsed) in [
+            "admit",
+            "commit_step",
+            "wait",
+            "take_checkpoints",
+            "reads",
+            "release",
+        ]
+        .into_iter()
+        .zip(pool_host)
+        {
+            eprintln!("pool host {phase}: {:.6}s total", elapsed.as_secs_f64());
+        }
+        for (phase, elapsed) in [
+            "encode_batch",
+            "commit_next",
+            "wait_until_completed",
+            "harvest_batch",
+        ]
+        .into_iter()
+        .zip(stream_host)
+        {
+            eprintln!("stream host {phase}: {:.6}s total", elapsed.as_secs_f64());
+        }
+        eprintln!(
+            "pool summed GPU time: {pool_gpu_us} us; stream summed GPU time: {stream_gpu_us} us"
+        );
+        eprintln!(
+            "host other (job copies, cleanup, timer overhead): pool={:.6}s stream={:.6}s",
+            pool_seconds - pool_host.iter().sum::<Duration>().as_secs_f64(),
+            stream_seconds - stream_host.iter().sum::<Duration>().as_secs_f64()
+        );
+        eprintln!("Host phases are exclusive wall intervals, including blocking waits. GPU time overlaps host work; do not add it to host totals. Result destruction is in host other. Pool construction is outside timing.");
+        let read_ratio = pool_host[4].as_secs_f64() / stream_host[3].as_secs_f64();
+        eprintln!("decode host time: pool={:.2} us/job, stream={:.2} us/job, ratio={read_ratio:.4}, target<=1.2",
+            pool_host[4].as_secs_f64() * 1_000_000.0 / jobs,
+            stream_host[3].as_secs_f64() * 1_000_000.0 / jobs);
+        assert!(
+            read_ratio <= 1.2,
+            "pool reads exceed 1.2x batch harvest time per job"
+        );
         assert!(
             pool_rate >= 0.95 * stream_rate,
             "S4 missed: profile admit and reads before Task 3"
