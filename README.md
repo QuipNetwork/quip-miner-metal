@@ -78,8 +78,8 @@ cutoff. It applies to the MSA kernel only. The eight keys below enter through
 | key | default | purpose |
 |-----|---------|---------|
 | `cascade` | `false` | enable or disable the screen |
-| `cascade_stages` | `[32, 128, 256]` | sweeps per probe stage |
-| `cascade_keep` | `3000` | probe-to-full denominator |
+| `cascade_stages` | `[32, 256]` | sweeps per probe stage |
+| `cascade_keep` | `2000` | probe-to-full denominator |
 | `cascade_keep_min` | `1000` | floor for the probe-to-full keep |
 | `cascade_keep_max` | `30000` | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | audit lane denominator |

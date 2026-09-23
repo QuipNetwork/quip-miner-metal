@@ -34,16 +34,12 @@ pub(crate) struct Calibration {
 }
 
 pub(crate) const CALIBRATION: Calibration = Calibration {
-    stages: &[32, 128, 256],
-    false_negative: &[
-        ((32, 128), 0.0581),
-        ((128, 256), 0.0496),
-        ((256, 14_336), 0.0804),
-    ],
-    skew: &[-0.138, -0.086, -0.076],
-    excess_kurtosis: &[0.059, 0.026, 0.018],
-    cost_a_us: 122.3,
-    cost_b_us: 2.367,
+    stages: &[32, 256],
+    false_negative: &[((32, 256), 0.0348), ((256, 14_336), 0.0357)],
+    skew: &[-0.147, -0.091],
+    excess_kurtosis: &[0.041, 0.016],
+    cost_a_us: 124.0,
+    cost_b_us: 2.284,
     k0: 1.0,
 };
 
@@ -77,11 +73,11 @@ pub(crate) struct CascadeSettings {
 impl Default for CascadeSettings {
     fn default() -> Self {
         let mut stages = [0; MAX_STAGES];
-        stages.copy_from_slice(CALIBRATION.stages);
+        stages[..CALIBRATION.stages.len()].copy_from_slice(CALIBRATION.stages);
         Self {
             enabled: false,
             stages,
-            keep: 3_000.0,
+            keep: 2_000.0,
             keep_min: 1_000.0,
             keep_max: 30_000.0,
             audit: 200,
@@ -838,8 +834,12 @@ mod tests {
             sweeps.push(next.params.num_sweeps);
             relay.complete(with_energy(next, -1), &out);
         }
-        assert_eq!(sweeps, [32, 128, 256, 14_336]);
-        assert_eq!(results.try_recv().unwrap().device_access_time_us, 14_752);
+        let expected_sweeps = [CALIBRATION.stages, &[14_336]].concat();
+        assert_eq!(sweeps, expected_sweeps);
+        assert_eq!(
+            results.try_recv().unwrap().device_access_time_us,
+            expected_sweeps.iter().sum::<usize>() as u64
+        );
         assert!(old_plan.upgrade().is_none());
         assert_eq!(relay.plan.borrow().cutoffs[0].moments().count(), 0);
         relay.admit(job(1, 1024));
@@ -945,16 +945,17 @@ mod tests {
 
     #[test]
     fn custom_stages_use_transition_calibration_and_skip_32_sweep_drift() {
+        let ((probe_budget, full_budget), miss_rate) = CALIBRATION.false_negative[1];
         let mut relay = Relay::new(
             CascadeSettings {
                 enabled: true,
-                stages: [128, 256, 0],
+                stages: [probe_budget, 0, 0],
                 ..enabled_settings()
             },
             1,
         );
-        relay.admit(job(0, 14_336));
-        let expected = AuditLane::new(0.0496).observation(true);
+        relay.admit(job(0, full_budget));
+        let expected = AuditLane::new(miss_rate).observation(true);
         assert_eq!(
             relay.plan.borrow_mut().audit_lanes[0].observation(true),
             expected
@@ -995,7 +996,8 @@ mod tests {
             }
             results.try_recv().unwrap();
         }
-        assert_eq!(relay.plan.borrow_mut().kept[2].len(), 1);
+        let last_probe = CALIBRATION.stages.len() - 1;
+        assert_eq!(relay.plan.borrow_mut().kept[last_probe].len(), 1);
         // With cold cutoffs and an audit draw at every rejection, only the
         // calibrated transitions may advance a 1,024-sweep job.
         for cutoff in &mut relay.plan.borrow_mut().cutoffs {
@@ -1009,7 +1011,7 @@ mod tests {
         }
         assert_eq!(
             results.try_recv().unwrap().device_access_time_us,
-            32 + 128 + 256
+            CALIBRATION.stages.iter().sum::<usize>() as u64
         );
     }
 
@@ -1089,6 +1091,7 @@ mod tests {
 
     #[test]
     fn audit_returns_the_next_probe_when_that_probe_screens_it_out() {
+        let ((_, full_budget), _) = CALIBRATION.false_negative[1];
         let mut relay = Relay::new(
             CascadeSettings {
                 audit: 2,
@@ -1098,11 +1101,11 @@ mod tests {
         );
         let (out, mut results) = mpsc::channel(1);
         for id in 0..100 {
-            relay.admit(job(id, 1024));
+            relay.admit(job(id, full_budget));
             let probe = relay.ready.pop_front().unwrap();
             relay.complete(with_energy(probe, 0), &out);
             if let Some(next) = relay.ready.pop_front() {
-                assert_eq!(next.params.num_sweeps, 128);
+                assert_eq!(next.params.num_sweeps, CALIBRATION.stages[1]);
                 // Choose a non-audit draw for the next screening decision.
                 relay.plan.borrow_mut().audit_rng = Some(1);
                 relay.complete(with_energy(next, 123), &out);
@@ -1111,7 +1114,10 @@ mod tests {
                     panic!("expected reads")
                 };
                 assert_eq!(reads[0].energy_milli, 123);
-                assert_eq!(result.device_access_time_us, 160);
+                assert_eq!(
+                    result.device_access_time_us,
+                    CALIBRATION.stages.iter().sum::<usize>() as u64
+                );
                 assert!(relay.plan.borrow_mut().kept[0].is_empty());
                 return;
             }
@@ -1122,8 +1128,9 @@ mod tests {
 
     #[test]
     fn injected_false_negative_burst_loosens_the_stage() {
+        let ((probe_budget, full_budget), _) = CALIBRATION.false_negative[0];
         let settings = CascadeSettings {
-            stages: [32, 0, 0],
+            stages: [probe_budget, 0, 0],
             keep: 100.0,
             keep_min: 2.0,
             keep_max: 1000.0,
@@ -1131,7 +1138,7 @@ mod tests {
             ..enabled_settings()
         };
         let mut relay = Relay::new(settings, 1);
-        relay.admit(job(0, 128));
+        relay.admit(job(0, full_budget));
         for _ in 0..100_000 {
             relay.plan.borrow_mut().cutoffs[0].observe(-100.0);
         }
@@ -1144,7 +1151,7 @@ mod tests {
         results.try_recv().unwrap();
         let before = relay.plan.borrow_mut().cutoffs[0].denominator();
         for id in 1..1000 {
-            relay.admit(job(id, 128));
+            relay.admit(job(id, full_budget));
             let probe = relay.ready.pop_front().unwrap();
             relay.complete(with_energy(probe, 0), &out);
             if let Some(full) = relay.ready.pop_front() {
@@ -1154,7 +1161,10 @@ mod tests {
                     panic!("expected reads")
                 };
                 assert_eq!(reads[0].energy_milli, -2000);
-                assert_eq!(result.device_access_time_us, 160);
+                assert_eq!(
+                    result.device_access_time_us,
+                    (probe_budget + full_budget) as u64
+                );
             } else {
                 results.try_recv().unwrap();
             }
@@ -1402,8 +1412,13 @@ mod tests {
 
     #[test]
     fn configured_stage_roots_and_effective_budgets_preserve_the_original_job() {
-        let mut relay = Relay::new(enabled_settings(), 1);
-        assert!((relay.plan.borrow_mut().cutoffs[0].denominator() - 10.0).abs() < 1e-10);
+        let settings = CascadeSettings {
+            stages: [32, 128, 256],
+            ..enabled_settings()
+        };
+        let mut relay = Relay::new(settings, 1);
+        let expected_min = settings.keep_min.powf(1.0 / settings.stages.len() as f64);
+        assert!((relay.plan.borrow_mut().cutoffs[0].denominator() - expected_min).abs() < 1e-10);
         let mut original = job(0, 128);
         original.params.beta_range = Some((0.5, 4.0));
         original.params.sweeps_per_beta = 2;
@@ -1426,9 +1441,11 @@ mod tests {
         assert_eq!(full.watermark, Some(1));
         assert_eq!(full.graph.edges, vec![(0, 1)]);
         relay.complete(answer(full), &out);
-        assert_eq!(results.try_recv().unwrap().device_access_time_us, 160);
+        assert_eq!(results.try_recv().unwrap().device_access_time_us, 32 + 128);
         assert_eq!(relay.plan.borrow_mut().cutoffs[1].moments().count(), 0);
+        assert_eq!(relay.plan.borrow_mut().cutoffs[2].moments().count(), 0);
         assert_eq!(relay.plan.borrow_mut().cutoffs[3].moments().count(), 1);
+        assert!(relay.plan.borrow().kept.iter().all(VecDeque::is_empty));
     }
 
     #[test]

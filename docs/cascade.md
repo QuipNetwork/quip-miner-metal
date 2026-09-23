@@ -24,8 +24,8 @@ the defaults are what they are.
 | key | default | valid range | notes |
 |-----|---------|-------------|-------|
 | `cascade` | `false` | `true` or `false` | disables and enables the screen |
-| `cascade_stages` | `[32, 128, 256]` | 1 to 3 values, each greater than the previous, first `>= 1` | sweeps per probe stage |
-| `cascade_keep` | `3000` | see the group rule | probe-to-full denominator |
+| `cascade_stages` | `[32, 256]` | 1 to 3 values, each greater than the previous, first `>= 1` | sweeps per probe stage |
+| `cascade_keep` | `2000` | see the group rule | probe-to-full denominator |
 | `cascade_keep_min` | `1000` | see the group rule | floor for the probe-to-full keep |
 | `cascade_keep_max` | `30000` | see the group rule | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | `>= 2` | audit lane denominator |
@@ -41,10 +41,9 @@ values.
 The three keep values are probe-to-full denominators for the whole job.
 The keep factor applies across the configured probe stages, so each of
 `S` stages keeps the `S`-th root of that factor. At the defaults this is
-`1 / 3000^(1/3)`, about 1 in 14.4 per stage. With the default three stages
-the screen keeps about 1 in 3000 nonces per job. `cascade_stages` may hold a
-shorter list or fewer than three probe stages, but the code accepts at most
-three.
+`1 / 2000^(1/2)`, about 1 in 44.7 per stage. With the default two stages the
+screen keeps about 1 in 2000 nonces per job. `cascade_stages` accepts one to
+three probe stages.
 
 `cascade_target_milli` and `cascade_yield_per_million` work together. The
 yield check is active only when the coordinator sets both. It counts how many
