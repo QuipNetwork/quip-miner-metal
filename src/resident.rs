@@ -128,6 +128,20 @@ fn validate(job: &StreamJob) -> Result<(), SampleError> {
     Ok(())
 }
 
+fn reject_tail(
+    pending: Option<StreamJob>,
+    jobs: &mut Receiver<StreamJob>,
+    out: &Sender<StreamResult>,
+    error: &SampleError,
+) {
+    if let Some(job) = pending {
+        send_reject(out, job, error.to_sample_error());
+    }
+    while let Ok(job) = jobs.try_recv() {
+        send_reject(out, job, error.to_sample_error());
+    }
+}
+
 /// Run on the sampler's blocking thread; no Metal object leaves this thread.
 pub(crate) fn run(
     device: &MetalDevice,
@@ -194,9 +208,7 @@ pub(crate) fn run(
             if pending.is_none() {
                 let full = pools.as_ref().is_some_and(|ps| {
                     let pool = &ps[turn];
-                    let nominal = batch_size_for_reads(Kernel::Msa, pool.reads);
-                    pool.slots.live()
-                        >= scale_budget(nominal, gov.budget_scale()).min(pool.slots.capacity())
+                    pool.slots.live() >= scale_budget(pool.slots.capacity(), gov.budget_scale())
                 });
                 if full || eof {
                     break;
@@ -228,12 +240,9 @@ pub(crate) fn run(
                     pending = Some(job);
                     break;
                 }
-                let capacity = scale_budget(
-                    batch_size_for_reads(
-                        Kernel::Msa,
-                        job.params.num_reads.clamp(1, sampler::MAX_READS),
-                    ),
-                    gov.budget_scale(),
+                let capacity = batch_size_for_reads(
+                    Kernel::Msa,
+                    job.params.num_reads.clamp(1, sampler::MAX_READS),
                 );
                 // Both pools are empty, so changing storage cannot discard work.
                 let rebuilt = Pool::new(device, &job, capacity)
@@ -320,9 +329,7 @@ pub(crate) fn run(
     }
     if let Some(error) = &fault {
         tracing::error!(%error, "resident stream failed");
-        if let Some(job) = pending {
-            send_reject(out, job, error.to_sample_error());
-        }
+        reject_tail(pending, &mut jobs, out, error);
     }
     *store.lock().unwrap_or_else(|p| p.into_inner()) = Some(controller);
 }
@@ -350,6 +357,122 @@ mod tests {
             },
             watermark: None,
         }
+    }
+
+    #[test]
+    fn fault_rejects_pending_and_queued_jobs_without_waiting_for_eof() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let (out, mut results) = tokio::sync::mpsc::channel(3);
+        tx.try_send(job(1, 8)).unwrap();
+        tx.try_send(job(2, 8)).unwrap();
+        let error = SampleError::Driver("injected fault".into());
+        reject_tail(Some(job(0, 8)), &mut rx, &out, &error);
+        for id in 0usize..3 {
+            let result = results.try_recv().expect("one rejection per submitted job");
+            assert_eq!(result.job_id, id.to_le_bytes());
+            match result.outcome {
+                StreamOutcome::Completed(Err(actual)) => {
+                    assert_eq!(actual, error.to_sample_error())
+                }
+                StreamOutcome::Completed(Ok(_)) | StreamOutcome::Cancelled => {
+                    panic!("expected device fault")
+                }
+            }
+        }
+        assert!(matches!(results.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        // The sender stays open throughout fault cleanup.
+        drop(tx);
+    }
+
+    #[test]
+    fn admission_grows_when_governor_scale_rises() {
+        use std::cell::{Cell, RefCell};
+
+        if MetalDevice::device_count() == 0 {
+            #[expect(clippy::print_stderr, reason = "device tests report a sandbox skip")]
+            {
+                eprintln!("skipping governor growth test: no Metal device");
+            }
+            return;
+        }
+        let nominal = batch_size_for_reads(Kernel::Msa, 4);
+        if nominal < 2 {
+            tracing::warn!("skipping governor growth test: batch capacity is one");
+            return;
+        }
+        struct Governor {
+            raised: Cell<bool>,
+            completed: RefCell<Vec<usize>>,
+            out: Sender<StreamResult>,
+        }
+        impl GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                if self.raised.get() {
+                    1.0
+                } else {
+                    0.25
+                }
+            }
+            fn record_gpu_busy_us(&self, us: u64) {
+                // Results stay buffered, so each delta counts a harvested batch.
+                self.completed
+                    .borrow_mut()
+                    .push(self.out.max_capacity() - self.out.capacity());
+                if us > 0 {
+                    self.raised.set(true);
+                }
+            }
+        }
+        let count = nominal * 6;
+        let (tx, rx) = tokio::sync::mpsc::channel(count);
+        let (out, mut results) = tokio::sync::mpsc::channel(count);
+        for id in 0..count {
+            tx.try_send(job(id, 8)).unwrap();
+        }
+        drop(tx);
+        let gov = Governor {
+            raised: Cell::new(false),
+            completed: RefCell::new(vec![0]),
+            out: out.clone(),
+        };
+        run(
+            &MetalDevice::open(0).unwrap(),
+            &Mutex::new(CascadeSettings {
+                enabled: true,
+                ..CascadeSettings::default()
+            }),
+            &Mutex::new(None),
+            rx,
+            &out,
+            &gov,
+            &CancelToken::default(),
+        );
+        let mut completed = gov.completed.into_inner();
+        completed.push(count - out.capacity());
+        let batches: Vec<_> = completed
+            .windows(2)
+            .map(|p| p[1] - p[0])
+            .filter(|&n| n > 0)
+            .collect();
+        assert_eq!(batches.first(), Some(&scale_budget(nominal, 0.25)));
+        assert_eq!(
+            batches.iter().max(),
+            Some(&nominal),
+            "admission stayed at initial scale: {batches:?}"
+        );
+        for id in 0..count {
+            let result = results.try_recv().unwrap();
+            match result.outcome {
+                StreamOutcome::Completed(Ok(reads)) => assert_eq!(reads.len(), 4, "job {id}"),
+                StreamOutcome::Completed(Err(error)) => panic!("{error}"),
+                StreamOutcome::Cancelled => panic!("unexpected cancellation"),
+            }
+        }
+        assert!(matches!(results.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
