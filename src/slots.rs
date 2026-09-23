@@ -1,10 +1,461 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-#[cfg_attr(
+#![cfg_attr(
     not(test),
-    expect(dead_code, reason = "slot pool dispatch is added in the next task")
+    expect(dead_code, reason = "resident cascade caller is added in a later task")
 )]
+
+use crate::metal_device::MetalDevice;
+use crate::sampler::{self, BufferPool, CachedTopology, Kernel, SampleError, MSA_THREADS};
+use crate::topology::fill_h_j;
+use crate::{IsingGraph, SampleParams, SamplerResult};
+use metal::{MTLCommandBufferStatus, MTLSize};
+use std::sync::Arc;
+
+pub(crate) struct SlotJob {
+    pub(crate) graph: IsingGraph,
+    pub(crate) schedule: Vec<f32>,
+    pub(crate) checkpoints: Vec<usize>,
+    pub(crate) seed: u64,
+}
+
+impl SlotJob {
+    fn validate(&self, sched_stride: usize) -> Result<(), SampleError> {
+        if self.schedule.len() > sched_stride {
+            return Err(SampleError::TooLarge("schedule exceeds slot stride".into()));
+        }
+        if self.graph.j.len() != self.graph.edges.len()
+            || !sampler::device_energy_exact(&self.graph)
+        {
+            return Err(SampleError::TooLarge(
+                "slot jobs require exact device-energy coefficients".into(),
+            ));
+        }
+        if self.schedule.is_empty()
+            || self.schedule.iter().any(|b| !b.is_finite() || *b < 0.0)
+            || self.checkpoints.first().is_none_or(|&p| p == 0)
+            || self.checkpoints.last() != Some(&self.schedule.len())
+            || self.checkpoints.windows(2).any(|p| p[0] >= p[1])
+        {
+            return Err(SampleError::Driver(
+                "invalid slot schedule or checkpoints".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) type SlotId = usize;
+
+pub(crate) struct Checkpoint {
+    pub(crate) slot: SlotId,
+    pub(crate) index: usize,
+    pub(crate) last: bool,
+    pub(crate) best: i64,
+}
+
+struct ResidentJob {
+    job: SlotJob,
+    position: usize,
+    next_checkpoint: usize,
+    has_output: bool,
+    device_us: u64,
+}
+
+pub(crate) struct SlotPool {
+    cached: Arc<CachedTopology>,
+    pool: Arc<BufferPool>,
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    // Buffer indices match the slot kernel ABI. Storage is rented only in new.
+    buffers: Vec<(u64, metal::Buffer)>,
+    slots: Vec<Option<ResidentJob>>,
+    steps: Vec<SlotStep>,
+    command: Option<metal::CommandBuffer>,
+    faulted: bool,
+    num_reads: usize,
+    words: usize,
+    threads: usize,
+    sched_stride: usize,
+}
+
+impl SlotPool {
+    pub(crate) fn new(
+        device: &MetalDevice,
+        graph: &IsingGraph,
+        num_reads: usize,
+        capacity: usize,
+        sched_stride: usize,
+    ) -> Result<Self, SampleError> {
+        let params = SampleParams {
+            num_reads,
+            num_sweeps: sched_stride,
+            ..Default::default()
+        };
+        sampler::validate_batch(&[graph], &params, Kernel::Msa)?;
+        if graph.num_nodes() == 0 || num_reads == 0 || capacity == 0 || sched_stride == 0 {
+            return Err(SampleError::TooLarge(
+                "slot pool dimensions must be nonzero".into(),
+            ));
+        }
+        let state_bytes = (graph.num_nodes() * 4).div_ceil(16) * 16;
+        let need = state_bytes + sampler::MSA_STATIC_TG_BYTES;
+        if need > device.device.max_threadgroup_memory_length() as usize {
+            return Err(SampleError::TooLarge(format!(
+                "slot pool needs {need} B of threadgroup memory"
+            )));
+        }
+        let cached = device.topology_cache.get_or_build(device, graph, true);
+        let words = num_reads.div_ceil(sampler::MSA_LANES);
+        let threads = MSA_THREADS
+            .min(device.msa_slots.max_total_threads_per_threadgroup() as usize)
+            .max(1);
+        // Bound every dimension and offset used by the kernel's 32-bit ABI.
+        let region = |factors: &[usize]| -> Result<u64, SampleError> {
+            let bytes = factors
+                .iter()
+                .try_fold(capacity, |n, &v| n.checked_mul(v))
+                .filter(|&n| n <= i32::MAX as usize)
+                .ok_or_else(|| {
+                    SampleError::TooLarge("slot buffer exceeds 32-bit indexing".into())
+                })?;
+            Ok(bytes.max(4) as u64)
+        };
+        let sizes = [
+            (2, region(&[cached.topo.nnz])?),
+            (9, region(&[sched_stride, 4])?),
+            (10, region(&[num_reads, cached.n.div_ceil(8)])?),
+            (11, region(&[num_reads, 4])?),
+            (15, region(&[cached.n])?),
+            (23, region(&[words, cached.n, 4])?),
+            (24, region(&[words, threads, 4, 4])?),
+            (25, region(&[std::mem::size_of::<SlotStep>()])?),
+        ];
+        let buffers = sizes
+            .into_iter()
+            .map(|(index, bytes)| (index, device.buffer_pool.take(&device.device, bytes)))
+            .collect();
+        Ok(Self {
+            cached,
+            pool: Arc::clone(&device.buffer_pool),
+            queue: device.queue.clone(),
+            pipeline: device.msa_slots.clone(),
+            buffers,
+            slots: (0..capacity).map(|_| None).collect(),
+            steps: Vec::with_capacity(capacity),
+            command: None,
+            faulted: false,
+            num_reads,
+            words,
+            threads,
+            sched_stride,
+        })
+    }
+
+    pub(crate) fn matches(&self, graph: &IsingGraph, num_reads: usize) -> bool {
+        self.cached.n == graph.num_nodes()
+            && self.cached.edges == graph.edges
+            && self.num_reads == num_reads
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+    pub(crate) fn live(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// A submitted command stays in flight until `take_checkpoints` retires it.
+    pub(crate) fn in_flight(&self) -> bool {
+        self.command.is_some()
+    }
+
+    fn idle(&self) -> Result<(), SampleError> {
+        if self.in_flight() || self.faulted {
+            return Err(SampleError::Driver(
+                "slot pool is in flight or faulted".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn buffer(&self, index: u64) -> Result<&metal::BufferRef, SampleError> {
+        self.buffers
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, b)| b.as_ref())
+            .ok_or_else(|| SampleError::Driver(format!("missing slot buffer {index}")))
+    }
+
+    fn write<T: Copy>(&self, index: u64, offset: usize, values: &[T]) -> Result<(), SampleError> {
+        let buf = self.buffer(index)?;
+        let bytes = std::mem::size_of_val(values);
+        let offset = offset
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| SampleError::Driver("slot write offset overflow".into()))?;
+        if buf.contents().is_null()
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > buf.length() as usize)
+        {
+            return Err(SampleError::Driver(
+                "slot buffer write exceeds storage".into(),
+            ));
+        }
+        // SAFETY: the caller holds the idle pool exclusively. The checked range
+        // lies in shared storage and values is a separate host allocation.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                buf.contents().cast::<u8>().add(offset),
+                bytes,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit(&mut self, job: SlotJob) -> Result<SlotId, SampleError> {
+        self.idle()?;
+        job.validate(self.sched_stride)?;
+        if !self.matches(&job.graph, self.num_reads) {
+            return Err(SampleError::Driver(
+                "job topology differs from slot pool".into(),
+            ));
+        }
+        let slot = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(|| SampleError::TooLarge("slot pool is full".into()))?;
+        let (couplings, fields) = fill_h_j(&self.cached.topo, &job.graph);
+        self.write(2, slot * self.cached.topo.nnz, &couplings)?;
+        self.write(15, slot * self.cached.n, &fields)?;
+        self.write(9, slot * self.sched_stride, &job.schedule)?;
+        self.slots[slot] = Some(ResidentJob {
+            job,
+            position: 0,
+            next_checkpoint: 0,
+            has_output: false,
+            device_us: 0,
+        });
+        Ok(slot)
+    }
+
+    pub(crate) fn release(&mut self, slot: SlotId) -> Result<(), SampleError> {
+        self.idle()?;
+        let entry = self
+            .slots
+            .get_mut(slot)
+            .filter(|s| s.is_some())
+            .ok_or_else(|| SampleError::Driver("slot is not live".into()))?;
+        *entry = None;
+        Ok(())
+    }
+
+    /// Advance every live job, stopping each at its next checkpoint. Release
+    /// jobs at their final checkpoint before submitting another step.
+    pub(crate) fn commit_step(&mut self, slice: usize) -> Result<bool, SampleError> {
+        self.idle()?;
+        if self.live() == 0 {
+            return Ok(false);
+        }
+        if slice == 0 {
+            return Err(SampleError::Driver("slot slice must be nonzero".into()));
+        }
+        self.steps.clear();
+        for (slot, resident) in self.slots.iter().enumerate() {
+            let Some(r) = resident else {
+                continue;
+            };
+            let Some(&checkpoint) = r.job.checkpoints.get(r.next_checkpoint) else {
+                return Err(SampleError::Driver(
+                    "release final-checkpoint slots before stepping".into(),
+                ));
+            };
+            let count = slice.min(checkpoint - r.position);
+            self.steps.push(SlotStep {
+                slot: slot as u32,
+                beta_start: r.position as i32,
+                beta_count: count as i32,
+                num_betas: r.job.schedule.len() as i32,
+                seed: slot_seed(r.job.seed),
+                flags: if r.position + count == checkpoint {
+                    SLOT_WRITE_OUTPUT
+                } else {
+                    0
+                },
+            });
+        }
+        self.write(25, 0, &self.steps)?;
+        let command = self.queue.new_command_buffer().to_owned();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(0, Some(&self.cached.row), 0);
+        encoder.set_buffer(1, Some(&self.cached.col), 0);
+        for (index, buffer) in &self.buffers {
+            encoder.set_buffer(*index, Some(buffer), 0);
+        }
+        for (i, buffer) in self.cached.colors.iter().enumerate() {
+            encoder.set_buffer(16 + i as u64, Some(buffer), 0);
+        }
+        for (index, value) in [
+            (3, 0),
+            (4, self.cached.topo.nnz as i32),
+            (5, self.cached.n as i32),
+            (6, self.sched_stride as i32),
+            (7, 1),
+            (8, 0),
+            (12, (self.steps.len() * self.words) as i32),
+            (13, self.capacity() as i32),
+            (14, self.num_reads as i32),
+            (19, self.words as i32),
+            (20, self.cached.topo.colors.num_colors),
+            (21, 0),
+            (22, 0),
+        ] {
+            encoder.set_bytes(index, 4, (&value as *const i32).cast());
+        }
+        encoder.set_threadgroup_memory_length(0, ((self.cached.n * 4).div_ceil(16) * 16) as u64);
+        encoder.dispatch_thread_groups(
+            MTLSize::new((self.steps.len() * self.words) as u64, 1, 1),
+            MTLSize::new(self.threads as u64, 1, 1),
+        );
+        encoder.end_encoding();
+        command.commit();
+        self.command = Some(command);
+        Ok(true)
+    }
+
+    pub(crate) fn wait(&self) {
+        if let Some(command) = &self.command {
+            command.wait_until_completed();
+        }
+    }
+
+    pub(crate) fn take_checkpoints(&mut self) -> Result<Vec<Checkpoint>, SampleError> {
+        let Some(command) = &self.command else {
+            self.idle()?;
+            return Ok(Vec::new());
+        };
+        let status = command.status();
+        if status == MTLCommandBufferStatus::Error {
+            self.faulted = true;
+            self.command = None;
+            return Err(SampleError::Driver("slot command buffer failed".into()));
+        }
+        if status != MTLCommandBufferStatus::Completed {
+            return Err(SampleError::Driver(
+                "slot command buffer has not completed".into(),
+            ));
+        }
+        let share = sampler::gpu_time_us(command) / self.steps.len() as u64;
+        self.command = None;
+        let mut checkpoints = Vec::new();
+        for step in &self.steps {
+            let slot = step.slot as usize;
+            let Some(r) = self.slots[slot].as_mut() else {
+                continue;
+            };
+            r.position += step.beta_count as usize;
+            r.device_us = r.device_us.saturating_add(share);
+            if step.flags & SLOT_WRITE_OUTPUT != 0 {
+                let index = r.next_checkpoint;
+                r.next_checkpoint += 1;
+                r.has_output = true;
+                let last = r.next_checkpoint == r.job.checkpoints.len();
+                let best = self
+                    .energies(slot)?
+                    .iter()
+                    .copied()
+                    .min()
+                    .map(i64::from)
+                    .ok_or_else(|| SampleError::Driver("slot has no energies".into()))?;
+                checkpoints.push(Checkpoint {
+                    slot,
+                    index,
+                    last,
+                    best,
+                });
+            }
+        }
+        Ok(checkpoints)
+    }
+
+    fn energies(&self, slot: SlotId) -> Result<&[i32], SampleError> {
+        let buffer = self.buffer(11)?;
+        // SAFETY: the buffer was sized for every slot's reads. This private
+        // helper is called only for live slots after a completed output step.
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                buffer.contents().cast::<i32>().add(slot * self.num_reads),
+                self.num_reads,
+            )
+        })
+    }
+
+    /// Read the latest checkpoint, which remains valid between output steps.
+    pub(crate) fn reads(
+        &self,
+        slot: SlotId,
+        num_reads: usize,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        self.idle()?;
+        let r = self
+            .slots
+            .get(slot)
+            .and_then(Option::as_ref)
+            .filter(|r| r.has_output)
+            .ok_or_else(|| SampleError::Driver("slot has no checkpoint output".into()))?;
+        if num_reads > self.num_reads {
+            return Err(SampleError::TooLarge(
+                "read count exceeds slot capacity".into(),
+            ));
+        }
+        let packed_size = self.cached.n.div_ceil(8);
+        let buffer = self.buffer(10)?;
+        // SAFETY: admission and dispatch cannot overlap reads. The completed
+        // checkpoint initialized this slot's output within the allocated range.
+        let packed = unsafe {
+            std::slice::from_raw_parts(
+                buffer
+                    .contents()
+                    .cast::<i8>()
+                    .add(slot * self.num_reads * packed_size),
+                num_reads * packed_size,
+            )
+        };
+        let energies = self.energies(slot)?;
+        let out: Vec<_> = (0..num_reads)
+            .map(|i| SamplerResult {
+                spins: sampler::unpack_spins(
+                    &packed[i * packed_size..(i + 1) * packed_size],
+                    self.cached.n,
+                ),
+                energy_milli: i64::from(energies[i]),
+            })
+            .collect();
+        sampler::audit_device_energies(std::slice::from_ref(&out), &[&r.job.graph])?;
+        Ok(out)
+    }
+
+    pub(crate) fn device_us(&self, slot: SlotId) -> u64 {
+        self.slots
+            .get(slot)
+            .and_then(Option::as_ref)
+            .map_or(0, |r| r.device_us)
+    }
+}
+
+impl Drop for SlotPool {
+    fn drop(&mut self) {
+        self.wait();
+        for (_, buffer) in self.buffers.drain(..) {
+            self.pool.give(buffer);
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SlotStep {
@@ -16,16 +467,8 @@ pub(crate) struct SlotStep {
     pub(crate) flags: u32,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "slot pool dispatch is added in the next task")
-)]
 pub(crate) const SLOT_WRITE_OUTPUT: u32 = 1;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "slot pool dispatch is added in the next task")
-)]
 pub(crate) fn slot_seed(seed: u64) -> u32 {
     ((seed ^ (seed >> 32)) as u32).max(1)
 }
@@ -41,6 +484,349 @@ mod tests {
 
     const READS: usize = 64;
     const WORDS: usize = 2;
+
+    fn job(seed: u64, sweeps: usize, checkpoints: Vec<usize>) -> SlotJob {
+        let graph = advantage2_system1(seed);
+        let schedule = build_beta_schedule(&graph, sweeps, 1, None).0;
+        SlotJob {
+            graph,
+            schedule,
+            checkpoints,
+            seed,
+        }
+    }
+
+    fn finish_step(pool: &mut SlotPool, slice: usize) -> Vec<Checkpoint> {
+        assert!(pool.commit_step(slice).unwrap());
+        pool.wait();
+        pool.take_checkpoints().unwrap()
+    }
+
+    #[test]
+    fn pool_matches_the_raw_dispatch() {
+        let Some(device) = device() else {
+            return;
+        };
+        let jobs: Vec<_> = [7, 19, 43]
+            .into_iter()
+            .map(|s| job(s, 64, vec![64]))
+            .collect();
+        let graphs: Vec<_> = jobs.iter().map(|j| j.graph.clone()).collect();
+        let schedules: Vec<_> = jobs.iter().map(|j| j.schedule.clone()).collect();
+        let steps: Vec<_> = [0, 32]
+            .into_iter()
+            .map(|start| {
+                jobs.iter()
+                    .enumerate()
+                    .map(|(i, j)| step(i as u32, j.seed, start, 32, 64))
+                    .collect()
+            })
+            .collect();
+        let reference = dispatch_slots(&device, &graphs, &schedules, &steps);
+        let mut pool = SlotPool::new(&device, &graphs[0], READS, 3, 64).unwrap();
+        assert_eq!(pool.capacity(), 3);
+        assert!(pool.matches(&graphs[1], READS));
+        assert!(!pool.matches(&graphs[1], READS + 1));
+        for j in jobs {
+            pool.admit(j).unwrap();
+        }
+        let mut expected_us = 0;
+        for index in 0..2 {
+            assert!(pool.commit_step(32).unwrap());
+            pool.wait();
+            expected_us += sampler::gpu_time_us(pool.command.as_ref().unwrap()) / 3;
+            assert_eq!(
+                pool.take_checkpoints().unwrap().len(),
+                if index == 0 { 0 } else { 3 }
+            );
+        }
+        // SAFETY: both completed steps wrote every live slot's output. The
+        // reference lengths are the exact allocated sample and energy counts.
+        unsafe {
+            let energies = std::slice::from_raw_parts(
+                pool.buffer(11).unwrap().contents().cast::<i32>(),
+                reference.0.len(),
+            );
+            let samples = std::slice::from_raw_parts(
+                pool.buffer(10).unwrap().contents().cast::<i8>(),
+                reference.1.len(),
+            );
+            assert_eq!(energies, reference.0);
+            assert_eq!(samples, reference.1);
+        }
+        for (slot, graph) in graphs.iter().enumerate() {
+            let packed_size = graph.h.len().div_ceil(8);
+            for (r, read) in pool.reads(slot, READS).unwrap().iter().enumerate() {
+                let idx = slot * READS + r;
+                assert_eq!(read.energy_milli, i64::from(reference.0[idx]));
+                assert_eq!(
+                    read.spins,
+                    unpack_spins(
+                        &reference.1[idx * packed_size..(idx + 1) * packed_size],
+                        graph.h.len()
+                    )
+                );
+            }
+            assert_eq!(pool.device_us(slot), expected_us);
+        }
+    }
+
+    #[test]
+    fn checkpoints_fire_at_each_boundary_and_last_marks_the_end() {
+        let Some(device) = device() else {
+            return;
+        };
+        let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 1, 160).unwrap();
+        pool.admit(job(7, 160, vec![32, 96, 160])).unwrap();
+        for i in 0..5 {
+            let checkpoints = finish_step(&mut pool, 32);
+            if i % 2 == 0 {
+                assert_eq!(checkpoints.len(), 1);
+                let cp = &checkpoints[0];
+                assert_eq!((cp.slot, cp.index, cp.last), (0, i / 2, i == 4));
+                assert_eq!(
+                    cp.best,
+                    pool.reads(0, READS)
+                        .unwrap()
+                        .iter()
+                        .map(|r| r.energy_milli)
+                        .min()
+                        .unwrap()
+                );
+            } else {
+                assert!(checkpoints.is_empty());
+            }
+            assert!(pool.take_checkpoints().unwrap().is_empty());
+        }
+        pool.release(0).unwrap();
+        assert_eq!(pool.live(), 0);
+        assert!(!pool.commit_step(32).unwrap());
+    }
+
+    #[test]
+    fn released_slot_starts_fresh() {
+        let Some(device) = device() else {
+            return;
+        };
+        let graph = advantage2_system1(7);
+        let mut pool = SlotPool::new(&device, &graph, READS, 1, 64).unwrap();
+        pool.admit(job(7, 64, vec![32, 64])).unwrap();
+        finish_step(&mut pool, 32);
+        pool.release(0).unwrap();
+        assert_eq!(pool.admit(job(19, 32, vec![32])).unwrap(), 0);
+        pool.reads(0, READS).unwrap_err();
+        finish_step(&mut pool, 32);
+        let mut fresh = SlotPool::new(&device, &graph, READS, 1, 64).unwrap();
+        fresh.admit(job(19, 32, vec![32])).unwrap();
+        finish_step(&mut fresh, 32);
+        for (a, b) in pool
+            .reads(0, READS)
+            .unwrap()
+            .iter()
+            .zip(fresh.reads(0, READS).unwrap())
+        {
+            assert_eq!(a.spins, b.spins);
+            assert_eq!(a.energy_milli, b.energy_milli);
+        }
+    }
+
+    #[test]
+    fn admit_and_release_refuse_while_in_flight() {
+        let Some(device) = device() else {
+            return;
+        };
+        let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 2, 32).unwrap();
+        pool.admit(job(7, 32, vec![32])).unwrap();
+        assert!(pool.commit_step(32).unwrap());
+        assert!(pool.in_flight());
+        pool.admit(job(19, 32, vec![32])).unwrap_err();
+        assert!(pool.release(0).is_err());
+        pool.reads(0, READS).unwrap_err();
+        pool.commit_step(32).unwrap_err();
+        assert_eq!(pool.live(), 1);
+        pool.wait();
+        assert_eq!(pool.take_checkpoints().unwrap().len(), 1);
+        assert!(!pool.in_flight());
+    }
+
+    #[test]
+    fn over_long_schedule_is_too_large() {
+        let Some(device) = device() else {
+            return;
+        };
+        let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 1, 64).unwrap();
+        assert!(matches!(
+            pool.admit(job(7, 65, vec![65])),
+            Err(crate::sampler::SampleError::TooLarge(_))
+        ));
+        assert_eq!(pool.live(), 0);
+    }
+
+    #[test]
+    fn reads_carry_device_energies_equal_to_host_scoring() {
+        let Some(device) = device() else {
+            return;
+        };
+        let graph = advantage2_system1(7);
+        let mut pool = SlotPool::new(&device, &graph, READS, 1, 32).unwrap();
+        pool.admit(job(7, 32, vec![32])).unwrap();
+        finish_step(&mut pool, 32);
+        for read in pool.reads(0, READS).unwrap() {
+            assert_eq!(
+                read.energy_milli,
+                energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_jobs_fail_validation_without_a_device() {
+        let mut j = job(7, 64, vec![32, 64]);
+        j.validate(64).unwrap();
+        assert!(matches!(j.validate(63), Err(SampleError::TooLarge(_))));
+        for checkpoints in [
+            vec![],
+            vec![0, 64],
+            vec![32, 32, 64],
+            vec![64, 32],
+            vec![32],
+        ] {
+            j.checkpoints = checkpoints;
+            j.validate(64).unwrap_err();
+        }
+        j.checkpoints = vec![64];
+        j.schedule[0] = f32::NAN;
+        j.validate(64).unwrap_err();
+        j.schedule[0] = -1.0;
+        j.validate(64).unwrap_err();
+        j.schedule[0] = 0.1;
+        j.graph.h[0] = 0.5;
+        j.validate(64).unwrap_err();
+    }
+
+    #[test]
+    fn pool_clamps_steps_and_preserves_checkpoint_reads() {
+        let Some(device) = device() else {
+            return;
+        };
+        let graph = advantage2_system1(7);
+        let mut pool = SlotPool::new(&device, &graph, 33, 1, 64).unwrap();
+        pool.admit(job(7, 64, vec![5, 64])).unwrap();
+        pool.admit(job(19, 32, vec![32])).unwrap_err();
+        pool.commit_step(0).unwrap_err();
+        pool.release(1).unwrap_err();
+        let cp = finish_step(&mut pool, 32);
+        assert_eq!((cp[0].index, cp[0].last), (0, false));
+        let before = pool.reads(0, 33).unwrap();
+        pool.reads(0, 34).unwrap_err();
+        assert_eq!(pool.reads(0, 1).unwrap().len(), 1);
+        assert!(finish_step(&mut pool, 32).is_empty());
+        for (a, b) in before.iter().zip(pool.reads(0, 33).unwrap()) {
+            assert_eq!(a.spins, b.spins);
+            assert_eq!(a.energy_milli, b.energy_milli);
+        }
+        let cp = finish_step(&mut pool, 32);
+        assert_eq!((cp[0].index, cp[0].last), (1, true));
+        for read in pool.reads(0, 33).unwrap() {
+            assert_eq!(
+                read.energy_milli,
+                energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
+        pool.commit_step(32).unwrap_err();
+    }
+
+    #[test]
+    #[ignore = "one-gate S4 throughput study; run only on the controller's GPU"]
+    #[expect(
+        clippy::print_stderr,
+        reason = "explicit throughput study reports both measured rates"
+    )]
+    fn pool_probe_rate_against_run_stream() {
+        use crate::sampler::{encode_batch, harvest_batch, EncodedBatch};
+        use std::time::Instant;
+
+        let Some(device) = device() else {
+            return;
+        };
+        const STEPS: usize = 400;
+        const SWEEPS: usize = 32;
+        // MSA's nominal read count is 64, so half the declared two-batch
+        // stream width is exactly batch_size_for_reads(Msa, READS).
+        assert_eq!(crate::METAL_MSA_ADAPT.min_reads as usize, READS);
+        let capacity = crate::streaming::declared_stream_width(Kernel::Msa) / 2;
+        let templates: Vec<_> = (0..capacity)
+            .map(|i| advantage2_system1(i as u64 + 1))
+            .collect();
+        let schedule = build_beta_schedule(&templates[0], SWEEPS, 1, None).0;
+        let mut pools = [
+            SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
+            SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
+        ];
+        let start = Instant::now();
+        for batch_index in 0..STEPS + 2 {
+            let pool = &mut pools[batch_index % 2];
+            if pool.in_flight() {
+                pool.wait();
+                let checkpoints = pool.take_checkpoints().unwrap();
+                assert_eq!(checkpoints.len(), capacity);
+                for checkpoint in checkpoints {
+                    assert!(checkpoint.last);
+                    std::hint::black_box(pool.reads(checkpoint.slot, READS).unwrap());
+                    pool.release(checkpoint.slot).unwrap();
+                }
+            }
+            if batch_index < STEPS {
+                for (i, graph) in templates.iter().enumerate() {
+                    pool.admit(SlotJob {
+                        graph: graph.clone(),
+                        schedule: schedule.clone(),
+                        checkpoints: vec![SWEEPS],
+                        seed: (batch_index * capacity + i + 1) as u64,
+                    })
+                    .unwrap();
+                }
+                assert!(pool.commit_step(SWEEPS).unwrap());
+            }
+        }
+        let pool_seconds = start.elapsed().as_secs_f64();
+        let mut batches: [Option<(EncodedBatch, Vec<IsingGraph>)>; 2] = [None, None];
+        let start = Instant::now();
+        for batch_index in 0..STEPS + 2 {
+            let pending = &mut batches[batch_index % 2];
+            if let Some((batch, graphs)) = pending.take() {
+                batch.wait_until_completed();
+                assert!(batch.failed_status().is_none());
+                let refs: Vec<_> = graphs.iter().collect();
+                std::hint::black_box(harvest_batch(&batch, &refs).unwrap());
+            }
+            if batch_index < STEPS {
+                let graphs = templates.clone();
+                let refs: Vec<_> = graphs.iter().collect();
+                let params = SampleParams {
+                    num_reads: READS,
+                    num_sweeps: SWEEPS,
+                    sweeps_per_beta: 1,
+                    seed: (batch_index * capacity + 1) as u64,
+                    ..Default::default()
+                };
+                let mut batch = encode_batch(&device, &refs, &params, Kernel::Msa, 2).unwrap();
+                assert_eq!(batch.chunk_count(), 1);
+                assert!(batch.commit_next(|| false));
+                *pending = Some((batch, graphs));
+            }
+        }
+        let stream_seconds = start.elapsed().as_secs_f64();
+        let jobs = (STEPS * capacity) as f64;
+        let pool_rate = jobs / pool_seconds;
+        let stream_rate = jobs / stream_seconds;
+        eprintln!("S4 one gate: {STEPS} steps, capacity={capacity}, reads={READS}, sweeps={SWEEPS}, two in flight, no later gates, no controller, no warmup");
+        eprintln!("pool={pool_rate:.2} jobs/s ({pool_seconds:.3}s), run_stream-equivalent={stream_rate:.2} jobs/s ({stream_seconds:.3}s), ratio={:.4}", pool_rate / stream_rate);
+        assert!(
+            pool_rate >= 0.95 * stream_rate,
+            "S4 missed: profile admit and reads before Task 3"
+        );
+    }
 
     fn device() -> Option<MetalDevice> {
         if MetalDevice::device_count() == 0 {

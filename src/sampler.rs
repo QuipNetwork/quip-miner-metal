@@ -160,7 +160,7 @@ pub(crate) const MSA_THREADS: usize = 1024;
 /// `msa_pipeline_compiles_and_admits_at_least_256_threads` checks the compiled figure
 /// against a bound using the literal 144 bytes (16 bytes of alignment headroom),
 /// rather than reading this constant.
-const MSA_STATIC_TG_BYTES: usize = MSA_LANES * 4;
+pub(crate) const MSA_STATIC_TG_BYTES: usize = MSA_LANES * 4;
 /// Threadgroup memory every Apple GPU family offers per threadgroup, bytes.
 /// There is no opt-in above it (CUDA's `MAX_DYNAMIC_SHARED_SIZE_BYTES` has no
 /// counterpart), which is why the kernel uses 32-bit words: one `u64` per
@@ -440,7 +440,7 @@ const DEVICE_ENERGY_MAX_UNITS: f64 = (i32::MAX / 1000) as f64;
 /// `graph`. The kernel truncates each coefficient to `i8` and sums in `int`,
 /// so it matches only when every coefficient is a whole number in `i8` range
 /// and the total magnitude cannot overflow. Consensus instances always pass.
-fn device_energy_exact(graph: &IsingGraph) -> bool {
+pub(crate) fn device_energy_exact(graph: &IsingGraph) -> bool {
     let whole = |v: f64| v.is_finite() && v.fract() == 0.0 && (-128.0..=127.0).contains(&v);
     let mut units = 0.0;
     for &v in graph.h.iter().chain(graph.j.iter()) {
@@ -815,7 +815,7 @@ impl Drop for EncodedBatch {
     unexpected_cfgs,
     reason = "objc 0.2 msg_send! expands to cfg(cargo-clippy) the compiler no longer recognizes"
 )]
-fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
+pub(crate) fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
     use objc::{msg_send, sel, sel_impl};
     // SAFETY: `GPUStartTime`/`GPUEndTime` are `CFTimeInterval` (f64) properties
     // on a completed `MTLCommandBuffer`; `cmd` implements `objc::Message`.
@@ -919,7 +919,7 @@ fn max_csr_degree(graph: &IsingGraph) -> usize {
 ///
 /// Split out of [`encode_batch`] so both rejections are reachable without a
 /// Metal device.
-fn validate_batch<'a>(
+pub(crate) fn validate_batch<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
     kernel: Kernel,
@@ -1478,7 +1478,7 @@ pub(crate) fn harvest_batch(
 /// Rescore one job in [`ENERGY_AUDIT_EVERY`] on the host. A mismatch means the
 /// kernel's reduction is wrong, which would turn into rejected proofs, so it
 /// is a device fault rather than a per-job error.
-fn audit_device_energies(
+pub(crate) fn audit_device_energies(
     out: &[Vec<SamplerResult>],
     graphs: &[&IsingGraph],
 ) -> Result<(), SampleError> {
