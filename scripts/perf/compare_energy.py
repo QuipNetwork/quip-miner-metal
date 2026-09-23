@@ -6,6 +6,7 @@
 Exit 0 when both the mean and the standard deviation of the candidate are
 within 0.05 baseline standard deviations of the baseline, else exit 1.
 """
+
 import csv
 import statistics
 import sys
@@ -26,9 +27,11 @@ def main():
     cm, cs = statistics.fmean(cand), statistics.stdev(cand)
     mean_shift = abs(cm - bm) / bs
     sd_shift = abs(cs - bs) / bs
-    print(f"{name}: baseline mean {bm:.1f} sd {bs:.1f} (n={len(base)}); "
-          f"candidate mean {cm:.1f} sd {cs:.1f} (n={len(cand)}); "
-          f"mean shift {mean_shift:.3f} sd, sd shift {sd_shift:.3f} sd")
+    print(
+        f"{name}: baseline mean {bm:.1f} sd {bs:.1f} (n={len(base)}); "
+        f"candidate mean {cm:.1f} sd {cs:.1f} (n={len(cand)}); "
+        f"mean shift {mean_shift:.3f} sd, sd shift {sd_shift:.3f} sd"
+    )
     return 0 if mean_shift <= TOLERANCE_SD and sd_shift <= TOLERANCE_SD else 1
 
 

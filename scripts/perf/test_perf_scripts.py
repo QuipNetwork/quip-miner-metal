@@ -18,8 +18,13 @@ LOG = """\
 
 
 def test_parse_reports_steady_rate():
-    out = subprocess.run([sys.executable, HERE / "parse.py"], input=LOG,
-                         capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(
+        [sys.executable, HERE / "parse.py"],
+        input=LOG,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
     got = json.loads(out)
     assert got["batches"] == 3
     assert got["batch_size"] == 40
@@ -38,7 +43,13 @@ def test_compare_energy_passes_and_fails(tmp_path):
     same.write_text(header + rows + "\n")
     shifted = "\n".join(f"{i},x,{-1010 - (i % 10)},0,0" for i in range(1000))
     moved.write_text(header + shifted + "\n")
-    ok = subprocess.run([sys.executable, HERE / "compare_energy.py", base, same, "best_64x32"])
-    bad = subprocess.run([sys.executable, HERE / "compare_energy.py", base, moved, "best_64x32"])
+    ok = subprocess.run(
+        [sys.executable, HERE / "compare_energy.py", base, same, "best_64x32"],
+        check=False,
+    )
+    bad = subprocess.run(
+        [sys.executable, HERE / "compare_energy.py", base, moved, "best_64x32"],
+        check=False,
+    )
     assert ok.returncode == 0
     assert bad.returncode == 1
