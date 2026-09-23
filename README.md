@@ -70,24 +70,30 @@ Only MSA can run on the ANE. See [engine selection](docs/combined-engines.md) fo
 
 ## Probe cascade (`quip-metal-msa`)
 
-The multi-spin miner probes each nonce with short sweeps before spending its
-full sweep budget, and screens out the nonces that rank below an adaptive
-cutoff. It applies to the MSA kernel only. The eight keys below enter through
-`backend_toml`.
+Metal MSA streams always use the resident runner. Jobs stay in GPU slots
+between probe checkpoints, and kept jobs continue to the full sweep budget.
+Four workers prepare jobs before admission. The sampler saves controller
+state between streams for the process lifetime.
+
+No configuration turns the cascade off. A leftover `cascade` key logs the
+unknown-field warning. Jobs whose coefficients are not whole units run once
+at full budget through the batch path after live slots drain.
+Other kernels and the Apple Neural Engine use separate paths.
 
 | key | default | purpose |
 |-----|---------|---------|
-| `cascade` | `false` | enable or disable the screen |
-| `cascade_stages` | `[32, 256]` | sweeps per probe stage |
+| `cascade_stages` | `[32, 256]` | cumulative sweep counts for probe checkpoints |
 | `cascade_keep` | `2000` | probe-to-full denominator |
 | `cascade_keep_min` | `1000` | floor for the probe-to-full keep |
 | `cascade_keep_max` | `30000` | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | audit lane denominator |
+| `cascade_reheat_beta` | `0.25` | starting beta for later segments |
 | `cascade_target_milli` | none | chain target energy |
 | `cascade_yield_per_million` | none | expected nonces per million below target |
 
-See [probe cascade](docs/cascade.md) for the full key reference, validation
-rules, model checks, and how to disable the screen.
+These keys enter through `backend_toml`.
+See [probe cascade](docs/cascade.md) for slots, schedules, controller lifetime,
+key validation, and model checks.
 
 ## Multi-spin kernel (`quip-metal-msa`)
 
