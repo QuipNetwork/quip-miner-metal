@@ -701,6 +701,22 @@ impl EncodedBatch {
         };
         let cmd = self.queue.new_command_buffer().to_owned();
         let encoder = cmd.new_compute_command_encoder();
+        self.encode_chunk(encoder, beta_start, beta_count);
+        encoder.end_encoding();
+        if cancelled() {
+            return false;
+        }
+        cmd.commit();
+        self.cmds.push(cmd);
+        true
+    }
+
+    fn encode_chunk(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        beta_start: i32,
+        beta_count: i32,
+    ) {
         encoder.set_compute_pipeline_state(&self.pipeline);
         bind_shared_args(encoder, &self.inputs, &self.out, &self.dims);
         match &self.kstate {
@@ -725,13 +741,6 @@ impl EncodedBatch {
             mtl_size_1d(self.groups),
             mtl_size_1d(self.threads_per_group),
         );
-        encoder.end_encoding();
-        if cancelled() {
-            return false;
-        }
-        cmd.commit();
-        self.cmds.push(cmd);
-        true
     }
 
     fn bind_colors(&self, encoder: &metal::ComputeCommandEncoderRef, slot19: i32) {
@@ -1632,6 +1641,377 @@ fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, Sample
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic xorshift64 for fixture generation.
+    fn xorshift64(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// Load compacted, zero-based fixture edges with seeded `J` in {-1, 1} and
+    /// `h` in {-1, 0, 1}.
+    fn advantage2_system1(seed: u64) -> IsingGraph {
+        let mut s = seed | 1;
+        let mut edges = Vec::with_capacity(41515);
+        let mut j = Vec::with_capacity(41515);
+        for line in include_str!("../tests/fixtures/advantage2-system1.edges").lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut nodes = line.split_whitespace();
+            let u = nodes.next().expect("edge start").parse().expect("node id");
+            let v = nodes.next().expect("edge end").parse().expect("node id");
+            assert!(nodes.next().is_none(), "two node ids per edge");
+            assert!(u < 4577 && v < 4577, "fixture node range");
+            edges.push((u, v));
+            j.push(if xorshift64(&mut s) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            });
+        }
+        assert_eq!(edges.len(), 41515);
+        let h = (0..4577)
+            .map(|_| [-1.0, 0.0, 1.0][(xorshift64(&mut s) % 3) as usize])
+            .collect();
+        IsingGraph::new(h, j, edges)
+    }
+
+    #[test]
+    #[ignore = "GPU experiment: about a minute of device time"]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the experiment reports its rates on stderr"
+    )]
+    fn concurrent_encoder_overlaps_a_full_budget_slice_with_probe_batches() {
+        use crate::metal_device::MetalDevice;
+        use metal::MTLDispatchType;
+        use std::time::Instant;
+
+        if MetalDevice::device_count() == 0 {
+            eprintln!("skipping: no Metal device");
+            return;
+        }
+        let device = MetalDevice::open(0).unwrap();
+        let graph = advantage2_system1(7);
+        let probes = [&graph; 20];
+        let full_graphs = [&graph];
+        let full_params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 14_336,
+            sweeps_per_beta: 1,
+            beta_range: None,
+            seed: 10_000,
+        };
+        let make_probe = |seed| {
+            let params = SampleParams {
+                num_sweeps: 32,
+                seed,
+                ..full_params.clone()
+            };
+            let batch = encode_batch(&device, &probes, &params, Kernel::Msa, 2).unwrap();
+            assert_eq!(batch.plan, [(0, 32)]);
+            batch
+        };
+        let retire_probe = |batch: EncodedBatch| {
+            batch.wait_until_completed();
+            assert!(batch.failed_status().is_none());
+            assert_eq!(harvest_batch(&batch, &probes).unwrap().len(), 20);
+        };
+        let make_full = |seed, slice: i32| {
+            let plan: Vec<_> = (0..14_336)
+                .step_by(slice as usize)
+                .map(|start| (start, slice.min(14_336 - start)))
+                .collect();
+            let params = SampleParams {
+                seed,
+                ..full_params.clone()
+            };
+            encode_batch_inner(&device, &full_graphs, &params, Kernel::Msa, 2, Some(&plan)).unwrap()
+        };
+
+        let mut pending = std::collections::VecDeque::new();
+        let start = Instant::now();
+        for seed in 0..400 {
+            if pending.len() == 2 {
+                retire_probe(pending.pop_front().unwrap());
+            }
+            let mut probe = make_probe(seed);
+            assert!(probe.commit_next(|| false));
+            pending.push_back(probe);
+        }
+        for probe in pending {
+            retire_probe(probe);
+        }
+        eprintln!(
+            "probes alone: {:.1} probe jobs/s",
+            8_000.0 / start.elapsed().as_secs_f64()
+        );
+
+        let start = Instant::now();
+        let mut alone = make_full(full_params.seed, 64);
+        while alone.commit_next(|| false) {
+            alone.wait_until_completed();
+        }
+        assert!(alone.failed_status().is_none());
+        harvest_batch(&alone, &full_graphs).unwrap();
+        eprintln!(
+            "full job alone, S=64: {:.1} wall ms",
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        drop(alone);
+
+        for (dispatch, slice) in [
+            (MTLDispatchType::Serial, 64),
+            (MTLDispatchType::Concurrent, 32),
+            (MTLDispatchType::Concurrent, 64),
+            (MTLDispatchType::Concurrent, 128),
+            (MTLDispatchType::Concurrent, 256),
+        ] {
+            let start = Instant::now();
+            // Alternate two full jobs between the in-flight slots. Retire a slot
+            // before reusing it, so a job never has two slices in flight together.
+            let mut full = [
+                make_full(full_params.seed, slice),
+                make_full(full_params.seed + 1, slice),
+            ];
+            let mut pending: [Option<EncodedBatch>; 2] = [None, None];
+            let mut next_seed = full_params.seed + 2;
+            let mut finished = 0;
+            let mut sweeps = 0;
+            for i in 0..400 {
+                let slot = i % 2;
+                if let Some(probe) = pending[slot].take() {
+                    retire_probe(probe);
+                }
+                let job = &mut full[slot];
+                assert!(job.failed_status().is_none());
+                if job.cmds.len() == job.plan.len() {
+                    harvest_batch(job, &full_graphs).unwrap();
+                    finished += 1;
+                    *job = make_full(next_seed, slice);
+                    next_seed += 1;
+                }
+                let mut probe = make_probe(i as u64);
+                let cmd = device.queue.new_command_buffer().to_owned();
+                let encoder = cmd.compute_command_encoder_with_dispatch_type(dispatch);
+                probe.encode_chunk(encoder, 0, 32);
+                let (beta_start, beta_count) = job.plan[job.cmds.len()];
+                // The probe and full slice share no writable buffers, so they need
+                // no barrier between dispatches inside a concurrent encoder.
+                job.encode_chunk(encoder, beta_start, beta_count);
+                encoder.end_encoding();
+                probe.cmds.push(cmd.clone());
+                job.cmds.push(cmd.clone());
+                cmd.commit();
+                pending[slot] = Some(probe);
+                sweeps += beta_count;
+            }
+            for probe in pending.into_iter().flatten() {
+                retire_probe(probe);
+            }
+            for job in &full {
+                assert!(job.failed_status().is_none());
+                if job.cmds.len() == job.plan.len() {
+                    harvest_batch(job, &full_graphs).unwrap();
+                    finished += 1;
+                }
+            }
+            let seconds = start.elapsed().as_secs_f64();
+            // Count executed slices, including partial jobs, in sweeps/s (not reads).
+            eprintln!("{dispatch:?} encoder, S={slice}: {:.1} probe jobs/s, {finished} full jobs finished, {:.1} full-job sweeps/s",
+                8_000.0 / seconds, f64::from(sweeps) / seconds);
+
+            if dispatch == MTLDispatchType::Concurrent && slice == 64 {
+                // 200 slices per slot cover only 12,800 betas. Complete the first
+                // job outside the timed arm to check all 14,336 betas against the
+                // default plan, keeping its remaining dispatches concurrent too.
+                let job = &mut full[0];
+                while job.cmds.len() < job.plan.len() {
+                    let (beta_start, beta_count) = job.plan[job.cmds.len()];
+                    let cmd = device.queue.new_command_buffer().to_owned();
+                    let encoder = cmd.compute_command_encoder_with_dispatch_type(dispatch);
+                    job.encode_chunk(encoder, beta_start, beta_count);
+                    encoder.end_encoding();
+                    job.cmds.push(cmd.clone());
+                    cmd.commit();
+                    job.wait_until_completed();
+                    assert!(job.failed_status().is_none());
+                }
+                let mut reference =
+                    encode_batch(&device, &full_graphs, &full_params, Kernel::Msa, 2).unwrap();
+                while reference.commit_next(|| false) {
+                    reference.wait_until_completed();
+                }
+                assert!(reference.failed_status().is_none());
+                let got = harvest_batch(job, &full_graphs).unwrap();
+                let want = harvest_batch(&reference, &full_graphs).unwrap();
+                assert_eq!(
+                    got[0].iter().map(|r| r.energy_milli).min(),
+                    want[0].iter().map(|r| r.energy_milli).min()
+                );
+                let count = job.num_reads * job.packed_size;
+                assert_eq!(
+                    read_i8_buffer(&job.d_samples, count).unwrap(),
+                    read_i8_buffer(&reference.d_samples, count).unwrap()
+                );
+            }
+        }
+
+        // Finish partial jobs only after stopping the clock. Report these
+        // completions separately: neither their sweeps nor time enter the rates.
+        let finish_partial = |jobs: &mut [EncodedBatch]| {
+            let mut finished = 0;
+            for job in jobs {
+                if job.cmds.len() == job.plan.len() {
+                    continue;
+                }
+                while job.commit_next(|| false) {
+                    job.wait_until_completed();
+                    assert!(job.failed_status().is_none());
+                }
+                assert_eq!(job.cmds.len(), job.plan.len());
+                harvest_batch(job, &full_graphs).unwrap();
+                finished += 1;
+            }
+            finished
+        };
+
+        // Arm 5: each slot owns k distinct jobs, with one slice per job in
+        // its serial encoder. Retiring the probe also retires all k slices.
+        for k in [1, 2, 4, 8] {
+            let start = Instant::now();
+            let mut full: Vec<_> = (0..2 * k)
+                .map(|i| make_full(full_params.seed + i as u64, 64))
+                .collect();
+            let mut next_seed = full_params.seed + (2 * k) as u64;
+            let mut pending: [Option<EncodedBatch>; 2] = [None, None];
+            let mut finished = 0;
+            let mut sweeps = 0;
+            for i in 0..400 {
+                let slot = i % 2;
+                if let Some(probe) = pending[slot].take() {
+                    retire_probe(probe);
+                }
+                let mut probe = make_probe(i as u64);
+                let cmd = device.queue.new_command_buffer().to_owned();
+                let encoder =
+                    cmd.compute_command_encoder_with_dispatch_type(MTLDispatchType::Serial);
+                probe.encode_chunk(encoder, 0, 32);
+                for job in &mut full[slot * k..(slot + 1) * k] {
+                    assert!(job.failed_status().is_none());
+                    if job.cmds.len() == job.plan.len() {
+                        harvest_batch(job, &full_graphs).unwrap();
+                        finished += 1;
+                        *job = make_full(next_seed, 64);
+                        next_seed += 1;
+                    }
+                    let (beta_start, beta_count) = job.plan[job.cmds.len()];
+                    job.encode_chunk(encoder, beta_start, beta_count);
+                    job.cmds.push(cmd.clone());
+                    sweeps += beta_count;
+                }
+                encoder.end_encoding();
+                probe.cmds.push(cmd.clone());
+                cmd.commit();
+                pending[slot] = Some(probe);
+            }
+            for probe in pending.into_iter().flatten() {
+                retire_probe(probe);
+            }
+            for job in &full {
+                assert!(job.failed_status().is_none());
+                if job.cmds.len() == job.plan.len() {
+                    harvest_batch(job, &full_graphs).unwrap();
+                    finished += 1;
+                }
+            }
+            let seconds = start.elapsed().as_secs_f64();
+            let extra = finish_partial(&mut full);
+            eprintln!("arm 5, serial encoder, S=64, k={k}: {:.1} probe jobs/s, {finished} full jobs finished in interval (+{extra} after timing), {:.1} full-job sweeps/s",
+                8_000.0 / seconds, f64::from(sweeps) / seconds);
+        }
+
+        // Arm 6: probes keep arm 1's two-buffer loop on the device queue.
+        // A separate host loop services every full job on the second queue,
+        // without blocking on one job while another is ready to resume.
+        for slice in [64, 256] {
+            for k in [2, 4] {
+                let queue = device.device.new_command_queue();
+                let make_queued_full = |seed| {
+                    let mut job = make_full(seed, slice);
+                    job.queue = queue.clone();
+                    job
+                };
+                let start = Instant::now();
+                let mut full: Vec<_> = (0..k)
+                    .map(|i| make_queued_full(full_params.seed + i as u64))
+                    .collect();
+                let mut next_seed = full_params.seed + k as u64;
+                let mut finished = 0;
+                let mut sweeps = 0;
+                std::thread::scope(|scope| {
+                    let probes = scope.spawn(|| {
+                        let mut pending = std::collections::VecDeque::new();
+                        for seed in 0..400 {
+                            if pending.len() == 2 {
+                                retire_probe(pending.pop_front().unwrap());
+                            }
+                            let mut probe = make_probe(seed);
+                            assert!(probe.commit_next(|| false));
+                            pending.push_back(probe);
+                        }
+                        for probe in pending {
+                            retire_probe(probe);
+                        }
+                    });
+                    while !probes.is_finished() {
+                        for job in &mut full {
+                            if probes.is_finished() {
+                                break;
+                            }
+                            if let Some(cmd) = job.cmds.last() {
+                                assert_ne!(cmd.status(), metal::MTLCommandBufferStatus::Error);
+                                if cmd.status() != metal::MTLCommandBufferStatus::Completed {
+                                    continue;
+                                }
+                            }
+                            assert!(job.failed_status().is_none());
+                            if job.cmds.len() == job.plan.len() {
+                                harvest_batch(job, &full_graphs).unwrap();
+                                finished += 1;
+                                *job = make_queued_full(next_seed);
+                                next_seed += 1;
+                            }
+                            let (_, beta_count) = job.plan[job.cmds.len()];
+                            assert!(job.commit_next(|| false));
+                            sweeps += beta_count;
+                        }
+                        std::thread::yield_now();
+                    }
+                    probes.join().unwrap();
+                });
+                // Include retirement of at most k outstanding slices in the
+                // timed interval, so every counted sweep has actually executed.
+                // No new slices start after the host observes probe completion.
+                for job in &full {
+                    job.wait_until_completed();
+                    assert!(job.failed_status().is_none());
+                    if job.cmds.len() == job.plan.len() {
+                        harvest_batch(job, &full_graphs).unwrap();
+                        finished += 1;
+                    }
+                }
+                let seconds = start.elapsed().as_secs_f64();
+                let extra = finish_partial(&mut full);
+                eprintln!("arm 6, second queue, S={slice}, k={k}: {:.1} probe jobs/s, {finished} full jobs finished in interval (+{extra} after timing), {:.1} full-job sweeps/s",
+                    8_000.0 / seconds, f64::from(sweeps) / seconds);
+            }
+        }
+    }
 
     #[test]
     fn four_color_is_on_unless_disabled() {
