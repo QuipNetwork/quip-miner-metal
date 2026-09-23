@@ -5,6 +5,9 @@ per second against a gate of 4,615. This follows the [first
 report](2026-09-23-resident-g5.md), which records 1,058 nonces per second at
 `e1adb01`.
 
+After the final review fixes, commit `4d5b7bd` reaches 3,752.23 nonces per
+second. G5 still misses.
+
 ## Result
 
 | gate | measured | pass | result |
@@ -157,6 +160,29 @@ show that the coordinator limits the rate as it checks results. Neither the
 miner nor model generation limits this run. Generated streams alone do not
 raise this rate while the coordinator rescores all 64 reads of every result.
 
+## Recheck after the final review fixes
+
+Commit `4d5b7bd` fixes the final review findings. One fix caps each resident
+step with the batch command-duration bound. These runs check that the cap does
+not slow the runner. Each run repeats the corresponding earlier command with run seed 20260923
+and eight producer threads.
+
+| run | `66ff170`, nonces per second | `4d5b7bd`, nonces per second | CPU ms per job at `4d5b7bd` | load average, start to end |
+|---|---:|---:|---:|---|
+| `one-gate-32` | 4,070 | 5,488.96 | 0.831 | 9.86 to 10.85 |
+| `one-gate-14336` | 3,291 | 4,311.85 | 1.074 | 10.85 to 10.61 |
+| `system`, 600 s | 2,795.56 | 3,752.23 | 1.146 | 7.94 to 12.36 across both streams |
+| `system`, second stream, 60 s | 2,848.6 | 3,654.74 | 1.156 | same measurement across both streams |
+
+G5 misses at 3,752.23 against 4,615. Every 10-second window of the first
+stream lies between 3,569.7 and 3,940.0 nonces per second. The first stream
+returns 2,253,094 results with zero errors. Three nonces reach the target:
+21557, 84198, and 1419019. The second stream returns 221,798 results with
+zero errors. Nonce 2392753 reaches −14,642,000 milli.
+
+Every rate is higher than at `66ff170`, but these runs do not show why,
+because no profile ran at `4d5b7bd`. The load averages are similar.
+
 ## Data
 
 `docs/perf/data/2026-09-23-resident-g5-rerun/`:
@@ -175,3 +201,5 @@ raise this rate while the coordinator rescores all 64 reads of every result.
   10-second call trees from the production processes.
 - `production/progress.log`: sampled production progress lines.
 - `production/measure.sh`: the commands that collect the production measurements.
+- `4d5b7bd/`: the recheck logs, `uptime` files, and kept jobs of the
+  whole-system run at `4d5b7bd`.
