@@ -442,7 +442,15 @@ fn query_iokit_gpu_utilization() -> u32 {
 /// back to a conservative default when this returns `None`, so a miss costs
 /// concurrency tuning, never correctness. Never panics — same "return nothing
 /// on any error" contract as [`query_iokit_gpu_utilization`].
+///
+/// The core count is fixed hardware, and the registry query costs tens of
+/// microseconds, so the first answer is kept for the life of the process.
 pub fn gpu_core_count() -> Option<usize> {
+    static CORES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CORES.get_or_init(query_gpu_core_count)
+}
+
+fn query_gpu_core_count() -> Option<usize> {
     let mut cores: Option<usize> = None;
     for_each_accelerator_properties(|props| {
         // SAFETY: `props` is a live, borrowed property dictionary for the whole
