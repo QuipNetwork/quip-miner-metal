@@ -10,10 +10,11 @@ platform, so this crate does not build anywhere else and offers no stub or CPU
 fallback. A non-macOS build fails while compiling the Apple-only dependencies.
 Build and run on Apple Silicon.
 
-Energies are scored on the host with the canonical
-`quip_solver_core::quip_protocol::scoring::energy_milli` so results match
-consensus. No GPU energy kernel exists. Metal Shading Language has no
-`double`.
+Energies match consensus `quip_solver_core::quip_protocol::scoring::energy_milli`.
+The multi-spin kernel computes each read's energy on the device in integer
+milli units when every coefficient is a whole number in `i8` range, and the
+host rescores 1 job in 1,000 to check it. Other kernels, and graphs with
+other coefficients, are scored on the host.
 
 ## Binaries
 
@@ -25,7 +26,7 @@ consensus. No GPU energy kernel exists. Metal Shading Language has no
 
 Prebuilt `arm64` binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-metal/-/releases)
-(built best-effort on a macOS CI runner. See [`.gitlab-ci.yml`](.gitlab-ci.yml)).
+(built best-effort on a macOS CI runner; see [`.gitlab-ci.yml`](.gitlab-ci.yml)).
 
 ## Build
 
@@ -45,7 +46,7 @@ from crates.io at a pinned version, published from
 quip-metal-sa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
-**Driver / fixed-input (run in isolation).** Use the coordinator's
+**Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
 `drive` harness pointed at the binary — `--source random` for golden-drawn
 problems, `--source list <jsonl>` for a fixed replay:
 
