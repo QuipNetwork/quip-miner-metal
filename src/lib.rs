@@ -335,6 +335,7 @@ impl quip_solver_core::Sampler for MetalSampler {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if settings.enabled && self.kernel == Kernel::Msa {
+            tracing::info!(keep = settings.keep, "cascade relay started");
             cascade::run(
                 settings,
                 jobs,
