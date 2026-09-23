@@ -72,7 +72,7 @@ impl AuditLane {
 
     pub(crate) fn denominator(&self, base: u32) -> u32 {
         if self.raised {
-            50
+            base.min(50)
         } else {
             base
         }
@@ -164,6 +164,15 @@ impl Yield {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raised_auditing_never_reduces_frequency() {
+        let mut lane = AuditLane::new(0.05);
+        lane.raise();
+        for base in [10, 50, 200] {
+            assert_eq!(lane.denominator(base), base.min(50));
+        }
+    }
 
     #[test]
     fn yield_raised_audits_require_200_new_observations_before_restore() {

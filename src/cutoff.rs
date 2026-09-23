@@ -264,6 +264,7 @@ impl Cutoff {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reset(&mut self) {
         *self = Self::new(self.cfg);
     }
@@ -336,13 +337,15 @@ impl Cutoff {
     }
 
     /// Halve the denominator, down to the loosest clamp.
-    pub(crate) fn loosen_step(&mut self) {
+    pub(crate) fn loosen_step(&mut self) -> f64 {
+        let before = self.loosen;
         self.loosen = (self.loosen * 0.5).max(self.cfg.keep_min / self.cfg.keep_max);
+        self.loosen / before
     }
 
-    /// Undo one [`Self::loosen_step`].
-    pub(crate) fn restore_step(&mut self) {
-        self.loosen = (self.loosen * 2.0).min(1.0);
+    /// Undo only the effective factor returned by [`Self::loosen_step`].
+    pub(crate) fn restore_step(&mut self, factor: f64) {
+        self.loosen = (self.loosen / factor).min(1.0);
     }
 
     /// Give the Gaussian anchor more weight for longer.
@@ -509,15 +512,32 @@ mod tests {
     }
 
     #[test]
+    fn restoring_the_applied_factor_preserves_drift_exactly() {
+        let mut c = Cutoff::new(CutoffConfig {
+            keep: 3000.0f64.cbrt(),
+            keep_min: 1000.0f64.cbrt(),
+            keep_max: 30000.0f64.cbrt(),
+            ..CutoffConfig::default()
+        });
+        assert_eq!(c.loosen_step(), 0.5);
+        let drift_factor = c.loosen;
+        let audit_factor = c.loosen_step();
+        assert!(audit_factor > 0.5 && audit_factor < 1.0);
+        assert_eq!(c.loosen_step(), 1.0);
+        c.restore_step(audit_factor);
+        assert_eq!(c.loosen, drift_factor);
+    }
+
+    #[test]
     fn loosen_step_halves_the_denominator_and_restore_undoes_it() {
         let mut c = Cutoff::new(CutoffConfig::default());
         normal_stream(2, 0.0, 1.0)
             .take(2_000_000)
             .for_each(|x| c.observe(x));
         let d = c.denominator();
-        c.loosen_step();
+        let factor = c.loosen_step();
         assert!((c.denominator() - d / 2.0).abs() < 1.0);
-        c.restore_step();
+        c.restore_step(factor);
         assert!((c.denominator() - d).abs() < 1.0);
     }
 

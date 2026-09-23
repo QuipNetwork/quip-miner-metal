@@ -330,14 +330,10 @@ impl quip_solver_core::Sampler for MetalSampler {
         // behavior, so the dependency is made explicit in the signature. The
         // governor is passed whole (not just a throttle closure) because sizing
         // is a loop: the stream reports its GPU time back through it.
-        let settings = *self
-            .cascade
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if settings.enabled && self.kernel == Kernel::Msa {
-            tracing::info!(keep = settings.keep, "cascade relay started");
+        if self.kernel == Kernel::Msa {
+            tracing::info!("cascade relay started");
             cascade::run(
-                settings,
+                &self.cascade,
                 jobs,
                 &out,
                 &cancel,

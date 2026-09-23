@@ -96,7 +96,7 @@ annealing in `quip-miner-cuda`'s `quip-cuda-msa` and `quip-miner-cpu`'s
 `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer, *Optimised simulated
 annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015). 32
 replicas share one 32-bit word per spin. The Metropolis test is an integer
-comparison against a per-rung geometric threshold table. The kernel drives
+comparison against an inline geometric threshold draw. The kernel drives
 spins one colour class at a time, using the Advantage2 four-colouring by
 default and falling back to the greedy colouring the Gibbs kernel uses when
 the graph is not Advantage2. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`,
@@ -110,8 +110,10 @@ per spin exceeds for Advantage2's 4577 spins, so this port uses 32-bit
 words. See `docs/metal-msa-design.md` for the
 full comparison.
 
-The host rescores every sample with `energy_milli`, as for the other
-kernels, because the device does not compute energies. Couplings must be in
+The MSA kernel computes on-device energies for whole coefficients. The host
+rescores 1 job in 1,000 with `energy_milli` to check those energies. Other
+kernels and graphs with fractional coefficients use host rescoring.
+Couplings must be in
 `{-1, 1}` and fields in `{-1, 0, 1}`, which v0.3 problems meet. The CSR
 degree must be at most 20. The miner rejects denser graphs as over capacity
 so the coordinator routes them elsewhere.

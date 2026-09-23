@@ -153,10 +153,14 @@ fn draw_seeds(run_seed: u64, count: usize) -> Vec<[u8; 32]> {
     (0..count).map(|_| next_drawn_seed(&mut state)).collect()
 }
 
-/// Sample seed for one stage of one nonce. The shift keeps a probe and a
-/// full job on the same nonce off the same RNG stream.
+/// Keep the stage-0 seed and mix later stages into the device-visible bits.
 fn job_seed(stage_index: usize, nonce: usize) -> u64 {
-    ((stage_index as u64) << 32) + nonce as u64
+    let seed = nonce as u64;
+    if stage_index == 0 {
+        seed
+    } else {
+        seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(stage_index as u64 + 1)
+    }
 }
 
 fn parse_seed(hex: &str) -> [u8; 32] {
@@ -897,7 +901,7 @@ fn cascade_nonce_supply_matches_the_stage_draw() {
         assert_eq!(parsed_seed, hex(seed));
     }
     assert!(supply.next_nonce().is_none());
-    assert_eq!(job_seed(1, 5), (1u64 << 32) + 5);
+    assert_eq!(job_seed(1, 5), 5 ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(2));
 
     let listed = draw_seeds(3, 2);
     let supply = NonceSupply::listed(listed.clone(), 60);
@@ -914,4 +918,16 @@ fn cascade_nonce_supply_matches_the_stage_draw() {
     assert!(!names_energy_audit_mismatch(
         "device fault: metal command buffer did not complete: status Error"
     ));
+}
+
+#[test]
+fn stage_seeds_have_distinct_device_bits() {
+    for nonce in [0, 1, 7, 42, usize::MAX] {
+        let seeds: Vec<_> = (0..4).map(|stage| job_seed(stage, nonce) as u32).collect();
+        for i in 0..4 {
+            for j in i + 1..4 {
+                assert_ne!(seeds[i], seeds[j], "nonce {nonce}, stages {i}/{j}");
+            }
+        }
+    }
 }
