@@ -211,7 +211,7 @@ kernel void msa_anneal(
     device const int* csr_row_ptr [[buffer(0)]],
     device const int* csr_col_ind [[buffer(1)]],
     device const int8_t* csr_J_vals [[buffer(2)]],
-    device const int* row_ptr_offsets [[buffer(3)]],
+    device const int* row_ptr_offsets [[buffer(3)]], // unused by msa: the CSR structure is shared
     device const int* col_ind_offsets [[buffer(4)]],
 
     constant int& N [[buffer(5)]],
@@ -270,10 +270,11 @@ kernel void msa_anneal(
         atomic_store_explicit(&lane_total[tid], 0, memory_order_relaxed);
     }
 
-    int row_ptr_start = row_ptr_offsets[problem_id];
+    // CSR structure is shared by every problem in a batch (same topology);
+    // only the couplings and fields are per problem.
     int col_ind_start = col_ind_offsets[problem_id];
-    device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
-    device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
+    device const int* my_csr_row_ptr = csr_row_ptr;
+    device const int* my_csr_col_ind = csr_col_ind;
     device const int8_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
     device const int8_t* my_h_vals = &csr_h_vals[problem_id * uint(N)];
 

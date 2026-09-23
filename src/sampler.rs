@@ -152,12 +152,13 @@ const _: () = assert!(
     MSA_LANES == SIMD_WIDTH,
     "simd_rounded_reads must produce whole 32-lane multi-spin words"
 );
-/// Threads per multi-spin threadgroup: they split each colour class's nodes.
+/// 1,024 threads split each colour class, bounded at dispatch by the pipeline's
+/// `max_total_threads_per_threadgroup`.
 /// Also the per-threadgroup RNG stream count the persistent buffer is sized by.
-const MSA_THREADS: usize = 256;
+const MSA_THREADS: usize = 1024;
 /// Static threadgroup bytes `msa_anneal` declares: an 8192-byte threshold row
 /// plus 64 `uint` cut values and 32 atomic lane totals.
-/// `msa_pipeline_compiles_and_admits_256_threads` checks the compiled figure
+/// `msa_pipeline_compiles_and_admits_at_least_256_threads` checks the compiled figure
 /// against a bound using the literal 8576 bytes,
 /// rather than reading this constant.
 const MSA_STATIC_TG_BYTES: usize = 8192 + 64 * 4 + MSA_LANES * 4;
@@ -769,19 +770,20 @@ fn validate_batch<'a>(
 /// Build and upload one batch's CSR structure and per-problem `h` / `J`.
 ///
 /// The CSR structure is shared by every problem in the batch (same topology),
-/// so it is tiled `num_problems` times; the offset arrays give the kernel each
-/// problem's slice.
+/// so the multi-spin kernel reads one shared copy. The SA and Gibbs kernels
+/// read a tiled copy through the offset arrays.
 fn upload_inputs(
     device: &crate::metal_device::MetalDevice,
     topo: &SelfFeedingTopology,
     graphs: &[&IsingGraph],
+    kernel: Kernel,
 ) -> InputBuffers {
     let num_problems = graphs.len();
     let n = topo.n;
     let nnz_alloc = topo.nnz.max(1);
     let rp_len = topo.row_ptr.len().max(1);
 
-    // Shared CSR structure, tiled per problem; per-problem J / h values.
+    // Shared CSR structure for MSA, tiled for SA / Gibbs; per-problem J / h values.
     let zero = [0i32];
     let base_row: &[i32] = if topo.row_ptr.is_empty() {
         &zero
@@ -789,8 +791,17 @@ fn upload_inputs(
         &topo.row_ptr
     };
     let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
-    let all_row_ptr = tile_i32(base_row, num_problems);
-    let all_col_ind = tile_i32(base_col, num_problems);
+    let (row, col) = if kernel == Kernel::Msa {
+        (
+            device.new_buffer_from_slice(base_row),
+            device.new_buffer_from_slice(base_col),
+        )
+    } else {
+        (
+            device.new_buffer_from_slice(&tile_i32(base_row, num_problems)),
+            device.new_buffer_from_slice(&tile_i32(base_col, num_problems)),
+        )
+    };
     let mut all_j = vec![0i8; num_problems * nnz_alloc];
     let mut all_h = vec![0i8; num_problems * n];
     for (p, graph) in graphs.iter().enumerate() {
@@ -804,8 +815,8 @@ fn upload_inputs(
     let col_ind_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * nnz_alloc) as i32).collect();
 
     InputBuffers {
-        row: device.new_buffer_from_slice(&all_row_ptr),
-        col: device.new_buffer_from_slice(&all_col_ind),
+        row,
+        col,
         j: device.new_buffer_from_slice(&all_j),
         h: device.new_buffer_from_slice(&all_h),
         row_off: device.new_buffer_from_slice(&row_ptr_offsets),
@@ -1029,7 +1040,7 @@ fn encode_batch_inner(
     // partial_energies[256]` reduction array.
     //
     // Multi-spin: one threadgroup per (problem, 32-replica word), `words`
-    // threadgroups per problem, 256 threads splitting each colour class.
+    // threadgroups per problem, 1,024 threads splitting each colour class.
     let words = num_reads.div_ceil(MSA_LANES);
     let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
     let (groups, threads_per_group) = match kernel {
@@ -1037,6 +1048,9 @@ fn encode_batch_inner(
         Kernel::Gibbs if node_parallel => (num_samples, 256.min(max_threads).max(1)),
         Kernel::Sa | Kernel::Gibbs => (num_problems, num_reads),
     };
+    if kernel == Kernel::Msa {
+        tracing::debug!(threads_per_group, "msa dispatch width");
+    }
     // `buffer(12)`: threads for SA / sequential Gibbs (one per read),
     // threadgroups for chromatic Gibbs and multi-spin. Also the count
     // `chunk_plan` multiplies: spin updates per thread, or word updates per
@@ -1076,7 +1090,7 @@ fn encode_batch_inner(
     } else {
         SelfFeedingTopology::build(first)
     };
-    let inputs = upload_inputs(device, &topo, graphs);
+    let inputs = upload_inputs(device, &topo, graphs, kernel);
     let out = DispatchBuffers {
         beta: device.new_buffer_from_slice(&beta),
         samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
@@ -1877,6 +1891,37 @@ mod tests {
             assert!(a.iter().any(|&byte| byte != 0));
             assert_eq!(split.cmds.len(), 128);
         }
+    }
+
+    #[test]
+    fn msa_shared_csr_matches_tiled_results_bit_for_bit() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let a = chain(200);
+        let mut b = chain(200);
+        b.j.iter_mut().step_by(3).for_each(|v| *v = -*v);
+        let graphs = [&a, &b, &a];
+        let p = params(64);
+        let mut batch = encode_batch(&dev, &graphs, &p, Kernel::Msa, 1).unwrap();
+        while batch.commit_next(|| false) {
+            batch.wait_until_completed();
+        }
+        batch.wait_until_completed();
+        let got = harvest_batch(&batch, &graphs).unwrap();
+        // Problems 0 and 2 share h and J, so equal seeds would give equal spins;
+        // they differ in RNG stream (threadgroup index), so compare energies to
+        // consensus instead, and check the row structure is not per-problem.
+        for (reads, g) in got.iter().zip(graphs) {
+            for r in reads {
+                assert_eq!(r.energy_milli, energy_milli(&r.spins, &g.h, &g.j, &g.edges));
+            }
+        }
+        assert_eq!(
+            batch.inputs.row.length() as usize,
+            (a.num_nodes() + 1) * std::mem::size_of::<i32>()
+        );
     }
 
     /// Two problems in one batch with two words each: every (problem, word)

@@ -247,14 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn msa_pipeline_compiles_and_admits_256_threads() {
+    fn msa_pipeline_compiles_and_admits_at_least_256_threads() {
         if MetalDevice::device_count() == 0 {
             return;
         }
         let dev = MetalDevice::open(0).unwrap();
-        // The host dispatches 256 threads per multi-spin threadgroup; a
-        // pipeline that admits fewer would silently shrink every colour class
-        // stride and break the persistent-RNG layout.
+        // The host requests 1,024 threads per multi-spin threadgroup and clamps
+        // to the pipeline maximum. Require support for at least 256 threads.
         assert!(dev.msa.max_total_threads_per_threadgroup() >= 256);
         // Static threadgroup arrays (row + cut + lane totals) must leave room for the
         // largest advertised N at 4 bytes per spin under the 32 KB cap.
