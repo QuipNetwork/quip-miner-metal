@@ -2003,6 +2003,11 @@ mod tests {
         let first = dev.topology_cache.get_or_build(&dev, &a, false);
         let again = dev.topology_cache.get_or_build(&dev, &a2, false);
         assert!(std::sync::Arc::ptr_eq(&first, &again));
+        // Same node count, one edge moved: the cache must rebuild.
+        let mut moved = chain(50);
+        moved.edges[0] = (0, 2);
+        let rewired = dev.topology_cache.get_or_build(&dev, &moved, false);
+        assert!(!std::sync::Arc::ptr_eq(&first, &rewired));
         let other = dev.topology_cache.get_or_build(&dev, &b, false);
         assert!(!std::sync::Arc::ptr_eq(&first, &other));
         assert_eq!(other.n, b.num_nodes());
