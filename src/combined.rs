@@ -1054,9 +1054,8 @@ mod tests {
     #[test]
     fn cascade_config_is_stored_before_metal_opens() {
         let sampler = CombinedSampler::new(Kernel::Msa, 0, 73, true);
-        sampler.apply_config("cascade = true\ncascade_keep = 5000");
+        sampler.apply_config("cascade_keep = 5000");
         let cfg = *sampler.cascade.lock().unwrap();
-        assert!(cfg.enabled);
         assert_eq!(cfg.keep, 5000.0);
         assert!(sampler.metal.get().is_none());
     }

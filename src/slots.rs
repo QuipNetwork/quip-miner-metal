@@ -1450,7 +1450,6 @@ mod tests {
             SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
         ];
         let settings = CascadeSettings {
-            enabled: true,
             stages: [SWEEPS, 0, 0],
             ..Default::default()
         };
@@ -1523,7 +1522,7 @@ mod tests {
                         feed(&mut preparation);
                         prepared
                     });
-                    let mut data = prepared.data.unwrap();
+                    let mut data = prepared.data.unwrap().unwrap();
                     timed(&mut pool_host[0], || {
                         let ticket = controller
                             .admit_prepared(&prepared.job, &mut data.schedule)

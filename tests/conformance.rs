@@ -18,7 +18,7 @@ const SOLVABLE_JOBS: [&[u8]; 4] = [b"job-1", b"job-2", b"job-hash", b"job-sparse
 /// Per-axis assertions ahead of the driver's composite `is_conformant()`: a
 /// bare composite failure says "not conformant" without saying which rule
 /// broke. `expected_meta_sweeps` states this test's own expectation —
-/// [`CONFIGURED_SWEEPS`] for SA, doubled for Gibbs — and is cross-checked
+/// [`CONFIGURED_SWEEPS`] for SA and MSA, doubled for Gibbs — and is cross-checked
 /// against the driver's derivation so a miner advertising the wrong
 /// algorithm cannot make both sides agree by accident.
 fn assert_conformant(bin: &str, report: &DriverReport, expected_meta_sweeps: u32) {
@@ -220,7 +220,9 @@ async fn quip_metal_msa_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    // `msa` is not `gibbs`, so the resolved budget is not doubled.
+    // MSA always screens, but StreamResult has no completed-sweeps field.
+    // The session builds SamplerMeta from the requested budget even when the
+    // resident runner returns probe reads. Keep the exact metadata contract.
     assert_conformant("quip-metal-msa", &report, CONFIGURED_SWEEPS);
 }
 

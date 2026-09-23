@@ -8,11 +8,10 @@ stage and then to the full budget. The screen keeps the most promising nonces, s
 the GPU spends its time on full-budget work most likely to beat the chain
 target.
 
-The cascade applies to the multi-spin (`msa`) kernel only. The switch in
-`src/lib.rs` gates it with `self.kernel == Kernel::Msa`, so the simulated
-annealing and Gibbs binaries do not run it. The ANE sampler has a separate
-path that never receives a probe, so the ANE handles only full-budget
-jobs.
+The `quip-metal-msa` miner always screens Metal jobs through the cascade.
+No configuration can turn the screen off. The coordinator sends no cascade key.
+The simulated annealing and Gibbs binaries do not run the cascade.
+The Apple Neural Engine sampler runs full-budget jobs on a separate path.
 
 The keys documented here enter through the `backend_toml` that the
 coordinator sends. Invalid keys keep the previous value and log a warning.
@@ -23,7 +22,6 @@ the defaults are what they are.
 
 | key | default | valid range | notes |
 |-----|---------|-------------|-------|
-| `cascade` | `false` | `true` or `false` | disables and enables the screen |
 | `cascade_stages` | `[32, 256]` | 1 to 3 values, each greater than the previous, first `>= 1` | sweeps per probe stage |
 | `cascade_keep` | `2000` | see the group rule | probe-to-full denominator |
 | `cascade_keep_min` | `1000` | see the group rule | floor for the probe-to-full keep |
@@ -88,10 +86,3 @@ The relay also logs a `cascade load window` info line once per minute with
 the per-stage dispatch counts, the adaptive denominator, and the current
 GPU busy estimate. A falling-behind stage and idle full-budget time feed a
 controller that tightens and loosens each stage cutoff.
-
-## Disabling
-
-Set `cascade = false` in `backend_toml` to turn the screen off. Every job
-then runs its full budget directly and bypasses the relay, so no probe runs
-and the model checks stay silent. The keys are still parsed and stored,
-so a later `cascade = true` re-enables the screen with the current values.

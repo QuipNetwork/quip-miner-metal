@@ -334,12 +334,7 @@ impl quip_solver_core::Sampler for MetalSampler {
         cancel: quip_solver_core::CancelToken,
     ) {
         // Both runners report device time to the same governor that sizes work.
-        let cascade_on = self
-            .cascade
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .enabled;
-        if self.kernel == Kernel::Msa && cascade_on {
+        if self.kernel == Kernel::Msa {
             resident::run(
                 &self.device,
                 &self.cascade,

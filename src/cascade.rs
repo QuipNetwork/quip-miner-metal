@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-//! Host-only cascade decisions and schedules for the resident slot runner.
+//! Host-only decisions and schedules for the always-on MSA cascade.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -72,7 +72,6 @@ fn calibrated_rate_from(from: usize) -> Option<f64> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CascadeSettings {
-    pub(crate) enabled: bool,
     pub(crate) stages: [usize; MAX_STAGES],
     /// Overall probe-to-full denominator, factored across configured probes.
     pub(crate) keep: f64,
@@ -89,7 +88,6 @@ impl Default for CascadeSettings {
         let mut stages = [0; MAX_STAGES];
         stages[..CALIBRATION.stages.len()].copy_from_slice(CALIBRATION.stages);
         Self {
-            enabled: false,
             stages,
             keep: 2_000.0,
             keep_min: 1_000.0,
@@ -104,7 +102,6 @@ impl Default for CascadeSettings {
 
 #[derive(serde::Deserialize, Default, Clone)]
 pub(crate) struct CascadeToml {
-    pub(crate) cascade: Option<bool>,
     pub(crate) cascade_stages: Option<Vec<usize>>,
     pub(crate) cascade_keep: Option<u32>,
     pub(crate) cascade_keep_min: Option<u32>,
@@ -119,9 +116,6 @@ impl CascadeSettings {
     /// Merge valid keys, retaining previous values for invalid keys. The three
     /// overall keep denominators are validated and accepted as one group.
     pub(crate) fn merge(&mut self, cfg: &CascadeToml) {
-        if let Some(value) = cfg.cascade {
-            self.enabled = value;
-        }
         if let Some(stages) = &cfg.cascade_stages {
             if (1..=MAX_STAGES).contains(&stages.len())
                 && stages[0] >= 1
@@ -397,9 +391,8 @@ impl Controller {
         schedule: &mut PreparedSchedule,
     ) -> Result<Ticket, crate::sampler::SampleError> {
         // Only settings changes rebuild on the runner. Queued jobs must use
-        // the current gate plan, including when the cascade is disabled.
-        if schedule.settings.enabled != self.settings.enabled
-            || schedule.settings.stages != self.settings.stages
+        // the current gate plan.
+        if schedule.settings.stages != self.settings.stages
             || schedule.settings.reheat_beta.to_bits() != self.settings.reheat_beta.to_bits()
         {
             let rebuilt = PreparedSchedule::new(job, self.settings);
@@ -542,13 +535,12 @@ pub(crate) struct PreparedSchedule {
 
 impl PreparedSchedule {
     pub(crate) fn new(job: &StreamJob, settings: CascadeSettings) -> Self {
-        let stages = if settings.enabled {
-            &settings.stages[..]
-        } else {
-            &[]
-        };
-        let (betas, checkpoints) =
-            segment_schedule(&job.graph, &job.params, stages, settings.reheat_beta);
+        let (betas, checkpoints) = segment_schedule(
+            &job.graph,
+            &job.params,
+            &settings.stages,
+            settings.reheat_beta,
+        );
         Self {
             settings,
             betas,
@@ -702,7 +694,6 @@ mod tests {
     #[test]
     fn settings_change_rejects_invalid_rebuilt_schedule() {
         let old = CascadeSettings {
-            enabled: true,
             stages: [2, 0, 0],
             reheat_beta: -1.5,
             ..Default::default()
@@ -783,7 +774,6 @@ mod tests {
             watermark: None,
         };
         let old = CascadeSettings {
-            enabled: true,
             stages: [32, 256, 0],
             ..Default::default()
         };
@@ -794,10 +784,6 @@ mod tests {
             },
             CascadeSettings {
                 reheat_beta: 0.5,
-                ..old
-            },
-            CascadeSettings {
-                enabled: false,
                 ..old
             },
         ] {
@@ -840,12 +826,6 @@ mod tests {
             graph: ring(),
             params: params(sweeps, 1),
             watermark: Some(1),
-        }
-    }
-    fn enabled_settings() -> CascadeSettings {
-        CascadeSettings {
-            enabled: true,
-            ..CascadeSettings::default()
         }
     }
 
@@ -906,7 +886,7 @@ mod tests {
             keep: 100.0,
             keep_min: 100.0,
             keep_max: 100.0,
-            ..enabled_settings()
+            ..CascadeSettings::default()
         };
         let mut controller = Controller::new(settings);
         let template = job(0, 1000);
@@ -947,7 +927,7 @@ mod tests {
 
     #[test]
     fn audited_job_records_one_observation_at_the_next_checkpoint() {
-        let mut c = Controller::new(enabled_settings());
+        let mut c = Controller::new(CascadeSettings::default());
         let (mut t, _, _) = c.admit(&job(0, 14_336));
         {
             let mut p = c.plan.lock().unwrap();
@@ -972,7 +952,7 @@ mod tests {
 
     #[test]
     fn topology_change_resets_the_distribution() {
-        let mut c = Controller::new(enabled_settings());
+        let mut c = Controller::new(CascadeSettings::default());
         let (mut old, _, _) = c.admit(&job(0, 1000));
         c.checkpoint(&mut old, 0);
         assert!(c.matches_topology(&ring()));
@@ -991,18 +971,18 @@ mod tests {
 
     #[test]
     fn settings_change_to_stages_rebuilds_but_audit_change_does_not() {
-        let mut c = Controller::new(enabled_settings());
+        let mut c = Controller::new(CascadeSettings::default());
         let (mut t, _, _) = c.admit(&job(0, 1000));
         c.checkpoint(&mut t, 0);
         c.refresh(CascadeSettings {
             audit: 50,
-            ..enabled_settings()
+            ..CascadeSettings::default()
         });
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 1);
         assert_eq!(c.plan.lock().unwrap().settings.audit, 50);
         c.refresh(CascadeSettings {
             stages: [16, 128, 0],
-            ..enabled_settings()
+            ..CascadeSettings::default()
         });
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
     }
@@ -1036,24 +1016,68 @@ mod tests {
     }
 
     #[test]
+    fn removed_cascade_key_warns_and_keeps_screening() {
+        #[derive(Clone)]
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let backend_toml = "cascade = false\nnum_sweeps = 1024";
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(
+                crate::resolve_governor_config(backend_toml, 73, true),
+                (73, true)
+            );
+        });
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("unknown field 'cascade' for metal (ignored)")
+                .count(),
+            1
+        );
+        assert!(!log.contains("unknown field 'num_sweeps'"));
+        let cfg: crate::MetalConfig = toml::from_str(backend_toml).unwrap();
+        assert_eq!(cfg.unknown["cascade"].as_bool(), Some(false));
+        let mut settings = CascadeSettings::default();
+        settings.merge(&cfg.cascade);
+        let mut controller = Controller::new(settings);
+        let (mut ticket, _, checkpoints) = controller.admit(&job(0, 1024));
+        assert_eq!(checkpoints, vec![32, 256, 1024]);
+        assert!(!controller.checkpoint(&mut ticket, 0));
+    }
+
+    #[test]
     fn backend_toml_routes_cascade_keys_and_leaves_unknown_keys_unknown() {
-        let cfg: crate::MetalConfig =
-            toml::from_str("cascade = true\ncascade_keep = 5000\nbogus = 1").unwrap();
-        assert_eq!(cfg.cascade.cascade, Some(true));
+        let cfg: crate::MetalConfig = toml::from_str("cascade_keep = 5000\nbogus = 1").unwrap();
         assert_eq!(cfg.cascade.cascade_keep, Some(5000));
         assert_eq!(cfg.unknown.keys().collect::<Vec<_>>(), vec!["bogus"]);
     }
 
     #[test]
     fn merge_accepts_all_keys_and_partial_updates() {
-        let cfg: crate::MetalConfig = toml::from_str("cascade = true\ncascade_stages = [16, 64]\ncascade_keep = 20\ncascade_keep_min = 2\ncascade_keep_max = 100\ncascade_audit = 2\ncascade_target_milli = -500\ncascade_yield_per_million = 1.5\ncascade_reheat_beta = 0.3").unwrap();
+        let cfg: crate::MetalConfig = toml::from_str("cascade_stages = [16, 64]\ncascade_keep = 20\ncascade_keep_min = 2\ncascade_keep_max = 100\ncascade_audit = 2\ncascade_target_milli = -500\ncascade_yield_per_million = 1.5\ncascade_reheat_beta = 0.3").unwrap();
         assert!(cfg.unknown.is_empty());
         let mut settings = CascadeSettings::default();
         settings.merge(&cfg.cascade);
         assert_eq!(
             settings,
             CascadeSettings {
-                enabled: true,
                 stages: [16, 64, 0],
                 keep: 20.0,
                 keep_min: 2.0,
@@ -1066,21 +1090,21 @@ mod tests {
         );
         let previous = settings;
         settings.merge(&CascadeToml {
-            cascade: Some(false),
+            cascade_audit: Some(7),
             ..CascadeToml::default()
         });
         assert_eq!(
             settings,
             CascadeSettings {
-                enabled: false,
+                audit: 7,
                 ..previous
             }
         );
     }
 
     #[test]
-    fn admitted_jobs_retain_their_plan_after_disable_and_stage_change() {
-        let mut c = Controller::new(enabled_settings());
+    fn admitted_jobs_retain_their_plan_after_stage_change() {
+        let mut c = Controller::new(CascadeSettings::default());
         let (mut t, _, checkpoints) = c.admit(&job(0, 14_336));
         for cutoff in &mut c.plan.lock().unwrap().cutoffs {
             for _ in 0..200 {
@@ -1089,9 +1113,8 @@ mod tests {
         }
         let old = Arc::downgrade(&c.plan);
         c.refresh(CascadeSettings {
-            enabled: false,
             stages: [64, 0, 0],
-            ..enabled_settings()
+            ..CascadeSettings::default()
         });
         assert!(!Arc::ptr_eq(&t.plan, &c.plan));
         assert_eq!(checkpoints, vec![32, 256, 14_336]);
@@ -1103,8 +1126,8 @@ mod tests {
         assert!(old.upgrade().is_none());
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
         let (t, _, checkpoints) = c.admit(&job(1, 1024));
-        assert_eq!(t.gates, 0);
-        assert_eq!(checkpoints, vec![1024]);
+        assert_eq!(t.gates, 1);
+        assert_eq!(checkpoints, vec![64, 1024]);
     }
 
     #[test]
@@ -1112,7 +1135,7 @@ mod tests {
         let settings = CascadeSettings {
             target_milli: Some(-100),
             yield_per_million: Some(1.0),
-            ..enabled_settings()
+            ..CascadeSettings::default()
         };
         let mut c = Controller::new(settings);
         let (old, _, _) = c.admit(&job(0, 32));
@@ -1140,17 +1163,16 @@ mod tests {
     }
 
     #[test]
-    fn live_settings_enable_disable_enable_and_change_stages_on_one_stream() {
-        let mut c = Controller::new(enabled_settings());
-        for (enabled, stages, expected) in [
-            (true, [32, 256, 0], vec![32, 256, 1000]),
-            (false, [32, 256, 0], vec![1000]),
-            (true, [16, 64, 0], vec![16, 64, 1000]),
+    fn live_settings_change_stages_on_one_stream() {
+        let mut c = Controller::new(CascadeSettings::default());
+        for (stages, expected) in [
+            ([32, 256, 0], vec![32, 256, 1000]),
+            ([64, 0, 0], vec![64, 1000]),
+            ([16, 64, 0], vec![16, 64, 1000]),
         ] {
             c.refresh(CascadeSettings {
-                enabled,
                 stages,
-                ..enabled_settings()
+                ..CascadeSettings::default()
             });
             let (t, _, checkpoints) = c.admit(&job(0, 1000));
             assert_eq!(checkpoints, expected);
@@ -1163,7 +1185,7 @@ mod tests {
         let ((probe, full), rate) = CALIBRATION.false_negative[1];
         let mut c = Controller::new(CascadeSettings {
             stages: [probe, 0, 0],
-            ..enabled_settings()
+            ..CascadeSettings::default()
         });
         let (mut t, _, _) = c.admit(&job(0, full));
         let before = {
@@ -1185,7 +1207,7 @@ mod tests {
 
     #[test]
     fn short_full_budget_never_trains_another_transition() {
-        let mut c = Controller::new(enabled_settings());
+        let mut c = Controller::new(CascadeSettings::default());
         for budget in [14_336, 1024] {
             let (mut t, _, _) = c.admit(&job(0, budget));
             for cutoff in &mut c.plan.lock().unwrap().cutoffs {
@@ -1210,7 +1232,7 @@ mod tests {
 
     #[test]
     fn audit_restore_preserves_drift_at_the_clamp() {
-        let c = Controller::new(enabled_settings());
+        let c = Controller::new(CascadeSettings::default());
         let mut p = c.plan.lock().unwrap();
         for _ in 0..100_000 {
             p.cutoffs[0].observe(0.0);
@@ -1240,7 +1262,7 @@ mod tests {
             let mut c = Controller::new(CascadeSettings {
                 target_milli: Some(-100),
                 yield_per_million: Some(10_000_000.0),
-                ..enabled_settings()
+                ..CascadeSettings::default()
             });
             let (t, _, _) = c.admit(&job(0, 32));
             c.finish(&t, best, delivered);
@@ -1255,7 +1277,7 @@ mod tests {
         }
         assert!(Controller::new(CascadeSettings {
             target_milli: Some(-100),
-            ..enabled_settings()
+            ..CascadeSettings::default()
         })
         .yield_check
         .is_none());
@@ -1266,7 +1288,7 @@ mod tests {
         assert_eq!(kept_median(&VecDeque::new()), None);
         assert_eq!(kept_median(&VecDeque::from([5, 1, 3])), Some(3.0));
         assert_eq!(kept_median(&VecDeque::from([5, 1, 3, 7])), Some(4.0));
-        let mut c = Controller::new(enabled_settings());
+        let mut c = Controller::new(CascadeSettings::default());
         let mut first = job(0, 1024);
         first.params.seed = 0;
         c.admit(&first);
@@ -1283,7 +1305,7 @@ mod tests {
             keep_min: 2.0,
             keep_max: 1000.0,
             audit: 2,
-            ..enabled_settings()
+            ..CascadeSettings::default()
         });
         let (mut t, _, _) = c.admit(&job(0, 256));
         for _ in 0..100_000 {
@@ -1311,7 +1333,7 @@ mod tests {
 
     #[test]
     fn a_job_at_or_below_the_first_budget_passes_straight_through() {
-        let mut c = Controller::new(enabled_settings());
+        let mut c = Controller::new(CascadeSettings::default());
         for budget in [16, 32] {
             let (t, s, checkpoints) = c.admit(&job(0, budget));
             assert_eq!(t.gates, 0);
@@ -1325,7 +1347,7 @@ mod tests {
         let settings = CascadeSettings {
             stages: [32, 128, 256],
             reheat_beta: 1.0,
-            ..enabled_settings()
+            ..CascadeSettings::default()
         };
         let mut c = Controller::new(settings);
         let mut original = job(0, 128);
@@ -1364,7 +1386,7 @@ mod tests {
 
     #[test]
     fn load_feedback_loosens_tightens_and_decays() {
-        let mut c = Controller::new(enabled_settings());
+        let mut c = Controller::new(CascadeSettings::default());
         c.update_load(0.0, &[], 4);
         assert!(c.plan.lock().unwrap().cutoffs[0].log_adjust() < 0.0);
         c.plan.lock().unwrap().cutoffs[0].reset();
@@ -1381,7 +1403,7 @@ mod tests {
     fn final_audit_and_cancel_accounting() {
         let mut c = Controller::new(CascadeSettings {
             stages: [32, 0, 0],
-            ..enabled_settings()
+            ..CascadeSettings::default()
         });
         let (mut t, _, _) = c.admit(&job(0, 256));
         {
@@ -1439,7 +1461,7 @@ mod tests {
 
     #[test]
     fn short_second_topology_preserves_inflight_training() {
-        let mut c = Controller::new(enabled_settings());
+        let mut c = Controller::new(CascadeSettings::default());
         let (mut ticket, _, _) = c.admit(&job(0, 1000));
         let plan = Arc::clone(&c.plan);
         let epochs = (c.topology_epoch, c.yield_epoch);
@@ -1457,12 +1479,12 @@ mod tests {
     }
 
     #[test]
-    fn disabled_admission_leaves_topology_unset_and_plan_untouched() {
+    fn short_admission_leaves_topology_unset_and_plan_untouched() {
         let mut c = Controller::new(CascadeSettings::default());
         let plan = Arc::clone(&c.plan);
-        let (ticket, _, checkpoints) = c.admit(&job(0, 1000));
+        let (ticket, _, checkpoints) = c.admit(&job(0, 16));
         assert_eq!(ticket.gates, 0);
-        assert_eq!(checkpoints, vec![1000]);
+        assert_eq!(checkpoints, vec![16]);
         assert!(c.topology.is_none());
         assert!(Arc::ptr_eq(&plan, &c.plan));
         assert_eq!((c.topology_epoch, c.yield_epoch), (0, 0));
@@ -1474,7 +1496,7 @@ mod tests {
         let mut c = Controller::new(CascadeSettings {
             target_milli: Some(-100),
             yield_per_million: Some(10_000_000.0),
-            ..enabled_settings()
+            ..CascadeSettings::default()
         });
         let (ticket, _, _) = c.admit(&job(0, 32));
         c.finish(&ticket, Some(-100), true);

@@ -123,14 +123,16 @@ fn validate(job: &StreamJob) -> Result<(), SampleError> {
             "resident job exceeds node or sweep limit".into(),
         ));
     }
-    if job.params.num_sweeps == 0 || job.graph.num_nodes() == 0 {
+    if (job.params.num_sweeps == 0 || job.graph.num_nodes() == 0)
+        && sampler::device_energy_exact(&job.graph)
+    {
         return Err(SampleError::TooLarge(
             "resident jobs require nonzero nodes and sweeps".into(),
         ));
     }
-    if job.graph.j.len() != job.graph.edges.len() || !sampler::device_energy_exact(&job.graph) {
+    if job.graph.j.len() != job.graph.edges.len() {
         return Err(SampleError::TooLarge(
-            "slot jobs require exact device-energy coefficients".into(),
+            "resident jobs require one coefficient per edge".into(),
         ));
     }
     Ok(())
@@ -138,7 +140,8 @@ fn validate(job: &StreamJob) -> Result<(), SampleError> {
 
 pub(crate) struct Prepared {
     pub(crate) job: StreamJob,
-    pub(crate) data: Result<PreparedData, SampleError>,
+    /// None selects the non-slot, host-rescored path after ordinary validation.
+    pub(crate) data: Result<Option<PreparedData>, SampleError>,
 }
 
 pub(crate) struct PreparedData {
@@ -156,8 +159,12 @@ impl Preparer {
         &mut self,
         job: &StreamJob,
         settings: CascadeSettings,
-    ) -> Result<PreparedData, SampleError> {
+    ) -> Result<Option<PreparedData>, SampleError> {
         validate(job)?;
+        if !sampler::device_energy_exact(&job.graph) {
+            sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+            return Ok(None);
+        }
         let inputs = self
             .topology
             .as_ref()
@@ -181,7 +188,7 @@ impl Preparer {
         };
         let schedule = PreparedSchedule::new(job, settings);
         validate_schedule(&schedule.betas, &schedule.checkpoints)?;
-        Ok(PreparedData { schedule, inputs })
+        Ok(Some(PreparedData { schedule, inputs }))
     }
 }
 
@@ -307,20 +314,38 @@ impl Drop for Preparation {
     }
 }
 
+fn reject_or_cancel(
+    out: &Sender<StreamResult>,
+    job: StreamJob,
+    error: &SampleError,
+    cancel: &CancelToken,
+) {
+    let _ = out.blocking_send(StreamResult {
+        job_id: job.job_id,
+        outcome: if cancel.is_cancelled(job.watermark) {
+            StreamOutcome::Cancelled
+        } else {
+            StreamOutcome::Completed(Err(error.to_sample_error()))
+        },
+        device_access_time_us: 0,
+    });
+}
+
 fn reject_tail(
     pending: Option<StreamJob>,
     jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
     error: &SampleError,
+    cancel: &CancelToken,
 ) {
     jobs.close();
     if let Some(job) = pending {
-        send_reject(out, job, error.to_sample_error());
+        reject_or_cancel(out, job, error, cancel);
     }
     // close() revokes new reservations, but existing permits may still send.
     // None means both buffered jobs and outstanding permits have drained.
     while let Some(job) = jobs.blocking_recv() {
-        send_reject(out, job, error.to_sample_error());
+        reject_or_cancel(out, job, error, cancel);
     }
 }
 
@@ -330,12 +355,66 @@ fn reject_preparation(
     jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
     error: &SampleError,
+    cancel: &CancelToken,
 ) {
     jobs.close();
     while let Some(prepared) = preparation.next() {
-        send_reject(out, prepared.job, error.to_sample_error());
+        reject_or_cancel(out, prepared.job, error, cancel);
     }
-    reject_tail(pending.map(|prepared| prepared.job), jobs, out, error);
+    reject_tail(
+        pending.map(|prepared| prepared.job),
+        jobs,
+        out,
+        error,
+        cancel,
+    );
+}
+
+fn run_non_exact(
+    device: &MetalDevice,
+    job: StreamJob,
+    out: &Sender<StreamResult>,
+    gov: &dyn GpuGovernor,
+    cancel: &CancelToken,
+) -> Result<(), SampleError> {
+    let mut device_access_time_us = 0;
+    let result = (|| {
+        let mut batch = sampler::encode_batch(device, &[&job.graph], &job.params, Kernel::Msa, 1)?;
+        while batch.commit_next(|| out.is_closed() || cancel.is_cancelled(job.watermark)) {
+            batch.wait_until_completed();
+        }
+        device_access_time_us = batch.gpu_time_us();
+        gov.record_gpu_busy_us(device_access_time_us);
+        if let Some(status) = batch.failed_status() {
+            return Err(SampleError::Driver(format!(
+                "metal command buffer did not complete: status {status:?}"
+            )));
+        }
+        if out.is_closed() || cancel.is_cancelled(job.watermark) {
+            return Ok(Vec::new());
+        }
+        let mut reads = sampler::harvest_batch(&batch, &[&job.graph])?.remove(0);
+        reads.truncate(job.params.num_reads.max(1));
+        Ok(reads)
+    })();
+    let fault = match &result {
+        Err(SampleError::TooLarge(_)) | Ok(_) => None,
+        Err(SampleError::Driver(message)) => Some(SampleError::Driver(message.clone())),
+        Err(SampleError::Metal(error)) => Some(SampleError::Driver(error.to_string())),
+    };
+    let _ = out.blocking_send(StreamResult {
+        job_id: job.job_id,
+        outcome: if out.is_closed() || cancel.is_cancelled(job.watermark) {
+            StreamOutcome::Cancelled
+        } else {
+            StreamOutcome::Completed(result.map_err(|error| error.to_sample_error()))
+        },
+        device_access_time_us,
+    });
+    match fault {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Run on the sampler's blocking thread; no Metal object leaves this thread.
@@ -359,7 +438,7 @@ pub(crate) fn run(
         Ok(preparation) => preparation,
         Err(error) => {
             jobs.close();
-            reject_tail(None, &mut jobs, out, &error);
+            reject_tail(None, &mut jobs, out, &error, cancel);
             *store.lock().unwrap_or_else(|p| p.into_inner()) = Some(controller);
             return;
         }
@@ -438,7 +517,27 @@ pub(crate) fn run(
                 continue;
             }
             let mut data = match data {
-                Ok(data) => data,
+                Ok(Some(data)) => data,
+                Ok(None) => {
+                    // Run on the Metal-owning runner only after live slots drain,
+                    // so a rare full-budget fallback cannot stall slot stepping.
+                    if !empty {
+                        pending = Some(Prepared {
+                            job,
+                            data: Ok(None),
+                        });
+                        break;
+                    }
+                    let started = Instant::now();
+                    let result = run_non_exact(device, job, out, gov, cancel);
+                    // Fallback time belongs to the governor, not cascade load.
+                    window += started.elapsed();
+                    if let Err(error) = result {
+                        fault = Some(error);
+                        break 'run;
+                    }
+                    continue;
+                }
                 Err(error) => {
                     send_reject(out, job, error.to_sample_error());
                     continue;
@@ -448,7 +547,7 @@ pub(crate) fn run(
                 if !empty {
                     pending = Some(Prepared {
                         job,
-                        data: Ok(data),
+                        data: Ok(Some(data)),
                     });
                     break;
                 }
@@ -560,7 +659,7 @@ pub(crate) fn run(
     // one terminal send attempt, and workers never send stream results.
     let error =
         fault.unwrap_or_else(|| SampleError::Driver("resident result receiver closed".into()));
-    reject_preparation(&mut preparation, pending, &mut jobs, out, &error);
+    reject_preparation(&mut preparation, pending, &mut jobs, out, &error, cancel);
     *store.lock().unwrap_or_else(|p| p.into_inner()) = Some(controller);
 }
 
@@ -584,6 +683,7 @@ mod tests {
                 &mut jobs,
                 &out,
                 &SampleError::Driver("injected fault".into()),
+                &CancelToken::default(),
             );
             finished.send(()).unwrap();
         });
@@ -641,10 +741,7 @@ mod tests {
         );
         job.params.num_reads = 64;
         let mut preparer = Preparer::default();
-        let settings = CascadeSettings {
-            enabled: true,
-            ..Default::default()
-        };
+        let settings = CascadeSettings::default();
         preparer.prepare(&job, settings).unwrap();
         let start = Instant::now();
         for _ in 0..1000 {
@@ -705,10 +802,7 @@ mod tests {
         ));
         input.params.num_sweeps = 32;
         input.graph.j[0] = 0.5;
-        assert!(matches!(
-            preparer.prepare(&input, settings),
-            Err(SampleError::TooLarge(_))
-        ));
+        assert!(preparer.prepare(&input, settings).unwrap().is_none());
     }
 
     fn job(id: usize, sweeps: usize) -> StreamJob {
@@ -771,6 +865,7 @@ mod tests {
                 &mut jobs,
                 &out,
                 &SampleError::Driver("closed output".into()),
+                &CancelToken::default(),
             );
             assert_eq!(preparation.len(), 0);
             assert_eq!(jobs.len(), 0);
@@ -805,7 +900,7 @@ mod tests {
             if id % 3 == 0 {
                 assert!(matches!(prepared.data, Err(SampleError::TooLarge(_))));
             } else {
-                let data = prepared.data.unwrap();
+                let data = prepared.data.unwrap().unwrap();
                 assert_eq!(data.schedule.betas.len(), 64);
                 assert_eq!(data.schedule.checkpoints.last(), Some(&64));
             }
@@ -848,7 +943,14 @@ mod tests {
             job: job(PREP_BOUND, 64),
             data: Err(SampleError::TooLarge("invalid pending job".into())),
         };
-        reject_preparation(&mut preparation, Some(pending), &mut jobs, &out, &error);
+        reject_preparation(
+            &mut preparation,
+            Some(pending),
+            &mut jobs,
+            &out,
+            &error,
+            &CancelToken::default(),
+        );
         for id in 0..PREP_BOUND + 3 {
             let result = results.try_recv().unwrap();
             assert_eq!(result.job_id, id.to_le_bytes());
@@ -859,13 +961,62 @@ mod tests {
     }
 
     #[test]
+    fn fault_cleanup_answers_non_exact_jobs_once_and_respects_cancellation() {
+        let cancel = CancelToken::default();
+        cancel.cancel_through(1);
+        let non_exact = |id, watermark| {
+            let mut job = job(id, 64);
+            job.graph.j[0] = 0.5;
+            job.watermark = Some(watermark);
+            job
+        };
+        let mut preparation = Preparation::new().unwrap();
+        preparation.submit(non_exact(0, 1), CascadeSettings::default());
+        preparation.submit(non_exact(1, 2), CascadeSettings::default());
+        let pending = Prepared {
+            job: non_exact(2, 1),
+            data: Ok(None),
+        };
+        let (tx, mut jobs) = tokio::sync::mpsc::channel(2);
+        tx.try_send(non_exact(3, 1)).unwrap();
+        tx.try_send(non_exact(4, 2)).unwrap();
+        let (out, mut results) = tokio::sync::mpsc::channel(5);
+        let error = SampleError::Driver("injected fault".into());
+        reject_preparation(
+            &mut preparation,
+            Some(pending),
+            &mut jobs,
+            &out,
+            &error,
+            &cancel,
+        );
+        for id in 0usize..5 {
+            let result = results.try_recv().unwrap();
+            assert_eq!(result.job_id, id.to_le_bytes());
+            if id == 1 || id == 4 {
+                assert!(matches!(result.outcome, StreamOutcome::Completed(Err(_))));
+            } else {
+                assert!(matches!(result.outcome, StreamOutcome::Cancelled));
+            }
+        }
+        assert!(matches!(results.try_recv(), Err(TryRecvError::Empty)));
+        assert!(tx.is_closed());
+    }
+
+    #[test]
     fn fault_rejects_pending_and_queued_jobs_without_waiting_for_eof() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let (out, mut results) = tokio::sync::mpsc::channel(3);
         tx.try_send(job(1, 8)).unwrap();
         tx.try_send(job(2, 8)).unwrap();
         let error = SampleError::Driver("injected fault".into());
-        reject_tail(Some(job(0, 8)), &mut rx, &out, &error);
+        reject_tail(
+            Some(job(0, 8)),
+            &mut rx,
+            &out,
+            &error,
+            &CancelToken::default(),
+        );
         for id in 0usize..3 {
             let result = results.try_recv().expect("one rejection per submitted job");
             assert_eq!(result.job_id, id.to_le_bytes());
@@ -940,10 +1091,7 @@ mod tests {
         };
         run(
             &MetalDevice::open(0).unwrap(),
-            &Mutex::new(CascadeSettings {
-                enabled: true,
-                ..CascadeSettings::default()
-            }),
+            &Mutex::new(CascadeSettings::default()),
             &Mutex::new(None),
             rx,
             &out,
@@ -975,6 +1123,42 @@ mod tests {
     }
 
     #[test]
+    fn preparation_accepts_non_exact_jobs_with_ordinary_msa_limits() {
+        let mut input = job(0, 64);
+        input.graph.j[0] = 0.5;
+        let mut preparer = Preparer::default();
+        assert!(preparer
+            .prepare(&input, CascadeSettings::default())
+            .unwrap()
+            .is_none());
+        input.params.num_sweeps = sampler::MAX_SWEEPS + 1;
+        assert!(matches!(
+            preparer.prepare(&input, CascadeSettings::default()),
+            Err(SampleError::TooLarge(_))
+        ));
+        input.params.num_sweeps = 0;
+        assert!(preparer
+            .prepare(&input, CascadeSettings::default())
+            .unwrap()
+            .is_none());
+        input.params.num_sweeps = 64;
+        input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
+        input.graph.j = vec![0.5; input.graph.edges.len()];
+        assert!(matches!(
+            preparer.prepare(&input, CascadeSettings::default()),
+            Err(SampleError::TooLarge(_))
+        ));
+        input
+            .graph
+            .h
+            .resize(sampler::kernel_max_nodes(Kernel::Msa) + 1, 0.0);
+        assert!(matches!(
+            preparer.prepare(&input, CascadeSettings::default()),
+            Err(SampleError::TooLarge(_))
+        ));
+    }
+
+    #[test]
     fn invalid_admissions_fail_before_allocating_schedules() {
         let mut invalid = job(0, sampler::MAX_SWEEPS + 1);
         assert_eq!(
@@ -993,10 +1177,7 @@ mod tests {
             quip_solver_core::SampleError::Capacity
         );
         invalid.graph.j.push(-0.5);
-        assert_eq!(
-            validate(&invalid).unwrap_err().to_sample_error(),
-            quip_solver_core::SampleError::Capacity
-        );
+        validate(&invalid).unwrap();
         invalid.graph.j.pop();
         invalid.graph.j.push(-1.0);
         validate(&invalid).unwrap();
@@ -1023,7 +1204,6 @@ mod tests {
         }
         let device = MetalDevice::open(0).unwrap();
         let settings = CascadeSettings {
-            enabled: true,
             stages: [8, 0, 0],
             keep: 1.0,
             keep_min: 1.0,
@@ -1092,7 +1272,7 @@ mod tests {
             crate::iokit_gov::UtilGovernor::start(0, 100, false),
             Kernel::Msa,
         );
-        sampler.apply_config("cascade = true\ncascade_stages = [8]\ncascade_keep = 100\ncascade_keep_min = 10\ncascade_keep_max = 100");
+        sampler.apply_config("cascade_stages = [8]\ncascade_keep = 100\ncascade_keep_min = 10\ncascade_keep_max = 100");
         let run = |start, count| {
             let (tx, rx) = tokio::sync::mpsc::channel(count);
             let (out, mut results) = tokio::sync::mpsc::channel(count);

@@ -3,7 +3,7 @@
 
 //! Device tests for the MSA probe cascade.
 //!
-//! Each test opens its own sampler, applies the cascade through
+//! Each test opens its own sampler, tunes the always-on cascade through
 //! `Sampler::apply_config`, and drives `Sampler::sample_stream`. A missing
 //! Metal device skips the test. The helpers follow `tests/streaming.rs`;
 //! integration test binaries do not share modules.
@@ -24,7 +24,6 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Probe-to-full denominators. Each of the two stages keeps the square root.
 const CASCADE_TOML: &str = "\
-cascade = true
 cascade_stages = [8, 32]
 cascade_keep = 20
 cascade_keep_min = 10
@@ -343,6 +342,51 @@ fn cascade_results_have_consensus_energies() {
 }
 
 #[test]
+fn cascade_completes_mixed_exact_and_non_exact_jobs() {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let _gpu = gpu_lock();
+    with_timeout(
+        180,
+        "cascade_completes_mixed_exact_and_non_exact_jobs",
+        || {
+            let graphs = [
+                ring(8),
+                IsingGraph::new(vec![1.0, -1.0], vec![0.5], vec![(0, 1)]),
+                ring(8),
+                IsingGraph::new(
+                    vec![1.0, -1.0, 0.25],
+                    vec![0.5, -0.75],
+                    vec![(0, 1), (1, 2)],
+                ),
+                ring(16),
+            ];
+            let jobs: Vec<_> = graphs
+                .iter()
+                .enumerate()
+                .map(|(index, graph)| {
+                    make_job(job_id("mixed", index), graph.clone(), 256, 42, None)
+                })
+                .collect();
+            let ids: Vec<_> = jobs.iter().map(|job| job.job_id.clone()).collect();
+            let results = run_jobs(
+                jobs,
+                120,
+                "cascade_completes_mixed_exact_and_non_exact_jobs",
+            );
+            assert_one_each(&results, &ids);
+            let by_id = index_results(&results);
+            for (graph, id) in graphs.iter().zip(&ids) {
+                let result = by_id[id];
+                assert_reads(result, NUM_READS, graph.num_nodes());
+                assert_consensus(graph, result);
+            }
+        },
+    );
+}
+
+#[test]
 fn cascade_passes_short_jobs_through() {
     if MetalDevice::device_count() == 0 {
         return;
@@ -595,58 +639,55 @@ fn closed_output_waits_for_inflight_and_returns() {
 }
 
 #[test]
-fn cascade_off_keeps_run_stream() {
+fn default_and_removed_cascade_key_return_screened_reads() {
     if MetalDevice::device_count() == 0 {
         return;
     }
     let _gpu = gpu_lock();
-    with_timeout(120, "cascade off", || {
-        let device = MetalDevice::open(0).unwrap();
-        let gov = UtilGovernor::start(0, 100, false);
-        let sampler = MetalSampler::new(
-            MetalDevice::open(0).unwrap(),
-            UtilGovernor::start(0, 100, false),
-            Kernel::Msa,
-        );
-        sampler.apply_config("cascade = false");
-        let execute = |direct| {
+    with_timeout(120, "always-on cascade", || {
+        // A field-free ring leaves domain walls for the full budget to remove.
+        let mut graph = ring(256);
+        graph.h.fill(0.0);
+        let execute = |config: &str, sweeps| {
             let (tx, rx) = tokio::sync::mpsc::channel(32);
             let (out, results) = tokio::sync::mpsc::channel(32);
             for i in 0..32 {
                 tx.blocking_send(make_job(
-                    job_id("off", i),
-                    chain(CHAIN_NODES),
-                    64,
+                    job_id("always-on", i),
+                    graph.clone(),
+                    sweeps,
                     i as u64 + 1,
                     None,
                 ))
                 .unwrap();
             }
             drop(tx);
-            if direct {
-                quip_miner_metal::streaming::run_stream(
-                    &device,
-                    Kernel::Msa,
-                    rx,
-                    &out,
-                    &gov,
-                    &CancelToken::default(),
-                );
-                drop(out);
-            } else {
-                sampler.sample_stream(rx, out, CancelToken::default());
-            }
-            drain_results(results, 30, "cascade off")
+            let sampler = MetalSampler::new(
+                MetalDevice::open(0).unwrap(),
+                UtilGovernor::start(0, 100, false),
+                Kernel::Msa,
+            );
+            sampler.apply_config(config);
+            sampler.sample_stream(rx, out, CancelToken::default());
+            drain_results(results, 30, "always-on cascade")
         };
-        let direct = execute(true);
-        let off = execute(false);
-        assert_eq!(direct.len(), 32);
-        assert_eq!(off.len(), 32);
-        let direct = index_results(&direct);
-        for result in off {
-            assert_eq!(
-                completed_reads(&result),
-                completed_reads(direct[&result.job_id])
+        // A job whose budget equals the first default stage runs one segment,
+        // so its reads are the probe reads of the longer jobs below.
+        let probes = execute("", 32);
+        let probes = index_results(&probes);
+        for config in ["", "cascade = false"] {
+            let results = execute(config, 512);
+            assert_eq!(results.len(), 32);
+            let mut screened = 0;
+            for result in results {
+                assert_consensus(&graph, &result);
+                if completed_reads(&result) == completed_reads(probes[&result.job_id]) {
+                    screened += 1;
+                }
+            }
+            assert!(
+                screened > 0,
+                "{config:?} must return probe reads before the full budget"
             );
         }
     });
@@ -669,7 +710,7 @@ fn cancelled_continuing_job_answers_once() {
                 UtilGovernor::start(0, 100, false),
                 Kernel::Msa,
             );
-            sampler.apply_config("cascade = true\ncascade_stages = [8]\ncascade_keep = 2\ncascade_keep_min = 2\ncascade_keep_max = 2");
+            sampler.apply_config("cascade_stages = [8]\ncascade_keep = 2\ncascade_keep_min = 2\ncascade_keep_max = 2");
             // Denominator 2 is the loosest valid keep. The warm-up screens
             // every job for its first 200 observations.
             let (warm_tx, warm_rx) = tokio::sync::mpsc::channel(500);

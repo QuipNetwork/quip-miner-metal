@@ -30,14 +30,14 @@
 //! `QUIP_SCREEN_OUT` (CSV path, default `probe-screen.csv`).
 //!
 //! `QUIP_SCREEN_CASCADE=1` admits one job per nonce to the public MSA sampler
-//! with the cascade on, instead of the stage loop. Admission stops after
+//! through the always-on cascade, instead of the stage loop. Admission stops after
 //! `QUIP_SCREEN_SECONDS` seconds (default 1800) or, when `QUIP_SCREEN_NONCES`
 //! is set, after that many jobs, whichever comes first. A `QUIP_SCREEN_SEEDS`
 //! file still replaces the draw and caps the run. `QUIP_SCREEN_FULL` is the
 //! sweep budget (default 14336) and every job asks for 64 reads. The job seed
 //! is `job_seed(0, nonce)`, the same derivation the stage loop uses for its
-//! first stage. `QUIP_SCREEN_CASCADE_TOML` supplies extra settings, with
-//! `cascade = true` forced for the study. `QUIP_G5_MODE` is `system` (default) or `one-gate`.
+//! first stage. `QUIP_SCREEN_CASCADE_TOML` supplies extra settings.
+//! `QUIP_G5_MODE` is `system` (default) or `one-gate`.
 //! One-gate mode overrides the backend stages with `[32]` and keep with 2000.
 //! Set `QUIP_SCREEN_FULL=32` to measure only the gate at its minimum budget.
 //! `QUIP_SCREEN_SECOND_SECONDS` (default 0, off) runs a second stream on the
@@ -464,10 +464,6 @@ fn names_energy_audit_mismatch(text: &str) -> bool {
     text.contains("device energy") && text.contains("host energy")
 }
 
-#[expect(
-    clippy::print_stderr,
-    reason = "study reports an overridden cascade setting"
-)]
 fn cascade_backend_toml(mode: &str, extra: &str) -> String {
     assert!(
         mode == "system" || mode == "one-gate",
@@ -476,11 +472,6 @@ fn cascade_backend_toml(mode: &str, extra: &str) -> String {
     let mut config: toml::Table = extra
         .parse()
         .expect("QUIP_SCREEN_CASCADE_TOML must be TOML");
-    if config.insert("cascade".into(), toml::Value::Boolean(true))
-        == Some(toml::Value::Boolean(false))
-    {
-        eprintln!("cascade study overrides cascade = false with cascade = true");
-    }
     if mode == "one-gate" {
         config.remove("cascade_stages");
         config.remove("cascade_keep");
@@ -501,18 +492,8 @@ fn cascade_backend_toml(mode: &str, extra: &str) -> String {
 }
 
 #[test]
-fn cascade_study_overrides_disabled_cascade() {
-    for mode in ["system", "one-gate"] {
-        let text = cascade_backend_toml(mode, "cascade = false\ncascade_audit = 7");
-        let config: toml::Table = toml::from_str(&text).unwrap();
-        assert_eq!(config["cascade"].as_bool(), Some(true));
-        assert_eq!(config["cascade_audit"].as_integer(), Some(7));
-    }
-}
-
-#[test]
 fn cascade_modes_build_valid_toml() {
-    assert_eq!(cascade_backend_toml("system", ""), "cascade = true\n");
+    assert_eq!(cascade_backend_toml("system", ""), "");
     let config = cascade_backend_toml(
         "one-gate",
         "cascade_stages = [16, 64]\ncascade_keep = 10\ncascade_audit = 7",
