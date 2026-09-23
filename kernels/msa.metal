@@ -19,10 +19,9 @@ using namespace metal;
 //   4577 spins, and Apple ALUs are 32-bit (64-bit integer ops are emulated).
 // - One threadgroup per (problem, word). A job of R reads dispatches R / 32
 //   independent threadgroups per problem; there is no `words` loop in-kernel.
-// - No slot control plane. The host dispatches explicit batches and chunks
-//   the beta ladder across command buffers (macOS GPU watchdog), so this
-//   kernel resumes from persistent buffers exactly as block_gibbs_parallel
-//   in kernels/gibbs.metal does.
+// - The host dispatches batches or slot steps and chunks the beta ladder
+//   across command buffers (macOS GPU watchdog). Both entries resume from
+//   persistent spin and RNG buffers.
 // - Geometric thresholds are drawn inline from a 32-bit RNG per word update.
 //
 // Preconditions the host checks: J in {-1, 0, +1}, |h| <= 1, CSR degree
@@ -202,78 +201,39 @@ inline void lane_energies(
 // the Gibbs colour-block bindings, 19 carries `words`, and 21..24 match the
 // Gibbs chunk bindings.
 
+static inline void msa_body(
+    device const int* my_csr_row_ptr,
+    device const int* my_csr_col_ind,
+    device const int8_t* my_csr_J_vals,
+    device const int8_t* my_h_vals,
+    device const float* beta_schedule,
+    device const uint* src_state,
+    device uint* dst_state,
+    device const uint* src_rng,
+    device uint* dst_rng,
+    device int* final_energies,
+    device int8_t* final_samples,
+    device const int* color_block_starts,
+    device const int* color_block_counts,
+    device const int* color_node_indices,
+    int N, int num_reads, int num_colors, int sweeps_per_beta,
+    int beta_start, int beta_end, uint init_seed,
+    bool write_output, bool write_samples,
+    uint w, uint tid, uint gsz,
 #ifdef QUIP_MSA_DIAGNOSTICS
-kernel void msa_anneal_diag(
-#else
-kernel void msa_anneal(
+    device ulong* diag_accept_counts,
+    device int* diag_energy_partials,
 #endif
-    device const int* csr_row_ptr [[buffer(0)]],
-    device const int* csr_col_ind [[buffer(1)]],
-    device const int8_t* csr_J_vals [[buffer(2)]],
-    device const int* row_ptr_offsets [[buffer(3)]], // unused by msa: the CSR structure is shared
-    device const int* col_ind_offsets [[buffer(4)]],
-
-    constant int& N [[buffer(5)]],
-    constant int& num_betas [[buffer(6)]],
-    constant int& sweeps_per_beta [[buffer(7)]],
-    constant uint& base_seed [[buffer(8)]],
-
-    device const float* beta_schedule [[buffer(9)]],
-
-    device int8_t* final_samples [[buffer(10)]],           // [num_problems * num_reads * packed_size]
-    device int* final_energies [[buffer(11)]],             // [num_problems * num_reads] milli, last chunk only
-
-    constant int& num_threadgroups [[buffer(12)]],         // num_problems * words
-    constant int& num_problems [[buffer(13)]],
-    constant int& num_reads [[buffer(14)]],
-
-    device const int8_t* csr_h_vals [[buffer(15)]],
-
-    device const int* color_block_starts [[buffer(16)]],
-    device const int* color_block_counts [[buffer(17)]],
-    device const int* color_node_indices [[buffer(18)]],
-
-    constant int& words [[buffer(19)]],                    // words per problem = num_reads / 32
-    constant int& num_colors [[buffer(20)]],
-
-    constant int& beta_start [[buffer(21)]],               // first beta index this chunk (0 = init)
-    constant int& beta_count [[buffer(22)]],               // betas to process this chunk
-    device uint* persistent_state [[buffer(23)]],          // [num_threadgroups * N] spin words
-    device uint* persistent_rng [[buffer(24)]],            // [num_threadgroups * group_size * 4]
-#ifdef QUIP_MSA_DIAGNOSTICS
-    device ulong* diag_accept_counts [[buffer(25)]],       // [num_threadgroups * group_size] per-thread flips
-    device int* diag_energy_partials [[buffer(26)]],       // [num_threadgroups * group_size * 32] per-(thread, lane)
-#endif
-    threadgroup uint* state [[threadgroup(0)]],            // [N] spin words, sized by the host
-
-    uint3 threadgroup_pos [[threadgroup_position_in_grid]],
-    uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
-    uint3 threads_per_group [[threads_per_threadgroup]]
+    threadgroup uint* state,
+    threadgroup atomic_int* lane_total
 ) {
-    threadgroup atomic_int lane_total[MSA_LANES];
 #ifdef QUIP_MSA_DIAGNOSTICS
     ulong accept_count = 0;                      // per-thread flips across this chunk's sweeps
 #endif
 
-    uint tg = threadgroup_pos.x;
-    if (tg >= uint(num_threadgroups)) {
-        return;
-    }
-    uint tid = thread_pos_in_group.x;
-    uint gsz = threads_per_group.x;
-    uint problem_id = tg / uint(words);
-    uint w = tg - problem_id * uint(words);
     if (tid < uint(MSA_LANES)) {
         atomic_store_explicit(&lane_total[tid], 0, memory_order_relaxed);
     }
-
-    // CSR structure is shared by every problem in a batch (same topology);
-    // only the couplings and fields are per problem.
-    int col_ind_start = col_ind_offsets[problem_id];
-    device const int* my_csr_row_ptr = csr_row_ptr;
-    device const int* my_csr_col_ind = csr_col_ind;
-    device const int8_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
-    device const int8_t* my_h_vals = &csr_h_vals[problem_id * uint(N)];
 
     int n = N;
     int packed_size = (n + 7) / 8;
@@ -281,27 +241,24 @@ kernel void msa_anneal(
     RngState rng;
     if (beta_start == 0) {
         // First chunk: seed per (threadgroup, thread) and draw random words.
-        rng = seed_rng((base_seed ? base_seed : 1u) ^ (tg * 2654435761u) ^ (tid * 2246822519u));
+        rng = seed_rng(init_seed);
         for (uint var = tid; var < uint(n); var += gsz) {
             state[var] = xoshiro128starstar(rng);
         }
     } else {
         // Continuation chunk: threadgroup memory does not survive dispatches,
         // so rebuild the words and the RNG stream from device memory.
-        device const uint* src_rng = &persistent_rng[(tg * gsz + tid) * 4];
         rng.s0 = src_rng[0];
         rng.s1 = src_rng[1];
         rng.s2 = src_rng[2];
         rng.s3 = src_rng[3];
-        device const uint* src_state = &persistent_state[tg * uint(n)];
         for (uint var = tid; var < uint(n); var += gsz) {
             state[var] = src_state[var];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    int chunk_end = min(beta_start + beta_count, num_betas);
-    for (int beta_idx = beta_start; beta_idx < chunk_end; beta_idx++) {
+    for (int beta_idx = beta_start; beta_idx < beta_end; beta_idx++) {
         float beta = beta_schedule[beta_idx];
 
         float two_beta = 2.0f * beta;
@@ -367,36 +324,33 @@ kernel void msa_anneal(
     // one follows). The barrier closing the last colour class already
     // synchronised `state`, and each thread writes a disjoint stride.
     {
-        device uint* dst_rng = &persistent_rng[(tg * gsz + tid) * 4];
         dst_rng[0] = rng.s0;
         dst_rng[1] = rng.s1;
         dst_rng[2] = rng.s2;
         dst_rng[3] = rng.s3;
-        device uint* dst_state = &persistent_state[tg * uint(n)];
         for (uint var = tid; var < uint(n); var += gsz) {
             dst_state[var] = state[var];
         }
     }
 
     // Energies. The diagnostic build keeps its per-(thread, lane) partials on
-    // every chunk; the production build reduces them on the last chunk only.
-    bool last_chunk = chunk_end >= num_betas;
+    // every chunk; the production build reduces them only when requested.
 #ifdef QUIP_MSA_DIAGNOSTICS
     bool need_energy = true;
 #else
-    bool need_energy = last_chunk;
+    bool need_energy = write_output;
 #endif
     if (need_energy) {
         int ener[MSA_LANES];
         lane_energies(ener, state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals,
                       my_h_vals, n, tid, gsz);
 #ifdef QUIP_MSA_DIAGNOSTICS
-        device int* dst = &diag_energy_partials[(tg * gsz + tid) * MSA_LANES];
+        device int* dst = diag_energy_partials;
         for (int r = 0; r < MSA_LANES; ++r) {
             dst[r] = ener[r];
         }
 #endif
-        if (last_chunk) {
+        if (write_output) {
             for (int r = 0; r < MSA_LANES; ++r) {
                 int s = simd_sum(ener[r]);
                 if (simd_is_first()) {
@@ -406,10 +360,10 @@ kernel void msa_anneal(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (last_chunk && tid < uint(MSA_LANES)) {
+    if (write_output && tid < uint(MSA_LANES)) {
         int read = int(w) * MSA_LANES + int(tid);
         if (read < num_reads) {
-            final_energies[problem_id * uint(num_reads) + uint(read)] =
+            final_energies[read] =
                 atomic_load_explicit(&lane_total[tid], memory_order_relaxed);
         }
     }
@@ -417,12 +371,15 @@ kernel void msa_anneal(
 #ifdef QUIP_MSA_DIAGNOSTICS
     // Per-thread accepted-flip counter for this chunk (overwritten per chunk;
     // no atomics, one disjoint write per thread).
-    diag_accept_counts[tg * gsz + tid] = accept_count;
+    diag_accept_counts[0] = accept_count;
 #endif
 
     // Pack lane r of this word as read w * 32 + r (bit 1 == spin -1, LSB
     // first per byte). (lane, byte) pairs are spread over the threadgroup;
     // each pair owns one output byte, so there are no write races.
+    if (!write_samples) {
+        return;
+    }
     int total = MSA_LANES * packed_size;
     for (int idx = int(tid); idx < total; idx += int(gsz)) {
         int lane = idx / packed_size;
@@ -439,7 +396,158 @@ kernel void msa_anneal(
                 byte |= ((state[var] >> uint(lane)) & 1u) << uint(bit);
             }
         }
-        uint out = (problem_id * uint(num_reads) + uint(read)) * uint(packed_size) + uint(b);
+        uint out = uint(read) * uint(packed_size) + uint(b);
         final_samples[out] = as_type<int8_t>(uchar(byte));
     }
 }
+
+#ifdef QUIP_MSA_DIAGNOSTICS
+kernel void msa_anneal_diag(
+#else
+kernel void msa_anneal(
+#endif
+    device const int* csr_row_ptr [[buffer(0)]],
+    device const int* csr_col_ind [[buffer(1)]],
+    device const int8_t* csr_J_vals [[buffer(2)]],
+    device const int* row_ptr_offsets [[buffer(3)]], // unused by msa: the CSR structure is shared
+    device const int* col_ind_offsets [[buffer(4)]],
+
+    constant int& N [[buffer(5)]],
+    constant int& num_betas [[buffer(6)]],
+    constant int& sweeps_per_beta [[buffer(7)]],
+    constant uint& base_seed [[buffer(8)]],
+
+    device const float* beta_schedule [[buffer(9)]],
+
+    device int8_t* final_samples [[buffer(10)]],           // [num_problems * num_reads * packed_size]
+    device int* final_energies [[buffer(11)]],             // [num_problems * num_reads] milli, last chunk only
+
+    constant int& num_threadgroups [[buffer(12)]],         // num_problems * words
+    constant int& num_problems [[buffer(13)]],
+    constant int& num_reads [[buffer(14)]],
+
+    device const int8_t* csr_h_vals [[buffer(15)]],
+
+    device const int* color_block_starts [[buffer(16)]],
+    device const int* color_block_counts [[buffer(17)]],
+    device const int* color_node_indices [[buffer(18)]],
+
+    constant int& words [[buffer(19)]],                    // words per problem = num_reads / 32
+    constant int& num_colors [[buffer(20)]],
+
+    constant int& beta_start [[buffer(21)]],               // first beta index this chunk (0 = init)
+    constant int& beta_count [[buffer(22)]],               // betas to process this chunk
+    device uint* persistent_state [[buffer(23)]],          // [num_threadgroups * N] spin words
+    device uint* persistent_rng [[buffer(24)]],            // [num_threadgroups * group_size * 4]
+#ifdef QUIP_MSA_DIAGNOSTICS
+    device ulong* diag_accept_counts [[buffer(25)]],       // [num_threadgroups * group_size] per-thread flips
+    device int* diag_energy_partials [[buffer(26)]],       // [num_threadgroups * group_size * 32] per-(thread, lane)
+#endif
+    threadgroup uint* state [[threadgroup(0)]],            // [N] spin words, sized by the host
+
+    uint3 threadgroup_pos [[threadgroup_position_in_grid]],
+    uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup atomic_int lane_total[MSA_LANES];
+    uint tg = threadgroup_pos.x;
+    if (tg >= uint(num_threadgroups)) {
+        return;
+    }
+    uint tid = thread_pos_in_group.x;
+    uint gsz = threads_per_group.x;
+    uint problem_id = tg / uint(words);
+    uint w = tg - problem_id * uint(words);
+    int beta_end = min(beta_start + beta_count, num_betas);
+    uint init_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u) ^ (tid * 2246822519u);
+    msa_body(csr_row_ptr, csr_col_ind, &csr_J_vals[col_ind_offsets[problem_id]],
+             &csr_h_vals[problem_id * uint(N)], beta_schedule,
+             &persistent_state[tg * uint(N)], &persistent_state[tg * uint(N)],
+             &persistent_rng[(tg * gsz + tid) * 4], &persistent_rng[(tg * gsz + tid) * 4],
+             &final_energies[problem_id * uint(num_reads)],
+             &final_samples[problem_id * uint(num_reads) * uint((N + 7) / 8)],
+             color_block_starts, color_block_counts, color_node_indices,
+             N, num_reads, num_colors, sweeps_per_beta, beta_start, beta_end, init_seed,
+             beta_end >= num_betas, true, w, tid, gsz,
+#ifdef QUIP_MSA_DIAGNOSTICS
+             &diag_accept_counts[tg * gsz + tid],
+             &diag_energy_partials[(tg * gsz + tid) * MSA_LANES],
+#endif
+             state, lane_total);
+}
+
+#ifndef QUIP_MSA_DIAGNOSTICS
+struct SlotStep {
+    uint slot;        // storage index for h, J, schedule, state, rng, outputs
+    int  beta_start;  // 0 = initialise spins and RNG from seed
+    int  beta_count;  // rungs this step
+    int  num_betas;   // this slot's schedule length
+    uint seed;        // job seed folded to 32 bits, never 0
+    uint flags;       // bit 0: write energies and packed samples
+};
+
+kernel void msa_anneal_slots(
+    device const int* csr_row_ptr [[buffer(0)]],
+    device const int* csr_col_ind [[buffer(1)]],
+    device const int8_t* csr_J_vals [[buffer(2)]],
+    device const int* row_ptr_offsets [[buffer(3)]], // unused by msa: the CSR structure is shared
+    constant int& j_stride [[buffer(4)]],
+
+    constant int& N [[buffer(5)]],
+    constant int& sched_stride [[buffer(6)]],
+    constant int& sweeps_per_beta [[buffer(7)]],
+    constant uint& base_seed [[buffer(8)]],
+
+    device const float* beta_schedule [[buffer(9)]],
+
+    device int8_t* final_samples [[buffer(10)]],           // [num_slots * num_reads * packed_size]
+    device int* final_energies [[buffer(11)]],             // [num_slots * num_reads] milli, output flag only
+
+    constant int& num_threadgroups [[buffer(12)]],         // num_steps * words
+    constant int& num_problems [[buffer(13)]],
+    constant int& num_reads [[buffer(14)]],
+
+    device const int8_t* csr_h_vals [[buffer(15)]],
+
+    device const int* color_block_starts [[buffer(16)]],
+    device const int* color_block_counts [[buffer(17)]],
+    device const int* color_node_indices [[buffer(18)]],
+
+    constant int& words [[buffer(19)]],                    // words per slot = num_reads / 32
+    constant int& num_colors [[buffer(20)]],
+
+    constant int& beta_start [[buffer(21)]],               // unused: supplied by the step
+    constant int& beta_count [[buffer(22)]],               // unused: supplied by the step
+    device uint* persistent_state [[buffer(23)]],          // [num_slots * words * N] spin words
+    device uint* persistent_rng [[buffer(24)]],            // [num_slots * words * group_size * 4]
+    device const SlotStep* steps [[buffer(25)]],
+    threadgroup uint* state [[threadgroup(0)]],            // [N] spin words, sized by the host
+
+    uint3 threadgroup_pos [[threadgroup_position_in_grid]],
+    uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup atomic_int lane_total[MSA_LANES];
+    uint tg = threadgroup_pos.x;
+    if (tg >= uint(num_threadgroups)) {
+        return;
+    }
+    uint tid = thread_pos_in_group.x;
+    uint gsz = threads_per_group.x;
+    SlotStep st = steps[tg / uint(words)];
+    uint w = tg % uint(words);
+    uint g = st.slot * uint(words) + w;
+    int beta_end = min(st.beta_start + st.beta_count, st.num_betas);
+    uint init_seed = st.seed ^ (w * 2654435761u) ^ (tid * 2246822519u);
+    bool write_output = (st.flags & 1u) != 0;
+    msa_body(csr_row_ptr, csr_col_ind, &csr_J_vals[st.slot * uint(j_stride)],
+             &csr_h_vals[st.slot * uint(N)], &beta_schedule[st.slot * uint(sched_stride)],
+             &persistent_state[g * uint(N)], &persistent_state[g * uint(N)],
+             &persistent_rng[(g * gsz + tid) * 4], &persistent_rng[(g * gsz + tid) * 4],
+             &final_energies[st.slot * uint(num_reads)],
+             &final_samples[st.slot * uint(num_reads) * uint((N + 7) / 8)],
+             color_block_starts, color_block_counts, color_node_indices,
+             N, num_reads, num_colors, 1, st.beta_start, beta_end, init_seed,
+             write_output, write_output, w, tid, gsz, state, lane_total);
+}
+#endif

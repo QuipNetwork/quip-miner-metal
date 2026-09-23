@@ -47,7 +47,7 @@ pub enum Kernel {
 
 use crate::topology::{fill_h_j, SelfFeedingTopology};
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-use quip_solver_core::quip_protocol::scoring::energy_milli;
+pub(crate) use quip_solver_core::quip_protocol::scoring::energy_milli;
 
 /// Failure from a Metal sample attempt: capacity refusal or driver fault.
 #[derive(Debug, Error)]
@@ -155,7 +155,7 @@ const _: () = assert!(
 /// 1,024 threads split each colour class, bounded at dispatch by the pipeline's
 /// `max_total_threads_per_threadgroup`. The persistent RNG buffer is sized by
 /// that clamped width, not by this constant.
-const MSA_THREADS: usize = 1024;
+pub(crate) const MSA_THREADS: usize = 1024;
 /// Static threadgroup bytes `msa_anneal` declares: 32 atomic lane totals.
 /// `msa_pipeline_compiles_and_admits_at_least_256_threads` checks the compiled figure
 /// against a bound using the literal 144 bytes (16 bytes of alignment headroom),
@@ -461,7 +461,7 @@ const ENERGY_AUDIT_EVERY: u64 = 1000;
 ///
 /// Uses the shared f64 schedule and casts each element to f32 — bit-identical
 /// to the prior in-crate f32 schedule.
-fn build_beta_schedule(
+pub(crate) fn build_beta_schedule(
     graph: &IsingGraph,
     num_sweeps: usize,
     sweeps_per_beta: usize,
@@ -485,7 +485,7 @@ fn build_beta_schedule(
 /// zero past its end (i.e. `+1`, the initialized value) instead of panicking:
 /// the caller sizes both the allocation and the harvest count from the same
 /// `packed_size`, so a mismatch is a bug, not a reason to abort the miner.
-fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
+pub(crate) fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
     let mut spins = vec![1i8; n];
     for (i, s) in spins.iter_mut().enumerate() {
         let byte = packed.get(i >> 3).copied().unwrap_or(0) as u8;

@@ -69,6 +69,12 @@ pub struct MetalDevice {
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
     pub(crate) msa: ComputePipelineState,
+    /// Multi-spin slot-table dispatch with per-slot state and schedules.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "slot pool dispatch is added in the next task")
+    )]
+    pub(crate) msa_slots: ComputePipelineState,
     /// One CSR topology, replaced when `n`, edges, or the colouring flag change.
     pub(crate) topology_cache: crate::sampler::TopologyCache,
     /// Multi-spin batch buffers returned after their command buffers retire.
@@ -116,6 +122,7 @@ impl MetalDevice {
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
         let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
+        let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let queue = device.new_command_queue();
 
         Ok(Self {
@@ -126,6 +133,7 @@ impl MetalDevice {
             gibbs,
             gibbs_parallel,
             msa,
+            msa_slots,
             topology_cache: crate::sampler::TopologyCache::default(),
             buffer_pool: std::sync::Arc::new(crate::sampler::BufferPool::default()),
         })
