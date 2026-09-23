@@ -7,7 +7,52 @@ use crate::topology::fill_h_j_matching;
 use crate::topology::SelfFeedingTopology;
 use crate::{IsingGraph, SampleParams, SamplerResult};
 use metal::{MTLCommandBufferStatus, MTLSize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+fn decode_pool() -> Result<&'static rayon::ThreadPool, SampleError> {
+    static POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+    // Bound decode fan-out independently of the global Rayon pool. Four
+    // decode workers plus four preparers leave four of the M4 Max's twelve
+    // performance cores for the runner, producers and other work. Byte-table
+    // expansion reduces the work on the slowest decode worker. Streaming
+    // keeps its existing pool and unpacker.
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|index| format!("resident-decode-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map_err(|error| SampleError::Driver(format!("start resident decode pool: {error}")))
+}
+
+fn unpack_slot_spins(packed: &[i8], n: usize) -> Vec<i8> {
+    const SPINS: [[i8; 8]; 256] = {
+        let mut table = [[1; 8]; 256];
+        let mut byte = 0;
+        while byte < 256 {
+            let mut bit = 0;
+            while bit < 8 {
+                if byte & (1 << bit) != 0 {
+                    table[byte][bit] = -1;
+                }
+                bit += 1;
+            }
+            byte += 1;
+        }
+        table
+    };
+    let mut spins = vec![0; n];
+    let (chunks, tail) = spins.as_chunks_mut::<8>();
+    for (chunk, &byte) in chunks.iter_mut().zip(packed) {
+        *chunk = SPINS[byte as u8 as usize];
+    }
+    if !tail.is_empty() {
+        tail.copy_from_slice(&SPINS[packed[n / 8] as u8 as usize][..n % 8]);
+    }
+    spins
+}
 
 pub(crate) struct SlotJob {
     pub(crate) graph: IsingGraph,
@@ -111,6 +156,7 @@ struct ResidentJob {
 }
 
 pub(crate) struct SlotPool {
+    decode: &'static rayon::ThreadPool,
     cached: Arc<CachedTopology>,
     pool: Arc<BufferPool>,
     queue: metal::CommandQueue,
@@ -135,6 +181,7 @@ impl SlotPool {
         capacity: usize,
         sched_stride: usize,
     ) -> Result<Self, SampleError> {
+        let decode = decode_pool()?;
         let params = SampleParams {
             num_reads,
             num_sweeps: sched_stride,
@@ -184,6 +231,7 @@ impl SlotPool {
             .map(|(index, bytes)| (index, device.buffer_pool.take(&device.device, bytes)))
             .collect();
         Ok(Self {
+            decode,
             cached,
             pool: Arc::clone(&device.buffer_pool),
             queue: device.queue.clone(),
@@ -500,7 +548,7 @@ impl SlotPool {
             .ok_or_else(|| SampleError::Driver("missing slot read result".into()))
     }
 
-    /// Harvest checkpoint outputs in requested slot order with one parallel
+    /// Harvest checkpoint outputs in requested slot order with one dense
     /// decode across jobs. Repeated slots produce repeated results.
     pub(crate) fn reads_many(
         &self,
@@ -572,14 +620,31 @@ impl SlotPool {
             }
             first = end;
         }
-        sampler::decode_packed_reads(
-            &packed,
-            Some(&energies),
-            &graphs,
-            num_reads,
-            packed_size,
-            self.cached.n,
-        )
+        let n = self.cached.n;
+        // Byte expansion avoids per-spin shifts. Keep the same energy audit.
+        // Split within jobs as well: a 64-read job must not pin an entire
+        // decode worker while the runner waits for the slowest job.
+        let decoded = self.decode.install(|| {
+            use rayon::prelude::*;
+            (0..count)
+                .into_par_iter()
+                .with_min_len(16)
+                .map(|index| {
+                    let start = index * packed_size;
+                    SamplerResult {
+                        spins: unpack_slot_spins(&packed[start..start + packed_size], n),
+                        energy_milli: i64::from(energies[index]),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut decoded = decoded.into_iter();
+        let reads: Vec<Vec<_>> = graphs
+            .iter()
+            .map(|_| decoded.by_ref().take(num_reads).collect())
+            .collect();
+        sampler::audit_device_energies(&reads, &graphs)?;
+        Ok(reads)
     }
 
     pub(crate) fn device_us(&self, slot: SlotId) -> u64 {
@@ -619,6 +684,37 @@ pub(crate) fn slot_seed(seed: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "host decode timing checks the byte expansion optimization"
+    )]
+    fn slot_unpack_matches_every_byte_and_partial_tail() {
+        for byte in 0..=255u8 {
+            for n in 0usize..=33 {
+                let packed = vec![byte as i8; n.div_ceil(8)];
+                assert_eq!(
+                    unpack_slot_spins(&packed, n),
+                    sampler::unpack_spins(&packed, n)
+                );
+            }
+        }
+        let packed = vec![0x5a; 4577usize.div_ceil(8)];
+        let start = std::time::Instant::now();
+        for _ in 0..20000 {
+            std::hint::black_box(sampler::unpack_spins(std::hint::black_box(&packed), 4577));
+        }
+        let old = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..20000 {
+            std::hint::black_box(unpack_slot_spins(std::hint::black_box(&packed), 4577));
+        }
+        eprintln!(
+            "unpack 4577 spins, 20000 reads: per-bit={old:?}, byte-table={:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn device_time_shares_conserve_command_time() {
@@ -1324,7 +1420,7 @@ mod tests {
     )]
     fn pool_probe_rate_against_run_stream() {
         use crate::cascade::{CascadeSettings, Controller, Ticket};
-        use crate::resident::{Preparation, PREP_BOUND};
+        use crate::resident::{Preparation, PREP_BOUND, PREP_WORKERS};
         use crate::sampler::{encode_batch, harvest_batch, EncodedBatch};
         use quip_solver_core::StreamJob;
         use std::time::{Duration, Instant};
@@ -1428,7 +1524,9 @@ mod tests {
                     });
                     let mut data = prepared.data.unwrap();
                     timed(&mut pool_host[0], || {
-                        let ticket = controller.admit_prepared(&prepared.job, &mut data.schedule);
+                        let ticket = controller
+                            .admit_prepared(&prepared.job, &mut data.schedule)
+                            .unwrap();
                         let slot = pool
                             .admit_prepared(
                                 data.inputs,
@@ -1489,7 +1587,7 @@ mod tests {
         let jobs = (STEPS * capacity) as f64;
         let pool_rate = jobs / pool_seconds;
         let stream_rate = jobs / stream_seconds;
-        eprintln!("S4 one gate: {STEPS} steps, capacity={capacity}, reads={READS}, sweeps={SWEEPS}, two in flight, no later gates, controller admission, four preparation workers, no warmup");
+        eprintln!("S4 one gate: {STEPS} steps, capacity={capacity}, reads={READS}, sweeps={SWEEPS}, two in flight, no later gates, controller admission, {PREP_WORKERS} preparation workers, no warmup");
         eprintln!("pool={pool_rate:.2} jobs/s ({pool_seconds:.3}s), run_stream-equivalent={stream_rate:.2} jobs/s ({stream_seconds:.3}s), ratio={:.4}", pool_rate / stream_rate);
         for (phase, elapsed) in [
             "admit",

@@ -11,7 +11,7 @@ use crate::streaming::{batch_size_for_reads, scale_budget, send_reject, GpuGover
 use crate::topology::SelfFeedingTopology;
 use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
 use std::collections::VecDeque;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -116,7 +116,13 @@ impl Pool {
 }
 
 fn validate(job: &StreamJob) -> Result<(), SampleError> {
-    sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+    if job.graph.num_nodes() > sampler::kernel_max_nodes(Kernel::Msa)
+        || job.params.num_sweeps > sampler::MAX_SWEEPS
+    {
+        return Err(SampleError::TooLarge(
+            "resident job exceeds node or sweep limit".into(),
+        ));
+    }
     if job.params.num_sweeps == 0 || job.graph.num_nodes() == 0 {
         return Err(SampleError::TooLarge(
             "resident jobs require nonzero nodes and sweeps".into(),
@@ -152,19 +158,29 @@ impl Preparer {
         settings: CascadeSettings,
     ) -> Result<PreparedData, SampleError> {
         validate(job)?;
+        let inputs = self
+            .topology
+            .as_ref()
+            .and_then(|(topology, edges)| PreparedInputs::new(&job.graph, topology, edges));
+        let inputs = match inputs {
+            Some(inputs) => inputs,
+            None => {
+                // Degree depends only on nodes and ordered edges. The cache is
+                // established only after validate_batch, and coefficient filling
+                // checks exact topology equality on every hit. Recounting degree
+                // would allocate and walk the same 41,515 edges on every job.
+                sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+                // This cache contains no Metal objects. Coloring does not
+                // change the CSR positions used for coefficient order.
+                let topology = SelfFeedingTopology::build(&job.graph);
+                let inputs = PreparedInputs::new(&job.graph, &topology, &job.graph.edges)
+                    .ok_or_else(|| SampleError::Driver("preparation topology mismatch".into()))?;
+                self.topology = Some((topology, job.graph.edges.clone()));
+                inputs
+            }
+        };
         let schedule = PreparedSchedule::new(job, settings);
         validate_schedule(&schedule.betas, &schedule.checkpoints)?;
-        if let Some((topology, edges)) = &self.topology {
-            if let Some(inputs) = PreparedInputs::new(&job.graph, topology, edges) {
-                return Ok(PreparedData { schedule, inputs });
-            }
-        }
-        // This cache contains no Metal objects. CSR positions are identical to
-        // the device topology; coloring does not change coefficient order.
-        let topology = SelfFeedingTopology::build(&job.graph);
-        let inputs = PreparedInputs::new(&job.graph, &topology, &job.graph.edges)
-            .ok_or_else(|| SampleError::Driver("preparation topology mismatch".into()))?;
-        self.topology = Some((topology, job.graph.edges.clone()));
         Ok(PreparedData { schedule, inputs })
     }
 }
@@ -175,36 +191,44 @@ struct Work {
     reply: mpsc::SyncSender<Prepared>,
 }
 
-// Four std workers leave CPU capacity for the coordinator's producers on an
-// M4 Max. At most 40 jobs (two nominal 20-slot batches) are queued, preparing,
-// or ready in total. Dedicated threads avoid competing with read decoding on
-// Rayon's global pool. One bounded reply per job preserves admission order.
-const PREP_WORKERS: usize = 4;
+// Warm Advantage2 preparation measured 251 us/job on one M4 Max host thread
+// (preparation_cost_advantage2), down from 436 us before the cache/beta fixes.
+// Allow 3x that cost under concurrent load: four workers / 0.753 ms = 5,312
+// jobs/s, 15% above the 4,615 jobs/s target. Four decode workers leave four
+// of the 12 performance cores, plus four efficiency cores, for the runner,
+// producers (~1.3 cores) and other work. Use std threads for explicit queue
+// ownership and joining, without borrowing Rayon's decode workers.
+// At most 40 jobs (two nominal 20-slot batches) are queued, preparing, or ready
+// in total. Per-worker request queues remove shared-receiver contention;
+// one bounded reply per job preserves admission order.
+pub(crate) const PREP_WORKERS: usize = 4;
 pub(crate) const PREP_BOUND: usize = 40;
 
 pub(crate) struct Preparation {
-    requests: Option<mpsc::SyncSender<Work>>,
+    requests: Vec<mpsc::SyncSender<Work>>,
+    next_worker: usize,
     ready: VecDeque<mpsc::Receiver<Prepared>>,
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Preparation {
     pub(crate) fn new() -> Result<Self, SampleError> {
-        let (tx, rx) = mpsc::sync_channel::<Work>(PREP_BOUND);
-        let rx = Arc::new(Mutex::new(rx));
         let mut preparation = Self {
-            requests: Some(tx),
+            requests: Vec::new(),
+            next_worker: 0,
             ready: VecDeque::new(),
             workers: Vec::new(),
         };
         for index in 0..PREP_WORKERS {
-            let rx = Arc::clone(&rx);
+            // Each receiver has one owner. No worker holds a shared lock while
+            // waiting for work. PREP_BOUND still bounds all outstanding replies.
+            let (tx, rx) = mpsc::sync_channel::<Work>(PREP_BOUND);
             let worker = std::thread::Builder::new()
                 .name(format!("resident-prepare-{index}"))
                 .spawn(move || {
                     let mut preparer = Preparer::default();
                     loop {
-                        let request = rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                        let request = rx.recv();
                         let Ok(Work {
                             job,
                             settings,
@@ -228,6 +252,7 @@ impl Preparation {
                     SampleError::Driver(format!("start preparation worker: {error}"))
                 })?;
             preparation.workers.push(worker);
+            preparation.requests.push(tx);
         }
         Ok(preparation)
     }
@@ -255,13 +280,13 @@ impl Preparation {
         };
         // The runner submits only below PREP_BOUND, so this queue cannot block.
         // A disconnected queue is returned through the same result owner.
-        if let Some(tx) = &self.requests {
-            if let Err(mpsc::SendError(work)) = tx.send(work) {
-                let _ = work.reply.send(Prepared {
-                    job: work.job,
-                    data: Err(SampleError::Driver("preparation workers stopped".into())),
-                });
-            }
+        let tx = &self.requests[self.next_worker];
+        self.next_worker = (self.next_worker + 1) % self.requests.len();
+        if let Err(mpsc::SendError(work)) = tx.send(work) {
+            let _ = work.reply.send(Prepared {
+                job: work.job,
+                data: Err(SampleError::Driver("preparation workers stopped".into())),
+            });
         }
         self.ready.push_back(result);
     }
@@ -273,7 +298,7 @@ impl Preparation {
 
 impl Drop for Preparation {
     fn drop(&mut self) {
-        self.requests.take();
+        self.requests.clear();
         // Replies have capacity one each. Joining never depends on the runner
         // draining results or on input EOF, including after output closes.
         for worker in self.workers.drain(..) {
@@ -288,10 +313,13 @@ fn reject_tail(
     out: &Sender<StreamResult>,
     error: &SampleError,
 ) {
+    jobs.close();
     if let Some(job) = pending {
         send_reject(out, job, error.to_sample_error());
     }
-    while let Ok(job) = jobs.try_recv() {
+    // close() revokes new reservations, but existing permits may still send.
+    // None means both buffered jobs and outstanding permits have drained.
+    while let Some(job) = jobs.blocking_recv() {
         send_reject(out, job, error.to_sample_error());
     }
 }
@@ -446,7 +474,13 @@ pub(crate) fn run(
             }
             let Some(pools) = &mut pools else { continue };
             let pool = &mut pools[turn];
-            let ticket = controller.admit_prepared(&job, &mut data.schedule);
+            let ticket = match controller.admit_prepared(&job, &mut data.schedule) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    send_reject(out, job, error.to_sample_error());
+                    continue;
+                }
+            };
             let admitted = pool.slots.admit_prepared(
                 data.inputs,
                 data.schedule.betas,
@@ -536,6 +570,146 @@ mod tests {
     use crate::slots::SlotJob;
     use crate::{IsingGraph, MetalSampler, SampleParams};
     use quip_solver_core::Sampler;
+
+    #[test]
+    fn shutdown_drains_a_permit_held_across_close() {
+        let (tx, mut jobs) = tokio::sync::mpsc::channel(2);
+        let permit = tx.clone().try_reserve_owned().unwrap();
+        let (out, mut results) = tokio::sync::mpsc::channel(2);
+        let (finished, completion) = mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            jobs.close();
+            reject_tail(
+                Some(job(0, 32)),
+                &mut jobs,
+                &out,
+                &SampleError::Driver("injected fault".into()),
+            );
+            finished.send(()).unwrap();
+        });
+        assert_eq!(
+            results.blocking_recv().unwrap().job_id,
+            0usize.to_le_bytes()
+        );
+        // The first rejection proves that cleanup has closed the receiver.
+        // Keep tx alive: draining must wait for permits, not sender EOF.
+        let early_completion = completion.recv_timeout(Duration::from_millis(50));
+        permit.send(job(1, 32));
+        cleanup.join().unwrap();
+        assert_eq!(early_completion, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(
+            results.blocking_recv().expect("reserved job lost").job_id,
+            1usize.to_le_bytes()
+        );
+        assert!(results.blocking_recv().is_none());
+        assert!(tx.is_closed());
+    }
+
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "host preparation cost informs the fixed worker budget"
+    )]
+    fn preparation_cost_advantage2() {
+        let edges = include_str!("../tests/fixtures/advantage2-system1.edges")
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let mut words = line.split_whitespace();
+                (
+                    words.next().unwrap().parse().unwrap(),
+                    words.next().unwrap().parse().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut job = job(0, 32);
+        let mut rng = 12345u64;
+        let mut draw = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        job.graph = IsingGraph::new(
+            (0..4577)
+                .map(|_| [-1.0, 0.0, 1.0][(draw() % 3) as usize])
+                .collect(),
+            (0..edges.len())
+                .map(|_| if draw() & 1 == 0 { -1.0 } else { 1.0 })
+                .collect(),
+            edges,
+        );
+        job.params.num_reads = 64;
+        let mut preparer = Preparer::default();
+        let settings = CascadeSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        preparer.prepare(&job, settings).unwrap();
+        let start = Instant::now();
+        for _ in 0..1000 {
+            std::hint::black_box(
+                preparer
+                    .prepare(std::hint::black_box(&job), settings)
+                    .unwrap(),
+            );
+        }
+        eprintln!(
+            "Advantage2 preparation: {:.3} us/job (1000 jobs, warm topology, one host thread)",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        let mut preparation = Preparation::new().unwrap();
+        let start = Instant::now();
+        let mut submitted = 0usize;
+        let mut completed = 0usize;
+        loop {
+            while submitted < 4000 && preparation.len() < PREP_BOUND {
+                preparation.submit(
+                    StreamJob {
+                        job_id: submitted.to_le_bytes().to_vec(),
+                        graph: job.graph.clone(),
+                        params: job.params.clone(),
+                        watermark: None,
+                    },
+                    settings,
+                );
+                submitted += 1;
+            }
+            let Some(prepared) = preparation.next() else {
+                break;
+            };
+            assert_eq!(prepared.job.job_id, completed.to_le_bytes());
+            std::hint::black_box(prepared.data.unwrap());
+            completed += 1usize;
+        }
+        assert_eq!(completed, 4000);
+        eprintln!("Advantage2 preparation stage: {:.1} jobs/s ({PREP_WORKERS} workers, 4000 jobs, includes graph copies and cache startup)", completed as f64 / start.elapsed().as_secs_f64());
+    }
+
+    #[test]
+    fn preparation_cache_never_bypasses_changed_topology_or_scalar_limits() {
+        let mut preparer = Preparer::default();
+        let settings = CascadeSettings::default();
+        let mut input = job(0, 32);
+        preparer.prepare(&input, settings).unwrap();
+        input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
+        input.graph.j = vec![1.0; input.graph.edges.len()];
+        assert!(matches!(
+            preparer.prepare(&input, settings),
+            Err(SampleError::TooLarge(_))
+        ));
+        let mut input = job(1, sampler::MAX_SWEEPS + 1);
+        assert!(matches!(
+            preparer.prepare(&input, settings),
+            Err(SampleError::TooLarge(_))
+        ));
+        input.params.num_sweeps = 32;
+        input.graph.j[0] = 0.5;
+        assert!(matches!(
+            preparer.prepare(&input, settings),
+            Err(SampleError::TooLarge(_))
+        ));
+    }
 
     fn job(id: usize, sweeps: usize) -> StreamJob {
         let n = 64;
@@ -705,7 +879,7 @@ mod tests {
             }
         }
         assert!(matches!(results.try_recv(), Err(TryRecvError::Empty)));
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
         // The sender stays open throughout fault cleanup.
         drop(tx);
     }

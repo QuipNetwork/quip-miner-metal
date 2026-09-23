@@ -387,7 +387,7 @@ impl Controller {
     #[cfg(test)]
     pub(crate) fn admit(&mut self, job: &StreamJob) -> (Ticket, Vec<f32>, Vec<usize>) {
         let mut schedule = PreparedSchedule::new(job, self.settings);
-        let ticket = self.admit_prepared(job, &mut schedule);
+        let ticket = self.admit_prepared(job, &mut schedule).unwrap();
         (ticket, schedule.betas, schedule.checkpoints)
     }
 
@@ -395,14 +395,16 @@ impl Controller {
         &mut self,
         job: &StreamJob,
         schedule: &mut PreparedSchedule,
-    ) -> Ticket {
+    ) -> Result<Ticket, crate::sampler::SampleError> {
         // Only settings changes rebuild on the runner. Queued jobs must use
         // the current gate plan, including when the cascade is disabled.
         if schedule.settings.enabled != self.settings.enabled
             || schedule.settings.stages != self.settings.stages
             || schedule.settings.reheat_beta.to_bits() != self.settings.reheat_beta.to_bits()
         {
-            *schedule = PreparedSchedule::new(job, self.settings);
+            let rebuilt = PreparedSchedule::new(job, self.settings);
+            crate::slots::validate_schedule(&rebuilt.betas, &rebuilt.checkpoints)?;
+            *schedule = rebuilt;
         }
         if schedule.checkpoints.len() > 1 {
             if !self.matches_topology(&job.graph) {
@@ -419,7 +421,7 @@ impl Controller {
         if let Some(check) = &mut self.yield_check {
             check.admit();
         }
-        Ticket {
+        Ok(Ticket {
             gates: schedule.checkpoints.len() - 1,
             stage: 0,
             audited: false,
@@ -427,7 +429,7 @@ impl Controller {
             yield_epoch: self.yield_epoch,
             plan: Arc::clone(&self.plan),
             final_sweeps: job.params.num_sweeps,
-        }
+        })
     }
 
     /// Called at a non-last checkpoint. true = keep running.
@@ -555,6 +557,34 @@ impl PreparedSchedule {
     }
 }
 
+// Unit-coupling draws have minimum gap one at every nonzero effective field.
+// Count incident terms instead of tracking Option<f64> minima per endpoint.
+// Keep the library path for every other coefficient domain.
+fn resident_beta_range(graph: &IsingGraph) -> (f64, f64) {
+    if graph.j.len() != graph.edges.len()
+        || graph.j.iter().any(|j| j.abs() != 1.0)
+        || graph.h.iter().any(|&h| h != 0.0 && h.abs() != 1.0)
+    {
+        return default_ising_beta_range(graph);
+    }
+    let n = graph.num_nodes();
+    let mut terms: Vec<usize> = graph.h.iter().map(|&h| usize::from(h != 0.0)).collect();
+    for &(u, v) in &graph.edges {
+        if u < n && v < n {
+            terms[u] += 1;
+            terms[v] += 1;
+        }
+    }
+    let max_eff = terms.iter().copied().max().unwrap_or(0) as f64;
+    if max_eff == 0.0 {
+        return (0.1, 1.0);
+    }
+    let hot = std::f64::consts::LN_2 / (2.0 * max_eff);
+    let gaps = terms.iter().filter(|&&count| count != 0).count() as f64;
+    let cold = (gaps / 0.01).ln() / 2.0;
+    (hot, cold.max(hot))
+}
+
 pub(crate) fn segment_schedule(
     graph: &IsingGraph,
     params: &SampleParams,
@@ -569,7 +599,7 @@ pub(crate) fn segment_schedule(
     checkpoints.push(params.num_sweeps);
     let (hot, cold) = params
         .beta_range
-        .unwrap_or_else(|| default_ising_beta_range(graph));
+        .unwrap_or_else(|| resident_beta_range(graph));
     let valid_reheat = reheat_beta > hot && reheat_beta < cold;
     if !valid_reheat {
         tracing::warn!(
@@ -611,6 +641,96 @@ pub(crate) fn segment_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_beta_range_matches_library_bits_on_draws() {
+        let edges: Vec<(usize, usize)> = include_str!("../tests/fixtures/advantage2-system1.edges")
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let mut nodes = line.split_whitespace();
+                (
+                    nodes.next().unwrap().parse().unwrap(),
+                    nodes.next().unwrap().parse().unwrap(),
+                )
+            })
+            .collect();
+        let mut rng = 12345u64;
+        let mut draw = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for seed in 0..512 {
+            let mut graph = IsingGraph::new(
+                (0..4577)
+                    .map(|_| [-1.0, 0.0, 1.0][(draw() % 3) as usize])
+                    .collect(),
+                (0..edges.len())
+                    .map(|_| if draw() & 1 == 0 { -1.0 } else { 1.0 })
+                    .collect(),
+                edges.clone(),
+            );
+            for nonunit in [false, true] {
+                if nonunit {
+                    graph.j[seed] = [0.0, 0.5, -2.0, 127.0][seed % 4];
+                }
+                let actual = resident_beta_range(&graph);
+                let expected = default_ising_beta_range(&graph);
+                assert_eq!(
+                    (actual.0.to_bits(), actual.1.to_bits()),
+                    (expected.0.to_bits(), expected.1.to_bits())
+                );
+            }
+        }
+        for graph in [
+            IsingGraph::new(vec![], vec![], vec![]),
+            IsingGraph::new(vec![0.0; 3], vec![], vec![]),
+            IsingGraph::new(vec![0.0, -1.0, 0.0], vec![1.0, -1.0], vec![(0, 0), (0, 8)]),
+            IsingGraph::new(vec![f64::NAN], vec![], vec![]),
+        ] {
+            let actual = resident_beta_range(&graph);
+            let expected = default_ising_beta_range(&graph);
+            assert_eq!(
+                (actual.0.to_bits(), actual.1.to_bits()),
+                (expected.0.to_bits(), expected.1.to_bits())
+            );
+        }
+    }
+
+    #[test]
+    fn settings_change_rejects_invalid_rebuilt_schedule() {
+        let old = CascadeSettings {
+            enabled: true,
+            stages: [2, 0, 0],
+            reheat_beta: -1.5,
+            ..Default::default()
+        };
+        let mut params = params(4, 1);
+        params.beta_range = Some((-2.0, -1.0));
+        let job = StreamJob {
+            job_id: vec![1],
+            graph: ring(),
+            params,
+            watermark: None,
+        };
+        let mut schedule = PreparedSchedule::new(&job, old);
+        crate::slots::validate_schedule(&schedule.betas, &schedule.checkpoints).unwrap();
+        let mut controller = Controller::new(old);
+        controller.refresh(CascadeSettings {
+            stages: [1, 0, 0],
+            ..old
+        });
+        assert!(matches!(
+            controller.admit_prepared(&job, &mut schedule),
+            Err(crate::sampler::SampleError::Driver(_))
+        ));
+        assert!(
+            controller.topology.is_none(),
+            "rejection must precede ticket side effects"
+        );
+    }
 
     #[test]
     fn segment_schedule_preserves_legacy_bits() {
@@ -684,7 +804,7 @@ mod tests {
             let mut prepared = PreparedSchedule::new(&job, old);
             let mut controller = Controller::new(old);
             controller.refresh(new);
-            let ticket = controller.admit_prepared(&job, &mut prepared);
+            let ticket = controller.admit_prepared(&job, &mut prepared).unwrap();
             let mut expected = Controller::new(new);
             let (expected_ticket, betas, checkpoints) = expected.admit(&job);
             assert_eq!(prepared.betas, betas);
