@@ -968,6 +968,79 @@ mod tests {
             .collect()
     }
 
+    fn segment_csv_header(intermediate: bool) -> &'static str {
+        if intermediate {
+            "nonce,seed,best_64x32,best_64x256,best_64x14336"
+        } else {
+            "nonce,seed,best_64x32,best_64x14336"
+        }
+    }
+
+    fn assert_segment_csv_row(header: &str, line: &str) {
+        let columns: Vec<_> = header.split(',').collect();
+        let cells: Vec<_> = line.split(',').collect();
+        assert_eq!(cells.len(), columns.len());
+        let seed_index = columns
+            .iter()
+            .position(|&column| column == "seed")
+            .expect("seed column");
+        let seed = cells[seed_index];
+        assert_eq!(seed.len(), 64, "64-hex instance seed");
+        assert!(
+            seed.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "lowercase hex instance seed"
+        );
+    }
+
+    fn segment_csv_row(nonce: usize, seed: &[u8; 32], energies: &[Option<i64>]) -> String {
+        use std::fmt::Write;
+
+        let mut line = format!("{nonce},");
+        for byte in seed {
+            write!(line, "{byte:02x}").unwrap();
+        }
+        for energy in energies {
+            write!(line, ",{}", energy.expect("checkpoint energy in milli")).unwrap();
+        }
+        line
+    }
+
+    #[test]
+    fn seeded_segment_csv_requires_instance_seed() {
+        for intermediate in [false, true] {
+            let header = segment_csv_header(intermediate);
+            assert_eq!(header.split(',').nth(1), Some("seed"));
+            let energies = if intermediate { "-1,-2,-3" } else { "-1,-3" };
+            let seed = "0123456789abcdef".repeat(4);
+            let values = if intermediate {
+                vec![Some(-1), Some(-2), Some(-3)]
+            } else {
+                vec![Some(-1), Some(-3)]
+            };
+            let line = segment_csv_row(7, &parse_seed(&seed), &values);
+            assert_eq!(line, format!("7,{seed},{energies}"));
+            assert_segment_csv_row(header, &line);
+            for invalid in [
+                String::new(),
+                "0".repeat(63),
+                "0".repeat(65),
+                "A".repeat(64),
+                "g".repeat(64),
+            ] {
+                assert!(std::panic::catch_unwind(|| {
+                    assert_segment_csv_row(header, &format!("7,{invalid},{energies}"));
+                })
+                .is_err());
+            }
+            let missing = header.replace(",seed", "");
+            assert!(std::panic::catch_unwind(|| {
+                assert_segment_csv_row(&missing, &format!("7,{energies}"));
+            })
+            .is_err());
+        }
+    }
+
     #[test]
     #[ignore = "seeded segment calibration; run only on the controller's GPU"]
     #[expect(
@@ -1032,11 +1105,7 @@ mod tests {
                 } else {
                     vec![32, 14_336]
                 };
-                let header = if intermediate {
-                    "nonce,best_64x32,best_64x256,best_64x14336"
-                } else {
-                    "nonce,best_64x32,best_64x14336"
-                };
+                let header = segment_csv_header(intermediate);
                 writeln!(csv, "{header}").unwrap();
                 let mut completed = 0;
                 for (batch, chunk) in seeds.chunks(pool.capacity()).enumerate() {
@@ -1077,13 +1146,8 @@ mod tests {
                             } else {
                                 prefix[nonce] = row[0];
                             }
-                            let mut line = nonce.to_string();
-                            for energy in row {
-                                use std::fmt::Write;
-                                write!(line, ",{}", energy.expect("checkpoint energy in milli"))
-                                    .unwrap();
-                            }
-                            assert_eq!(line.split(',').count(), header.split(',').count());
+                            let line = segment_csv_row(nonce, &seeds[nonce], row);
+                            assert_segment_csv_row(header, &line);
                             writeln!(csv, "{line}").unwrap();
                             pool.release(checkpoint.slot).unwrap();
                             completed += 1;
