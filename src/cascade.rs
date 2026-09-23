@@ -350,16 +350,18 @@ impl Relay {
         let busy = self.cost_us / 1e6 / elapsed;
         let slack = (0.9 - busy).max(0.0) / 0.9;
         for stage in 0..self.cutoffs.len() - 1 {
-            let queued_next = self
-                .ready
-                .iter()
-                .filter(|job| {
-                    self.active
-                        .get(&job.job_id)
-                        .is_some_and(|a| a.stage == stage + 1)
-                })
+            // Count the next stage's jobs wherever they are: queued here, in the
+            // inner channel, or on the GPU. The relay tracks at most 2 * width
+            // jobs and the inner side absorbs about that many, so the ready queue
+            // alone stays near empty. A next stage holding more than half a
+            // stream width of the tracked jobs is falling behind.
+            let at_next = self
+                .active
+                .values()
+                .filter(|a| a.stage == stage + 1)
                 .count();
-            let backlog = (queued_next as f64 / (2 * self.width) as f64).max(1.0).ln();
+            let reference = (self.width / 2).max(1);
+            let backlog = (at_next as f64 / reference as f64).max(1.0).ln();
             let cutoff = &mut self.cutoffs[stage];
             let error = if backlog == 0.0 && slack == 0.0 {
                 -cutoff.log_adjust()
@@ -844,13 +846,19 @@ mod tests {
 
     #[test]
     fn load_feedback_loosens_tightens_and_decays() {
-        let mut relay = Relay::new(CascadeSettings::default(), 1);
+        let width = 4;
+        let mut relay = Relay::new(CascadeSettings::default(), width);
         relay.window = Instant::now() - Duration::from_secs(1);
         relay.update_load();
         assert!(relay.cutoffs[0].log_adjust() < 0.0);
         relay.cutoffs[0].reset();
-        for id in 0..4 {
+        // Stay inside the admission cap of 2 * width; three next-stage jobs
+        // exceed the reference depth of width / 2.
+        for id in 0..width as u64 {
             relay.admit(job(id, 1024));
+        }
+        assert!(relay.active.len() < 2 * width);
+        for id in 0..3u64 {
             relay
                 .active
                 .get_mut(id.to_le_bytes().as_slice())
@@ -862,7 +870,9 @@ mod tests {
         relay.update_load();
         let positive = relay.cutoffs[0].log_adjust();
         assert!(positive > 0.0);
-        relay.ready.clear();
+        for a in relay.active.values_mut() {
+            a.stage = 0;
+        }
         relay.cost_us = 2e6;
         relay.window = Instant::now() - Duration::from_secs(1);
         relay.update_load();
