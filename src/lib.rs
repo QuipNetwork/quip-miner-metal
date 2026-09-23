@@ -331,21 +331,8 @@ impl quip_solver_core::Sampler for MetalSampler {
         // behavior, so the dependency is made explicit in the signature. The
         // governor is passed whole (not just a throttle closure) because sizing
         // is a loop: the stream reports its GPU time back through it.
-        if self.kernel == Kernel::Msa {
-            tracing::info!("cascade relay started");
-            cascade::run(
-                &self.cascade,
-                jobs,
-                &out,
-                &cancel,
-                self.stream_width(),
-                |rx, tx| {
-                    streaming::run_stream(&self.device, self.kernel, rx, &tx, &self.gov, &cancel);
-                },
-            );
-        } else {
-            streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
-        }
+        // Task 5 replaces cascade-on streams with the resident runner.
+        streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
     }
 
     fn stream_width(&self) -> usize {
