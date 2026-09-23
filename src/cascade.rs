@@ -478,11 +478,11 @@ impl Controller {
 
     /// Called once per job with its final best (None for error or cancel).
     pub(crate) fn finish(&mut self, ticket: &Ticket, best: Option<i64>, delivered: bool) {
-        if ticket.topology_epoch != self.topology_epoch {
-            return;
-        }
         if let Some(best) = best {
-            if ticket.stage == ticket.gates && ticket.gates > 0 {
+            if ticket.topology_epoch == self.topology_epoch
+                && ticket.stage == ticket.gates
+                && ticket.gates > 0
+            {
                 let mut plan = ticket.plan.lock().unwrap_or_else(|p| p.into_inner());
                 Self::observe_transition(&mut plan, ticket, best);
                 let final_index = plan.cutoffs.len() - 1;
@@ -1512,6 +1512,115 @@ mod tests {
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
         let (hits, bound) = c.yield_check.as_ref().unwrap().observation();
         assert_eq!(hits, 1.0);
+        assert!((bound - (30f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn late_topology_result_counts_yield_without_training_either_plan() {
+        let mut c = Controller::new(CascadeSettings {
+            target_milli: Some(-100),
+            yield_per_million: Some(10_000_000.0),
+            ..CascadeSettings::default()
+        });
+        let (mut ticket, _, _) = c.admit(&job(0, 1000));
+        ticket.stage = ticket.gates;
+        let old_plan = Arc::clone(&ticket.plan);
+        let mut changed = job(1, 1000);
+        changed.graph.h.push(0.0);
+        c.admit(&changed);
+        c.finish(&ticket, Some(-100), true);
+        let (hits, bound) = c.yield_check.as_ref().unwrap().observation();
+        assert_eq!(hits, 1.0);
+        assert!((bound - (20f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
+        for plan in [&old_plan, &c.plan] {
+            assert!(plan
+                .lock()
+                .unwrap()
+                .cutoffs
+                .iter()
+                .all(|cutoff| cutoff.moments().count() == 0));
+        }
+        c.refresh(CascadeSettings {
+            target_milli: Some(-200),
+            ..c.settings
+        });
+        c.finish(&ticket, Some(-300), true);
+        assert_eq!(c.yield_check.as_ref().unwrap().observation(), (0.0, 0.0));
+    }
+
+    fn run_topologies(controller: Controller, jobs: Vec<StreamJob>) -> Controller {
+        struct Governor;
+        impl crate::streaming::GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let device = crate::metal_device::MetalDevice::open(0).unwrap();
+        let count = jobs.len();
+        let (tx, rx) = tokio::sync::mpsc::channel(count);
+        let (out, mut results) = tokio::sync::mpsc::channel(count);
+        for job in jobs {
+            tx.try_send(job).unwrap();
+        }
+        drop(tx);
+        let settings = Mutex::new(controller.settings);
+        let store = Mutex::new(Some(controller));
+        crate::resident::run(
+            &device,
+            &settings,
+            &store,
+            rx,
+            &out,
+            &Governor,
+            &quip_solver_core::CancelToken::default(),
+        );
+        for _ in 0..count {
+            assert!(matches!(
+                results.try_recv().unwrap().outcome,
+                quip_solver_core::StreamOutcome::Completed(Ok(_))
+            ));
+        }
+        store.into_inner().unwrap().unwrap()
+    }
+
+    #[test]
+    fn runner_preserves_trained_a_across_gate_free_b_and_back() {
+        let mut c = Controller::new(CascadeSettings::default());
+        let input = job(0, 64);
+        for _ in 0..200 {
+            let (mut ticket, _, _) = c.admit(&input);
+            c.checkpoint(&mut ticket, 0);
+        }
+        let plan = Arc::clone(&c.plan);
+        let epoch = c.topology_epoch;
+        let mut short = job(1, 32);
+        short.graph.h.push(0.0);
+        let c = run_topologies(c, vec![input, short, job(2, 64)]);
+        assert!(Arc::ptr_eq(&plan, &c.plan));
+        assert_eq!(c.topology_epoch, epoch);
+        assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 202);
+    }
+
+    #[test]
+    fn runner_preserves_yield_across_gated_topology_change() {
+        let mut c = Controller::new(CascadeSettings {
+            target_milli: Some(i64::MAX),
+            yield_per_million: Some(10_000_000.0),
+            ..CascadeSettings::default()
+        });
+        let (ticket, _, _) = c.admit(&job(0, 32));
+        c.finish(&ticket, Some(0), true);
+        let epoch = c.yield_epoch;
+        let mut changed = job(2, 64);
+        changed.graph.h.push(0.0);
+        let c = run_topologies(c, vec![job(1, 64), changed]);
+        assert_eq!(c.yield_epoch, epoch);
+        let (hits, bound) = c.yield_check.as_ref().unwrap().observation();
+        assert_eq!(hits, 3.0);
         assert!((bound - (30f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
     }
 

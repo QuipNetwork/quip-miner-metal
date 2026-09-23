@@ -123,13 +123,6 @@ fn validate(job: &StreamJob) -> Result<(), SampleError> {
             "resident job exceeds node or sweep limit".into(),
         ));
     }
-    if (job.params.num_sweeps == 0 || job.graph.num_nodes() == 0)
-        && sampler::device_energy_exact(&job.graph)
-    {
-        return Err(SampleError::TooLarge(
-            "resident jobs require nonzero nodes and sweeps".into(),
-        ));
-    }
     if job.graph.j.len() != job.graph.edges.len() {
         return Err(SampleError::TooLarge(
             "resident jobs require one coefficient per edge".into(),
@@ -140,7 +133,7 @@ fn validate(job: &StreamJob) -> Result<(), SampleError> {
 
 pub(crate) struct Prepared {
     pub(crate) job: StreamJob,
-    /// None selects the non-slot, host-rescored path after ordinary validation.
+    /// None selects the non-slot path, including direct empty-graph answers.
     pub(crate) data: Result<Option<PreparedData>, SampleError>,
 }
 
@@ -160,8 +153,11 @@ impl Preparer {
         job: &StreamJob,
         settings: CascadeSettings,
     ) -> Result<Option<PreparedData>, SampleError> {
+        if job.graph.num_nodes() == 0 {
+            return Ok(None);
+        }
         validate(job)?;
-        if !sampler::device_energy_exact(&job.graph) {
+        if job.params.num_sweeps == 0 || !sampler::device_energy_exact(&job.graph) {
             sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
             return Ok(None);
         }
@@ -370,7 +366,7 @@ fn reject_preparation(
     );
 }
 
-fn run_non_exact(
+fn run_fallback(
     device: &MetalDevice,
     job: StreamJob,
     out: &Sender<StreamResult>,
@@ -380,7 +376,14 @@ fn run_non_exact(
     let mut device_access_time_us = 0;
     let result = (|| {
         let mut batch = sampler::encode_batch(device, &[&job.graph], &job.params, Kernel::Msa, 1)?;
-        while batch.commit_next(|| out.is_closed() || cancel.is_cancelled(job.watermark)) {
+        for _ in 0..batch.chunk_count() {
+            if out.is_closed() || cancel.is_cancelled(job.watermark) {
+                break;
+            }
+            crate::streaming::yield_gate(out, gov);
+            if !batch.commit_next(|| out.is_closed() || cancel.is_cancelled(job.watermark)) {
+                break;
+            }
             batch.wait_until_completed();
         }
         device_access_time_us = batch.gpu_time_us();
@@ -519,6 +522,10 @@ pub(crate) fn run(
             let mut data = match data {
                 Ok(Some(data)) => data,
                 Ok(None) => {
+                    if job.graph.num_nodes() == 0 {
+                        crate::streaming::answer_empty(out, job);
+                        continue;
+                    }
                     // Run on the Metal-owning runner only after live slots drain,
                     // so a rare full-budget fallback cannot stall slot stepping.
                     if !empty {
@@ -529,7 +536,7 @@ pub(crate) fn run(
                         break;
                     }
                     let started = Instant::now();
-                    let result = run_non_exact(device, job, out, gov, cancel);
+                    let result = run_fallback(device, job, out, gov, cancel);
                     // Fallback time belongs to the governor, not cascade load.
                     window += started.elapsed();
                     if let Err(error) = result {
@@ -560,9 +567,6 @@ pub(crate) fn run(
                     .and_then(|a| Pool::new(device, &job, capacity).map(|b| [a, b]));
                 match rebuilt {
                     Ok(rebuilt) => {
-                        if !controller.matches_topology(&job.graph) {
-                            controller = Controller::new(config);
-                        }
                         pools = Some(rebuilt);
                     }
                     Err(error) => {
@@ -613,10 +617,7 @@ pub(crate) fn run(
                 for pool in pools.iter() {
                     pool.slots.wait();
                 }
-                let deadline = Instant::now() + Duration::from_millis(500);
-                while !out.is_closed() && gov.should_throttle() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+                crate::streaming::yield_gate(out, gov);
             }
             if out.is_closed() {
                 break;
@@ -887,7 +888,14 @@ mod tests {
             assert_ne!(worker.thread().id(), std::thread::current().id());
         }
         for id in 0..PREP_BOUND {
-            let mut job = job(id, if id % 3 == 0 { 0 } else { 64 });
+            let mut job = job(
+                id,
+                if id % 3 == 0 {
+                    sampler::MAX_SWEEPS + 1
+                } else {
+                    64
+                },
+            );
             if id % 2 == 0 {
                 job.graph.edges.swap(0, 1);
             }
@@ -1159,6 +1167,123 @@ mod tests {
     }
 
     #[test]
+    fn zero_sweeps_select_batch_in_both_coefficient_domains() {
+        let mut preparer = Preparer::default();
+        for coefficient in [1.0, 0.5] {
+            let mut input = job(0, 0);
+            input.graph.j[0] = coefficient;
+            assert!(preparer
+                .prepare(&input, CascadeSettings::default())
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn public_stream_preserves_empty_and_zero_sweep_results() {
+        let device = MetalDevice::open(0).unwrap();
+        let mut inputs = Vec::new();
+        let mut expected = Vec::new();
+        for coefficient in [1.0, 0.5] {
+            let mut input = job(inputs.len(), 0);
+            input.graph.j[0] = coefficient;
+            expected.push(
+                sampler::sample_ising(&device, &input.graph, &input.params, Kernel::Msa).unwrap(),
+            );
+            inputs.push(input);
+        }
+        for reads in [0, 3] {
+            let mut input = job(inputs.len(), 0);
+            input.graph = IsingGraph::new(vec![], vec![], vec![]);
+            input.params.num_reads = reads;
+            expected.push(
+                (0..reads.max(1))
+                    .map(|_| quip_solver_core::SamplerResult {
+                        spins: vec![],
+                        energy_milli: 0,
+                    })
+                    .collect(),
+            );
+            inputs.push(input);
+        }
+        let count = inputs.len();
+        let sampler = MetalSampler::new(
+            device,
+            crate::iokit_gov::UtilGovernor::start(0, 100, false),
+            Kernel::Msa,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(count);
+        let (out, mut results) = tokio::sync::mpsc::channel(count);
+        for input in inputs {
+            tx.try_send(input).unwrap();
+        }
+        drop(tx);
+        sampler.sample_stream(rx, out, CancelToken::default());
+        for (id, reads) in expected.into_iter().enumerate() {
+            let result = results.blocking_recv().unwrap();
+            assert_eq!(result.job_id, id.to_le_bytes());
+            match result.outcome {
+                StreamOutcome::Completed(Ok(actual)) => assert_eq!(actual, reads),
+                StreamOutcome::Completed(Err(error)) => panic!("{error}"),
+                StreamOutcome::Cancelled => panic!("unexpected cancellation"),
+            }
+            if id >= 2 {
+                assert_eq!(result.device_access_time_us, 0);
+            }
+        }
+        assert!(results.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn fallback_consults_throttling_governor_before_submission() {
+        use std::cell::Cell;
+        struct Governor {
+            checks: Cell<usize>,
+            reported: Cell<u64>,
+            start: Instant,
+        }
+        impl GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                self.checks.set(self.checks.get() + 1);
+                self.checks.get() <= 2
+            }
+            fn budget_scale(&self) -> f64 {
+                1.0
+            }
+            fn record_gpu_busy_us(&self, us: u64) {
+                assert!(self.checks.get() >= 3);
+                assert!(self.start.elapsed() >= Duration::from_millis(50));
+                self.reported.set(self.reported.get() + us);
+            }
+        }
+        let device = MetalDevice::open(0).unwrap();
+        let governor = Governor {
+            checks: Cell::new(0),
+            reported: Cell::new(0),
+            start: Instant::now(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (out, mut results) = tokio::sync::mpsc::channel(1);
+        let mut input = job(0, 32);
+        input.graph.j[0] = 0.5;
+        tx.try_send(input).unwrap();
+        drop(tx);
+        run(
+            &device,
+            &Mutex::new(CascadeSettings::default()),
+            &Mutex::new(None),
+            rx,
+            &out,
+            &governor,
+            &CancelToken::default(),
+        );
+        let result = results.try_recv().unwrap();
+        assert!(matches!(result.outcome, StreamOutcome::Completed(Ok(_))));
+        assert!(result.device_access_time_us > 0);
+        assert_eq!(governor.reported.get(), result.device_access_time_us);
+    }
+
+    #[test]
     fn invalid_admissions_fail_before_allocating_schedules() {
         let mut invalid = job(0, sampler::MAX_SWEEPS + 1);
         assert_eq!(
@@ -1166,10 +1291,7 @@ mod tests {
             quip_solver_core::SampleError::Capacity
         );
         invalid.params.num_sweeps = 0;
-        assert_eq!(
-            validate(&invalid).unwrap_err().to_sample_error(),
-            quip_solver_core::SampleError::Capacity
-        );
+        validate(&invalid).unwrap();
         invalid.params.num_sweeps = 32;
         invalid.graph.j.pop();
         assert_eq!(

@@ -346,6 +346,25 @@ fn chunk_plan(
     let num_betas = dims.num_betas.max(1);
     let per_beta =
         (dims.num_threads as f64) * (dims.sweeps_per.max(1) as f64) * (dims.n.max(1) as f64);
+    let betas_per_chunk = dispatch_beta_limit(kernel, per_beta, groups, in_flight, num_betas);
+
+    let mut plan = Vec::new();
+    let mut start = 0;
+    while start < num_betas {
+        let count = betas_per_chunk.min(num_betas - start);
+        plan.push((start, count));
+        start += count;
+    }
+    plan
+}
+
+fn dispatch_beta_limit(
+    kernel: Kernel,
+    per_beta: f64,
+    groups: usize,
+    in_flight: usize,
+    num_betas: i32,
+) -> i32 {
     // Concurrent batches share the aggregate rate at their combined occupancy.
     // Reserve the full stream window even while priming or draining it.
     let in_flight = in_flight.max(1);
@@ -356,17 +375,19 @@ fn chunk_plan(
         clippy::cast_possible_truncation,
         reason = "clamped to 1..=num_betas immediately below"
     )]
-    let betas_per_chunk =
-        ((budget / per_beta.max(1.0)).floor() as i64).clamp(1, i64::from(num_betas)) as i32;
+    let limit = ((budget / per_beta.max(1.0)).floor() as i64).clamp(1, i64::from(num_betas)) as i32;
+    limit
+}
 
-    let mut plan = Vec::new();
-    let mut start = 0;
-    while start < num_betas {
-        let count = betas_per_chunk.min(num_betas - start);
-        plan.push((start, count));
-        start += count;
-    }
-    plan
+/// Bound slot commands with the batch estimate, reserving both resident pools.
+pub(crate) fn msa_step_limit(n: usize, groups: usize, slice: usize) -> usize {
+    dispatch_beta_limit(
+        Kernel::Msa,
+        groups as f64 * n.max(1) as f64,
+        groups,
+        2,
+        slice.clamp(1, MAX_SWEEPS) as i32,
+    ) as usize
 }
 
 /// Whether Gibbs uses the chromatic (node-parallel) kernel — the default.
@@ -2869,6 +2890,38 @@ mod tests {
             let shared = chunk_plan(kernel, &dims, groups, 2)[0].1;
             assert_eq!(shared, (solo / 2).max(1), "{kernel:?}");
         }
+    }
+
+    #[test]
+    fn resident_step_limit_matches_two_in_flight_batch_chunks() {
+        for n in [64, 4577, MSA_MAX_NODES] {
+            for groups in [1, 2, 20, 80, 512] {
+                for slice in [1, 32, MAX_SWEEPS, usize::MAX] {
+                    let dims = BatchDims {
+                        n,
+                        num_betas: slice.min(MAX_SWEEPS) as i32,
+                        sweeps_per: 1,
+                        base_seed: 1,
+                        num_threads: groups,
+                        num_problems: groups,
+                        num_reads: MSA_LANES,
+                        packed_size: n.div_ceil(8),
+                    };
+                    let limit = msa_step_limit(n, groups, slice);
+                    assert_eq!(
+                        limit,
+                        chunk_plan(Kernel::Msa, &dims, groups, 2)[0].1 as usize
+                    );
+                    assert!((1..=slice.min(MAX_SWEEPS)).contains(&limit));
+                    let work = limit as f64 * groups as f64 * n as f64;
+                    let budget = TARGET_DISPATCH_MS / 1000.0
+                        * estimated_updates_per_sec(Kernel::Msa, groups * 2)
+                        / 2.0;
+                    assert!(work <= budget || limit == 1);
+                }
+            }
+        }
+        assert!(msa_step_limit(4577, 80, MAX_SWEEPS) < MAX_SWEEPS);
     }
 
     /// Chunk boundaries fall on rung boundaries, and every carry-over (the

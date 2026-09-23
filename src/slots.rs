@@ -401,6 +401,7 @@ impl SlotPool {
         if slice == 0 {
             return Err(SampleError::Driver("slot slice must be nonzero".into()));
         }
+        let slice = sampler::msa_step_limit(self.cached.n, self.live() * self.words, slice);
         self.steps.clear();
         for (slot, resident) in self.slots.iter().enumerate() {
             let Some(r) = resident else {
@@ -1793,6 +1794,12 @@ mod tests {
     fn slot_step_layout_matches_msl() {
         assert_eq!(std::mem::size_of::<SlotStep>(), 24);
         assert_eq!(std::mem::align_of::<SlotStep>(), 4);
+        assert_eq!(std::mem::offset_of!(SlotStep, slot), 0);
+        assert_eq!(std::mem::offset_of!(SlotStep, beta_start), 4);
+        assert_eq!(std::mem::offset_of!(SlotStep, beta_count), 8);
+        assert_eq!(std::mem::offset_of!(SlotStep, num_betas), 12);
+        assert_eq!(std::mem::offset_of!(SlotStep, seed), 16);
+        assert_eq!(std::mem::offset_of!(SlotStep, flags), 20);
     }
 
     #[test]
@@ -1890,6 +1897,79 @@ mod tests {
         assert_eq!(full, run(32));
         assert_eq!(full, run(16));
         assert_eq!(full, run(4));
+    }
+
+    #[test]
+    fn large_first_checkpoint_has_bounded_steps_and_identical_reads() {
+        let device = MetalDevice::open(0).unwrap();
+        let graph = advantage2_system1(7);
+        let limit = sampler::msa_step_limit(graph.num_nodes(), WORDS, sampler::MAX_SWEEPS);
+        let first = limit + 17;
+        let total = first + 31;
+        assert!(total <= sampler::MAX_SWEEPS);
+        let schedule = build_beta_schedule(&graph, total, 1, None).0;
+        let mut pool = SlotPool::new(&device, &graph, READS, 1, total).unwrap();
+        pool.admit(SlotJob {
+            graph: graph.clone(),
+            schedule: schedule.clone(),
+            checkpoints: vec![first, total],
+            seed: 99,
+        })
+        .unwrap();
+        let mut position = 0;
+        let mut commands = 0;
+        let mut reference_steps = Vec::new();
+        for (index, checkpoint) in [first, total].into_iter().enumerate() {
+            let start = if index == 0 { 0 } else { first };
+            let mut reference_step = step(
+                0,
+                99,
+                start as i32,
+                (checkpoint - start) as i32,
+                total as i32,
+            );
+            reference_step.flags = SLOT_WRITE_OUTPUT;
+            reference_steps.push(vec![reference_step]);
+            loop {
+                let checkpoints = finish_step(&mut pool, first);
+                let actual = pool.steps[0];
+                assert_eq!(actual.beta_start as usize, position);
+                assert!((1..=limit).contains(&(actual.beta_count as usize)));
+                position += actual.beta_count as usize;
+                commands += 1;
+                if position < checkpoint {
+                    assert!(checkpoints.is_empty());
+                    assert_eq!(actual.flags, 0);
+                    continue;
+                }
+                assert_eq!(position, checkpoint);
+                assert_eq!(checkpoints.len(), 1);
+                assert_eq!(
+                    (checkpoints[0].index, checkpoints[0].last),
+                    (index, index == 1)
+                );
+                let (energies, samples) = dispatch_slots(
+                    &device,
+                    std::slice::from_ref(&graph),
+                    std::slice::from_ref(&schedule),
+                    &reference_steps,
+                );
+                let packed_size = graph.num_nodes().div_ceil(8);
+                for (read, actual) in pool.reads(0, READS).unwrap().iter().enumerate() {
+                    assert_eq!(actual.energy_milli, i64::from(energies[read]));
+                    assert_eq!(
+                        actual.spins,
+                        unpack_spins(
+                            &samples[read * packed_size..(read + 1) * packed_size],
+                            graph.num_nodes()
+                        )
+                    );
+                }
+                break;
+            }
+        }
+        assert!(commands > 2);
+        assert_eq!(pool.slots[0].as_ref().unwrap().job.schedule, schedule);
     }
 
     #[test]

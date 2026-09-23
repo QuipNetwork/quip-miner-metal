@@ -10,7 +10,8 @@ Metal MSA streams always use the resident runner. No key turns it off. An old
 Gibbs binaries do not run the cascade. The Apple Neural Engine sampler runs
 full-budget jobs on a separate path.
 
-Jobs whose coefficients are not whole units use the batch path. The runner
+Jobs whose coefficients have no exact device-energy form use the batch path.
+Fractional coefficients are one example. The runner
 drains live slots, then runs each such job once at full budget. The batch path
 rescores its reads on the host and returns one result. It does not screen
 these jobs.

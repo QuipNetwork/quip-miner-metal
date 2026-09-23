@@ -25,8 +25,9 @@ using namespace metal;
 // - Geometric thresholds are drawn inline from a 32-bit RNG per word update.
 //
 // Preconditions the host checks: J in {-1, 0, +1}, |h| <= 1, CSR degree
-// <= MSA_MAX_DEG. On the last chunk the kernel writes each read's energy in
-// milli units to final_energies. The value equals energy_milli whenever every
+// <= MSA_MAX_DEG. The batch entry writes each read's energy on the last chunk;
+// slot steps write it at flagged checkpoints, in milli units to final_energies.
+// The value equals energy_milli whenever every
 // coefficient is a whole number in int8 range; the host checks that and
 // rescores otherwise.
 

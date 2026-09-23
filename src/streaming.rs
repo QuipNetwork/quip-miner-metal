@@ -340,19 +340,23 @@ impl StreamCtx<'_> {
     /// the miner keeps running at a smaller size instead of stopping and
     /// starting.
     fn yield_gate(&self) {
-        if !self.gov.should_throttle() {
-            return;
-        }
-        tracing::debug!("yield gate: pausing");
-        let deadline = Instant::now() + THROTTLE_MAX_PAUSE;
-        while !self.out.is_closed() && Instant::now() < deadline && self.gov.should_throttle() {
-            std::thread::sleep(THROTTLE_PAUSE);
-        }
+        yield_gate(self.out, self.gov);
+    }
+}
+
+pub(crate) fn yield_gate(out: &Sender<StreamResult>, gov: &dyn GpuGovernor) {
+    if !gov.should_throttle() {
+        return;
+    }
+    tracing::debug!("yield gate: pausing");
+    let deadline = Instant::now() + THROTTLE_MAX_PAUSE;
+    while !out.is_closed() && Instant::now() < deadline && gov.should_throttle() {
+        std::thread::sleep(THROTTLE_PAUSE);
     }
 }
 
 /// Emit an empty-graph job's answer directly (no GPU work needed).
-fn answer_empty(out: &Sender<StreamResult>, job: StreamJob) {
+pub(crate) fn answer_empty(out: &Sender<StreamResult>, job: StreamJob) {
     let reads = job.params.num_reads.max(1);
     if out
         .blocking_send(StreamResult {

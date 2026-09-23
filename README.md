@@ -76,8 +76,9 @@ Four workers prepare jobs before admission. The sampler saves controller
 state between streams for the process lifetime.
 
 No configuration turns the cascade off. A leftover `cascade` key logs the
-unknown-field warning. Jobs whose coefficients are not whole units run once
-at full budget through the batch path after live slots drain.
+unknown-field warning. Jobs whose coefficients have no exact device-energy
+form run once at full budget through the batch path after live slots drain.
+Fractional coefficients are one example.
 Other kernels and the Apple Neural Engine use separate paths.
 
 | key | default | purpose |
