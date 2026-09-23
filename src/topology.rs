@@ -354,11 +354,40 @@ fn quantize_i8(v: f64) -> i8 {
 /// assert_eq!(j_csr.iter().filter(|&&v| v != 0).count(), 8);
 /// ```
 pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>, Vec<i8>) {
+    fill_h_j_inspecting_edges(topology, graph, |_, _| {})
+}
+
+/// Compare the exact ordered edges during coefficient construction, avoiding
+/// a separate topology walk. No coefficients escape on a mismatch.
+pub(crate) fn fill_h_j_matching(
+    topology: &SelfFeedingTopology,
+    edges: &[(usize, usize)],
+    graph: &IsingGraph,
+) -> Option<(Vec<i8>, Vec<i8>)> {
+    if graph.num_nodes() != topology.n
+        || graph.edges.len() != edges.len()
+        || topology.edge_pos.len() != edges.len()
+    {
+        return None;
+    }
+    let mut matches = true;
+    let coefficients = fill_h_j_inspecting_edges(topology, graph, |k, edge| {
+        matches &= edges[k] == edge;
+    });
+    matches.then_some(coefficients)
+}
+
+fn fill_h_j_inspecting_edges(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+    mut inspect: impl FnMut(usize, (usize, usize)),
+) -> (Vec<i8>, Vec<i8>) {
     let mut j_csr = vec![0i8; topology.nnz];
     for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
         let Some(&(u, v)) = graph.edges.get(k) else {
             continue;
         };
+        inspect(k, (u, v));
         if u >= topology.n || v >= topology.n {
             continue;
         }
@@ -375,6 +404,27 @@ pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matching_coefficients_require_exact_topology() {
+        let graph = g();
+        let topology = SelfFeedingTopology::build(&graph);
+        assert_eq!(
+            fill_h_j_matching(&topology, &graph.edges, &graph).unwrap(),
+            fill_h_j(&topology, &graph)
+        );
+        let mut changed = graph.clone();
+        changed.edges.swap(0, 1);
+        assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
+        changed = graph.clone();
+        changed.edges[0] = (0, 2);
+        assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
+        changed.edges.pop();
+        assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
+        changed = graph.clone();
+        changed.h.pop();
+        assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
+    }
 
     fn g() -> IsingGraph {
         // Small ring: 0-1-2-3-0, unit J, ternary h.

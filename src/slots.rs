@@ -8,7 +8,7 @@
 
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, BufferPool, CachedTopology, Kernel, SampleError, MSA_THREADS};
-use crate::topology::fill_h_j;
+use crate::topology::fill_h_j_matching;
 use crate::{IsingGraph, SampleParams, SamplerResult};
 use metal::{MTLCommandBufferStatus, MTLSize};
 use std::sync::Arc;
@@ -47,6 +47,23 @@ impl SlotJob {
 }
 
 pub(crate) type SlotId = usize;
+
+fn checked_read_pointer<T>(
+    contents: *mut std::ffi::c_void,
+    length: u64,
+    count: usize,
+) -> Result<*const T, SampleError> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<T>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| SampleError::Driver("slot read size overflow".into()))?;
+    if contents.is_null() || length < bytes as u64 {
+        return Err(SampleError::Driver(
+            "slot read buffer is null or too short".into(),
+        ));
+    }
+    Ok(contents.cast())
+}
 
 pub(crate) struct Checkpoint {
     pub(crate) slot: SlotId,
@@ -153,10 +170,12 @@ impl SlotPool {
         })
     }
 
+    /// Optional routing query. Admission checks topology itself, so callers
+    /// targeting this pool need not call matches first.
     pub(crate) fn matches(&self, graph: &IsingGraph, num_reads: usize) -> bool {
         self.cached.n == graph.num_nodes()
-            && self.cached.edges == graph.edges
             && self.num_reads == num_reads
+            && self.cached.edges == graph.edges
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -188,6 +207,11 @@ impl SlotPool {
             .ok_or_else(|| SampleError::Driver(format!("missing slot buffer {index}")))
     }
 
+    fn read_pointer<T>(&self, index: u64, count: usize) -> Result<*const T, SampleError> {
+        let buffer = self.buffer(index)?;
+        checked_read_pointer(buffer.contents(), buffer.length(), count)
+    }
+
     fn write<T: Copy>(&self, index: u64, offset: usize, values: &[T]) -> Result<(), SampleError> {
         let buf = self.buffer(index)?;
         let bytes = std::mem::size_of_val(values);
@@ -216,20 +240,19 @@ impl SlotPool {
         Ok(())
     }
 
+    /// Validate topology exactly during coefficient construction. Callers can
+    /// admit directly without a prior matches query or a topology hash.
     pub(crate) fn admit(&mut self, job: SlotJob) -> Result<SlotId, SampleError> {
         self.idle()?;
         job.validate(self.sched_stride)?;
-        if !self.matches(&job.graph, self.num_reads) {
-            return Err(SampleError::Driver(
-                "job topology differs from slot pool".into(),
-            ));
-        }
         let slot = self
             .slots
             .iter()
             .position(Option::is_none)
             .ok_or_else(|| SampleError::TooLarge("slot pool is full".into()))?;
-        let (couplings, fields) = fill_h_j(&self.cached.topo, &job.graph);
+        let (couplings, fields) =
+            fill_h_j_matching(&self.cached.topo, &self.cached.edges, &job.graph)
+                .ok_or_else(|| SampleError::Driver("job topology differs from slot pool".into()))?;
         self.write(2, slot * self.cached.topo.nnz, &couplings)?;
         self.write(15, slot * self.cached.n, &fields)?;
         self.write(9, slot * self.sched_stride, &job.schedule)?;
@@ -351,6 +374,7 @@ impl SlotPool {
             ));
         }
         let share = sampler::gpu_time_us(command) / self.steps.len() as u64;
+        let energies = self.read_pointer::<i32>(11, self.capacity() * self.num_reads)?;
         self.command = None;
         let output_count = self
             .steps
@@ -358,7 +382,6 @@ impl SlotPool {
             .filter(|step| step.flags & SLOT_WRITE_OUTPUT != 0)
             .count();
         let mut checkpoints = Vec::with_capacity(output_count);
-        let energies = self.buffer(11)?.contents().cast::<i32>();
         for step in &self.steps {
             let slot = step.slot as usize;
             let Some(r) = self.slots[slot].as_mut() else {
@@ -372,10 +395,12 @@ impl SlotPool {
                 r.has_output = true;
                 let last = r.next_checkpoint == r.job.checkpoints.len();
                 // SAFETY: the completed output step initialized this live
-                // slot's region. No host mutation or GPU write overlaps it.
+                // slot's region. read_pointer checked the mapping and byte
+                // length. No host mutation or GPU write overlaps this copy.
                 let slot_energies = unsafe {
                     std::slice::from_raw_parts(energies.add(slot * self.num_reads), self.num_reads)
-                };
+                }
+                .to_vec();
                 let best = slot_energies
                     .iter()
                     .copied()
@@ -445,8 +470,9 @@ impl SlotPool {
             })?;
         let mut packed = Vec::with_capacity(count * packed_size);
         let mut energies = Vec::with_capacity(count);
-        let sample_ptr = self.buffer(10)?.contents().cast::<i8>();
-        let energy_ptr = self.buffer(11)?.contents().cast::<i32>();
+        let sample_ptr =
+            self.read_pointer::<i8>(10, self.capacity() * self.num_reads * packed_size)?;
+        let energy_ptr = self.read_pointer::<i32>(11, self.capacity() * self.num_reads)?;
         let mut first = 0;
         while first < slots.len() {
             let mut end = first + 1;
@@ -462,6 +488,7 @@ impl SlotPool {
             // SAFETY: all requested slots have completed checkpoint output and
             // idle() excludes GPU writes. Only validated slot regions are read,
             // including when uninitialized or released slots lie between them.
+            // read_pointer checked non-null mappings and full buffer lengths.
             unsafe {
                 packed.extend_from_slice(std::slice::from_raw_parts(
                     sample_ptr.add(read_offset * packed_size),
@@ -529,6 +556,52 @@ mod tests {
 
     const READS: usize = 64;
     const WORDS: usize = 2;
+
+    #[test]
+    fn checked_read_pointer_rejects_null_short_and_overflowing_buffers() {
+        let mut values = [1i32, 2];
+        let ptr = values.as_mut_ptr().cast();
+        assert_eq!(
+            checked_read_pointer::<i32>(ptr, 8, 2).unwrap(),
+            values.as_ptr()
+        );
+        checked_read_pointer::<i32>(std::ptr::null_mut(), 8, 2).unwrap_err();
+        checked_read_pointer::<i32>(ptr, 7, 2).unwrap_err();
+        checked_read_pointer::<i32>(ptr, u64::MAX, usize::MAX).unwrap_err();
+        checked_read_pointer::<i8>(ptr, u64::MAX, isize::MAX as usize + 1).unwrap_err();
+    }
+
+    #[test]
+    fn admission_rejects_wrong_edges_and_readback_rejects_short_buffers() {
+        let Some(device) = device() else {
+            return;
+        };
+        let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 1, 32).unwrap();
+        let mut wrong = job(7, 32, vec![32]);
+        wrong.graph.edges.swap(0, 1);
+        pool.admit(wrong).unwrap_err();
+        assert_eq!(pool.live(), 0);
+        pool.admit(job(7, 32, vec![32])).unwrap();
+        assert!(pool.commit_step(32).unwrap());
+        pool.wait();
+        let energy_index = pool.buffers.iter().position(|(i, _)| *i == 11).unwrap();
+        let original = std::mem::replace(
+            &mut pool.buffers[energy_index].1,
+            device.new_buffer_from_slice(&[0i32]),
+        );
+        assert!(matches!(
+            pool.take_checkpoints(),
+            Err(SampleError::Driver(_))
+        ));
+        pool.buffers[energy_index].1 = original;
+        assert_eq!(pool.take_checkpoints().unwrap().len(), 1);
+        pool.buffers[energy_index].1 = device.new_buffer_from_slice(&[0i32]);
+        pool.reads_many(&[0], READS).unwrap_err();
+        pool.buffers[energy_index].1 = device.new_buffer_from_slice(&vec![0i32; READS]);
+        let sample_index = pool.buffers.iter().position(|(i, _)| *i == 10).unwrap();
+        pool.buffers[sample_index].1 = device.new_buffer_from_slice(&[0i8]);
+        pool.reads_many(&[0], READS).unwrap_err();
+    }
 
     fn job(seed: u64, sweeps: usize, checkpoints: Vec<usize>) -> SlotJob {
         let graph = advantage2_system1(seed);
