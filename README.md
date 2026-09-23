@@ -12,8 +12,8 @@ Build and run on Apple Silicon.
 
 Energies are scored on the host with the canonical
 `quip_solver_core::quip_protocol::scoring::energy_milli` so results match
-consensus; there is no GPU energy kernel (Metal Shading Language has no
-`double`).
+consensus. No GPU energy kernel exists. Metal Shading Language has no
+`double`.
 
 ## Binaries
 
@@ -25,7 +25,7 @@ consensus; there is no GPU energy kernel (Metal Shading Language has no
 
 Prebuilt `arm64` binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-metal/-/releases)
-(built best-effort on a macOS CI runner; see [`.gitlab-ci.yml`](.gitlab-ci.yml)).
+(built best-effort on a macOS CI runner. See [`.gitlab-ci.yml`](.gitlab-ci.yml)).
 
 ## Build
 
@@ -45,7 +45,7 @@ from crates.io at a pinned version, published from
 quip-metal-sa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
-**Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
+**Driver / fixed-input (run in isolation).** Use the coordinator's
 `drive` harness pointed at the binary — `--source random` for golden-drawn
 problems, `--source list <jsonl>` for a fixed replay:
 
@@ -66,6 +66,27 @@ quip-metal-sa --check          # probe the backend is runnable
 
 All binaries accept `enable_ane` and `enable_metal` in `backend_toml`. Both default to `true`.
 Only MSA can run on the ANE. See [engine selection](docs/combined-engines.md) for modes, limits, and invalid settings.
+
+## Probe cascade (`quip-metal-msa`)
+
+The multi-spin miner probes each nonce with short sweeps before spending its
+full sweep budget, and screens out the nonces that rank below an adaptive
+cutoff. It applies to the MSA kernel only. The eight keys below enter through
+`backend_toml`.
+
+| key | default | purpose |
+|-----|---------|---------|
+| `cascade` | `false` | enable or disable the screen |
+| `cascade_stages` | `[32, 128, 256]` | sweeps per probe stage |
+| `cascade_keep` | `3000` | probe-to-full denominator |
+| `cascade_keep_min` | `1000` | floor for the probe-to-full keep |
+| `cascade_keep_max` | `30000` | ceiling for the probe-to-full keep |
+| `cascade_audit` | `200` | audit lane denominator |
+| `cascade_target_milli` | none | chain target energy |
+| `cascade_yield_per_million` | none | expected nonces per million below target |
+
+See [probe cascade](docs/cascade.md) for the full key reference, validation
+rules, model checks, and how to disable the screen.
 
 ## Multi-spin kernel (`quip-metal-msa`)
 
