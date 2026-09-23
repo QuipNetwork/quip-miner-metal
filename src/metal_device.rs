@@ -70,10 +70,6 @@ pub struct MetalDevice {
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
     pub(crate) msa: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "slot pool dispatch is added in the next task")
-    )]
     pub(crate) msa_slots: ComputePipelineState,
     /// One CSR topology, replaced when `n`, edges, or the colouring flag change.
     pub(crate) topology_cache: crate::sampler::TopologyCache,

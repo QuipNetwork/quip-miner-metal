@@ -278,7 +278,7 @@ fn index_results(results: &[StreamResult]) -> HashMap<Vec<u8>, &StreamResult> {
 }
 
 #[test]
-fn cascade_answers_every_job_once() {
+fn every_job_returns_exactly_one_result() {
     if MetalDevice::device_count() == 0 {
         return;
     }
@@ -287,20 +287,28 @@ fn cascade_answers_every_job_once() {
         let graph = chain(CHAIN_NODES);
         let jobs: Vec<_> = (0..400)
             .map(|index| {
-                make_job(
+                let mut job = make_job(
                     job_id("chain", index),
                     graph.clone(),
-                    256,
+                    [8, 128, 256, 64][index / 100],
                     u64::try_from(index).unwrap_or(1) + 1,
                     None,
-                )
+                );
+                if index >= 200 {
+                    job.params.num_reads = 8;
+                }
+                job
             })
             .collect();
         let ids: Vec<_> = jobs.iter().map(|job| job.job_id.clone()).collect();
+        let read_counts: HashMap<_, _> = jobs
+            .iter()
+            .map(|job| (job.job_id.clone(), job.params.num_reads))
+            .collect();
         let results = run_jobs(jobs, 240, "cascade_answers_every_job_once");
         assert_one_each(&results, &ids);
         for result in &results {
-            assert_reads(result, NUM_READS, CHAIN_NODES);
+            assert_reads(result, read_counts[&result.job_id], CHAIN_NODES);
         }
     });
 }
@@ -451,7 +459,7 @@ fn cascade_cancel_mid_stream() {
 }
 
 #[test]
-fn cascade_topology_switch() {
+fn topology_change_drains_live_slots() {
     if MetalDevice::device_count() == 0 {
         return;
     }
@@ -503,5 +511,224 @@ fn cascade_topology_switch() {
             assert_reads(result, NUM_READS, CHAIN_NODES);
             assert_consensus(&ring, result);
         }
+    });
+}
+
+#[test]
+fn screened_out_results_carry_probe_reads_and_kept_results_carry_full_reads() {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let _gpu = gpu_lock();
+    with_timeout(300, "checkpoint reads", || {
+        // A field-free ring leaves domain walls for longer schedules to remove.
+        // The short ternary chain often reaches its ground state at the probe.
+        let mut graph = ring(256);
+        graph.h.fill(0.0);
+        let jobs = |sweeps| {
+            (0..2000)
+                .map(|i| {
+                    make_job(
+                        job_id("probe", i),
+                        graph.clone(),
+                        sweeps,
+                        i as u64 + 1,
+                        None,
+                    )
+                })
+                .collect()
+        };
+        let probes = run_jobs(jobs(8), 120, "probe baseline");
+        let results = run_jobs(jobs(256), 120, "checkpoint reads");
+        let probes = index_results(&probes);
+        let mut screened = 0;
+        let mut continued = 0;
+        let mut improvement = 0i64;
+        for result in &results {
+            assert_consensus(&graph, result);
+            let probe = completed_reads(probes[&result.job_id]);
+            let reads = completed_reads(result);
+            if reads == probe {
+                screened += 1;
+            } else {
+                continued += 1;
+                improvement += probe.iter().map(|r| r.energy_milli).min().unwrap()
+                    - reads.iter().map(|r| r.energy_milli).min().unwrap();
+            }
+        }
+        assert_eq!(results.len(), 2000);
+        assert!(screened > 0, "warm-up must return probe reads");
+        assert!(continued > 0, "settled controller must continue some jobs");
+        assert!(
+            improvement >= 0,
+            "continued set should improve on average: total {improvement}, jobs {continued}"
+        );
+    });
+}
+
+#[test]
+fn closed_output_waits_for_inflight_and_returns() {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let _gpu = gpu_lock();
+    with_timeout(60, "closed output", || {
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let (out, mut results) = tokio::sync::mpsc::channel(1);
+        for i in 0..128 {
+            tx.blocking_send(make_job(
+                job_id("close", i),
+                chain(CHAIN_NODES),
+                4096,
+                i as u64 + 1,
+                None,
+            ))
+            .unwrap();
+        }
+        let worker = spawn_cascade(rx, out, CancelToken::default());
+        assert!(results.blocking_recv().is_some());
+        drop(results);
+        // Keep the input sender open: output closure must end the runner.
+        join_with_timeout(worker, 30, "closed output");
+        drop(tx);
+    });
+}
+
+#[test]
+fn cascade_off_keeps_run_stream() {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let _gpu = gpu_lock();
+    with_timeout(120, "cascade off", || {
+        let device = MetalDevice::open(0).unwrap();
+        let gov = UtilGovernor::start(0, 100, false);
+        let sampler = MetalSampler::new(
+            MetalDevice::open(0).unwrap(),
+            UtilGovernor::start(0, 100, false),
+            Kernel::Msa,
+        );
+        sampler.apply_config("cascade = false");
+        let execute = |direct| {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            let (out, results) = tokio::sync::mpsc::channel(32);
+            for i in 0..32 {
+                tx.blocking_send(make_job(
+                    job_id("off", i),
+                    chain(CHAIN_NODES),
+                    64,
+                    i as u64 + 1,
+                    None,
+                ))
+                .unwrap();
+            }
+            drop(tx);
+            if direct {
+                quip_miner_metal::streaming::run_stream(
+                    &device,
+                    Kernel::Msa,
+                    rx,
+                    &out,
+                    &gov,
+                    &CancelToken::default(),
+                );
+                drop(out);
+            } else {
+                sampler.sample_stream(rx, out, CancelToken::default());
+            }
+            drain_results(results, 30, "cascade off")
+        };
+        let direct = execute(true);
+        let off = execute(false);
+        assert_eq!(direct.len(), 32);
+        assert_eq!(off.len(), 32);
+        let direct = index_results(&direct);
+        for result in off {
+            assert_eq!(
+                completed_reads(&result),
+                completed_reads(direct[&result.job_id])
+            );
+        }
+    });
+}
+
+#[test]
+fn cancelled_continuing_job_answers_once() {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let _gpu = gpu_lock();
+    with_timeout(180, "cancel continuing", || {
+        let (tx, rx) = tokio::sync::mpsc::channel(65);
+        let (out, mut results) = tokio::sync::mpsc::channel(65);
+        let cancel = CancelToken::default();
+        let worker_cancel = cancel.clone();
+        let worker = thread::spawn(move || {
+            let sampler = MetalSampler::new(
+                MetalDevice::open(0).unwrap(),
+                UtilGovernor::start(0, 100, false),
+                Kernel::Msa,
+            );
+            sampler.apply_config("cascade = true\ncascade_stages = [8]\ncascade_keep = 2\ncascade_keep_min = 2\ncascade_keep_max = 2");
+            // Denominator 2 is the loosest valid keep. The warm-up screens
+            // every job for its first 200 observations.
+            let (warm_tx, warm_rx) = tokio::sync::mpsc::channel(500);
+            let (warm_out, warm_results) = tokio::sync::mpsc::channel(500);
+            for i in 0..500 {
+                warm_tx
+                    .blocking_send(make_job(
+                        job_id("warm", i),
+                        chain(CHAIN_NODES),
+                        16,
+                        i as u64 + 1,
+                        None,
+                    ))
+                    .unwrap();
+            }
+            drop(warm_tx);
+            sampler.sample_stream(warm_rx, warm_out, CancelToken::default());
+            assert_eq!(drain_results(warm_results, 30, "warm-up").len(), 500);
+            sampler.sample_stream(rx, out, worker_cancel);
+        });
+        for i in 0..64 {
+            tx.blocking_send(make_job(
+                job_id("continuing", i),
+                chain(CHAIN_NODES),
+                65_536,
+                i as u64 + 1000,
+                Some(1),
+            ))
+            .unwrap();
+        }
+        // The short job reports after earlier pools have passed their probe.
+        tx.blocking_send(make_job(
+            b"probe".to_vec(),
+            chain(CHAIN_NODES),
+            8,
+            2000,
+            None,
+        ))
+        .unwrap();
+        drop(tx);
+        // Jobs screened out at the first gate may answer before the probe.
+        let mut answered = Vec::new();
+        loop {
+            let result = results.blocking_recv().expect("probe result");
+            if result.job_id == b"probe" {
+                assert_reads(&result, NUM_READS, CHAIN_NODES);
+                break;
+            }
+            answered.push(result);
+        }
+        cancel.cancel_through(1);
+        answered.extend(drain_results(results, 60, "cancel continuing"));
+        let ids: Vec<_> = (0..64).map(|i| job_id("continuing", i)).collect();
+        assert_one_each(&answered, &ids);
+        let cancelled = answered
+            .iter()
+            .filter(|r| matches!(r.outcome, StreamOutcome::Cancelled))
+            .count();
+        assert!(cancelled > 0, "no continuing job was cancelled");
+        join_with_timeout(worker, 30, "cancel continuing");
     });
 }

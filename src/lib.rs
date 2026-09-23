@@ -52,6 +52,7 @@ mod cascade;
 mod combined;
 mod cutoff;
 mod model_checks;
+mod resident;
 mod slots;
 
 pub mod iokit_gov;
@@ -230,12 +231,23 @@ pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct MetalSampler {
     device: crate::metal_device::MetalDevice,
     gov: crate::iokit_gov::UtilGovernor,
     kernel: Kernel,
     cascade: std::sync::Mutex<cascade::CascadeSettings>,
+    controller: std::sync::Mutex<Option<cascade::Controller>>,
+}
+
+impl std::fmt::Debug for MetalSampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalSampler")
+            .field("device", &self.device)
+            .field("gov", &self.gov)
+            .field("kernel", &self.kernel)
+            .field("cascade", &self.cascade)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Metal backend config, parsed from the verbatim `config.toml` subsection in
@@ -285,6 +297,7 @@ impl MetalSampler {
             gov,
             kernel,
             cascade: std::sync::Mutex::new(cascade::CascadeSettings::default()),
+            controller: std::sync::Mutex::new(None),
         }
     }
 
@@ -320,19 +333,25 @@ impl quip_solver_core::Sampler for MetalSampler {
         out: tokio::sync::mpsc::Sender<quip_solver_core::StreamResult>,
         cancel: quip_solver_core::CancelToken,
     ) {
-        // `&out`: `run_stream` borrows the sender (it only ever clones/sends
-        // through it). Depends on the matching `streaming::run_stream`
-        // signature change landing in the same round.
-        //
-        // The governor is passed as a predicate rather than read inside
-        // `run_stream`: the streaming loop overrides `Sampler::sample_stream`,
-        // whose default implementation is the only place the harness consults
-        // `should_throttle`. Overriding it silently dropped all yielding
-        // behavior, so the dependency is made explicit in the signature. The
-        // governor is passed whole (not just a throttle closure) because sizing
-        // is a loop: the stream reports its GPU time back through it.
-        // Task 5 replaces cascade-on streams with the resident runner.
-        streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
+        // Both runners report device time to the same governor that sizes work.
+        let cascade_on = self
+            .cascade
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .enabled;
+        if self.kernel == Kernel::Msa && cascade_on {
+            resident::run(
+                &self.device,
+                &self.cascade,
+                &self.controller,
+                jobs,
+                &out,
+                &self.gov,
+                &cancel,
+            );
+        } else {
+            streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
+        }
     }
 
     fn stream_width(&self) -> usize {

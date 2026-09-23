@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "resident cascade caller is added in a later task")
-)]
-
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, BufferPool, CachedTopology, Kernel, SampleError, MSA_THREADS};
 use crate::topology::fill_h_j_matching;
@@ -419,6 +414,7 @@ impl SlotPool {
     }
 
     /// Read the latest checkpoint, which remains valid between output steps.
+    #[cfg(test)]
     pub(crate) fn reads(
         &self,
         slot: SlotId,

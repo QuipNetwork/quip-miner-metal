@@ -145,7 +145,7 @@ fn tg_budget(kernel: Kernel) -> usize {
 /// mapping: chromatic Gibbs spends `num_reads` threadgroups per problem and
 /// multi-spin spends `num_reads / 32`, so their batches shrink as reads grow.
 /// SA spends one.
-fn batch_size_for_reads(kernel: Kernel, num_reads: usize) -> usize {
+pub(crate) fn batch_size_for_reads(kernel: Kernel, num_reads: usize) -> usize {
     let budget = tg_budget(kernel);
     let per_problem = match kernel {
         Kernel::Gibbs if sampler::gibbs_node_parallel() => {
@@ -163,7 +163,7 @@ fn batch_size_for_reads(kernel: Kernel, num_reads: usize) -> usize {
 ///
 /// Never returns 0: one problem per dispatch is the floor, because a dispatch
 /// of nothing makes no progress and would never free the coordinator's credit.
-fn scale_budget(nominal: usize, scale: f64) -> usize {
+pub(crate) fn scale_budget(nominal: usize, scale: f64) -> usize {
     if !scale.is_finite() || scale >= 1.0 {
         return nominal.max(1);
     }
@@ -387,7 +387,7 @@ fn send_cancelled(out: &Sender<StreamResult>, job: StreamJob) {
     }
 }
 
-fn send_reject(out: &Sender<StreamResult>, job: StreamJob, err: SampleError) {
+pub(crate) fn send_reject(out: &Sender<StreamResult>, job: StreamJob, err: SampleError) {
     if out
         .blocking_send(StreamResult {
             job_id: job.job_id,

@@ -3,11 +3,6 @@
 
 //! Host-only cascade decisions and schedules for the resident slot runner.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Task 5 connects the resident runner")
-)]
-
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,7 +26,21 @@ pub(crate) struct Calibration {
     pub(crate) false_negative: &'static [((usize, usize), f64)],
     pub(crate) skew: &'static [f64],
     pub(crate) excess_kurtosis: &'static [f64],
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained calibration checked by the Arm D regression test"
+        )
+    )]
     pub(crate) cost_a_us: f64,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained calibration checked by the Arm D regression test"
+        )
+    )]
     pub(crate) cost_b_us: f64,
     pub(crate) k0: f64,
 }
@@ -317,6 +326,17 @@ impl StagePlan {
 }
 
 impl Controller {
+    #[cfg(test)]
+    pub(crate) fn keep_denominators(&self) -> Vec<f64> {
+        self.plan
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cutoffs
+            .iter()
+            .map(Cutoff::denominator)
+            .collect()
+    }
+
     pub(crate) fn new(settings: CascadeSettings) -> Self {
         Self {
             settings,
