@@ -452,7 +452,15 @@ mod tests {
         for _ in 0..1_000 {
             c.load_update(5.0, 1.0);
         }
-        assert!(c.denominator() <= 30_000.0);
+        // The integral saturates at ln(30_000 / 10_000) on top of the warm-up
+        // interpolation; without that clamp the outer clamp would give 30_000.
+        let warm = 10.0 / (10.0 + 2.0);
+        let saturated = (1_000f64.ln() + warm * 10f64.ln() + 3f64.ln()).exp();
+        let d = c.denominator();
+        assert!(
+            (d - saturated).abs() < 1e-6 * saturated,
+            "{d} vs {saturated}"
+        );
         for _ in 0..1_000 {
             c.load_update(-5.0, 1.0);
         }
