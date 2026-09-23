@@ -1,0 +1,27 @@
+{
+  "stages": [
+    32
+  ],
+  "spearman_vs_full": {
+    "32": 0.7762302275575568
+  },
+  "tail_r_deepest_500": null,
+  "normal_quantile_dev_sd": {
+    "1e-3": 0.11834557462041467,
+    "1e-4": 0.6477226554520505,
+    "1e-5": 1.1798355518822692
+  },
+  "moments": {
+    "32": {
+      "mean": -13834590.0,
+      "sd": 52294.052243061065,
+      "skew": -0.12330440437942435,
+      "excess_kurtosis": 0.013782116457605742
+    }
+  },
+  "false_negative_rate": {},
+  "cost_model_us": {
+    "a": null,
+    "b": null
+  }
+}
