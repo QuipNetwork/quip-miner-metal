@@ -486,6 +486,158 @@ fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
     spins
 }
 
+/// One built topology and the device buffers that depend only on its edges.
+#[derive(Debug)]
+pub(crate) struct CachedTopology {
+    pub(crate) n: usize,
+    pub(crate) edges: Vec<(usize, usize)>,
+    pub(crate) four_color: bool,
+    pub(crate) topo: SelfFeedingTopology,
+    pub(crate) colors: Vec<metal::Buffer>,
+    pub(crate) row: metal::Buffer,
+    pub(crate) col: metal::Buffer,
+}
+
+/// Single cached topology. A miss replaces the entry.
+#[derive(Debug, Default)]
+pub(crate) struct TopologyCache {
+    slot: std::sync::Mutex<Option<std::sync::Arc<CachedTopology>>>,
+}
+
+impl TopologyCache {
+    pub(crate) fn get_or_build(
+        &self,
+        device: &crate::metal_device::MetalDevice,
+        graph: &IsingGraph,
+        four_color: bool,
+    ) -> std::sync::Arc<CachedTopology> {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = slot.as_ref() {
+            if entry.n == graph.num_nodes()
+                && entry.four_color == four_color
+                && entry.edges == graph.edges
+            {
+                return std::sync::Arc::clone(entry);
+            }
+        }
+        let cached = std::sync::Arc::new(build_cached_topology(device, graph, four_color));
+        *slot = Some(std::sync::Arc::clone(&cached));
+        cached
+    }
+}
+
+fn build_cached_topology(
+    device: &crate::metal_device::MetalDevice,
+    graph: &IsingGraph,
+    four_color: bool,
+) -> CachedTopology {
+    let topo = if four_color {
+        SelfFeedingTopology::build_with_advantage2_coloring(graph)
+    } else {
+        SelfFeedingTopology::build(graph)
+    };
+    let colors = [&topo.colors.starts, &topo.colors.counts, &topo.colors.nodes]
+        .into_iter()
+        .map(|values| device.new_buffer_from_slice(&pad_i32(values)))
+        .collect();
+    let zero = [0i32];
+    let base_row: &[i32] = if topo.row_ptr.is_empty() {
+        &zero
+    } else {
+        &topo.row_ptr
+    };
+    let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
+    let row = device.new_buffer_from_slice(base_row);
+    let col = device.new_buffer_from_slice(base_col);
+    CachedTopology {
+        n: graph.num_nodes(),
+        edges: graph.edges.clone(),
+        four_color,
+        topo,
+        colors,
+        row,
+        col,
+    }
+}
+
+/// Free shared-storage buffers for later multi-spin batches. At most 64.
+#[derive(Debug, Default)]
+pub(crate) struct BufferPool {
+    free: std::sync::Mutex<Vec<metal::Buffer>>,
+}
+
+impl BufferPool {
+    /// Smallest free buffer with `len <= length <= 2 * len`, else a new shared buffer.
+    pub(crate) fn take(&self, device: &metal::DeviceRef, len: u64) -> metal::Buffer {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut best_index = None;
+        let mut best_len = u64::MAX;
+        for (index, buf) in free.iter().enumerate() {
+            let length = buf.length();
+            if length >= len && length <= len.saturating_mul(2) && length < best_len {
+                best_index = Some(index);
+                best_len = length;
+            }
+        }
+        if let Some(index) = best_index {
+            return free.swap_remove(index);
+        }
+        drop(free);
+        device.new_buffer(len, metal::MTLResourceOptions::StorageModeShared)
+    }
+
+    /// Keep `buf` if the pool holds fewer than 64 buffers.
+    pub(crate) fn give(&self, buf: metal::Buffer) {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if free.len() < 64 {
+            free.push(buf);
+        }
+    }
+}
+
+/// Copy `data` into a pooled shared buffer.
+///
+/// An empty slice becomes a 4-byte zero stub, matching
+/// [`crate::metal_device::MetalDevice::new_buffer_from_slice`].
+fn pooled_from_slice<T: Copy>(
+    pool: &BufferPool,
+    device: &metal::DeviceRef,
+    data: &[T],
+) -> metal::Buffer {
+    let bytes = std::mem::size_of_val(data);
+    if bytes == 0 {
+        let buf = pool.take(device, 4);
+        // SAFETY: `take(4)` returns StorageModeShared storage of at least 4
+        // bytes, so `contents()` maps those bytes on the host. The write stays
+        // inside that mapping.
+        unsafe {
+            std::ptr::write_bytes(buf.contents().cast::<u8>(), 0, 4);
+        }
+        return buf;
+    }
+    let buf = pool.take(device, bytes as u64);
+    // SAFETY: `take` returns StorageModeShared storage of at least `bytes`
+    // bytes, so `contents()` is a non-null host mapping of that many bytes.
+    // `data` is a separate allocation and cannot overlap the mapping.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().cast::<u8>(),
+            buf.contents().cast::<u8>(),
+            bytes,
+        );
+    }
+    buf
+}
+
 /// A prepared batch retaining its inputs and carry-over state between chunks.
 /// Only `commit_next` submits work, with at most one unfinished chunk per batch.
 pub(crate) struct EncodedBatch {
@@ -511,6 +663,15 @@ pub(crate) struct EncodedBatch {
     groups: usize,
     threads_per_group: usize,
     plan: Vec<(i32, i32)>,
+    /// Retains the topology buffers after a later miss replaces the device slot.
+    #[expect(
+        dead_code,
+        reason = "keeps cached Metal buffers alive until the batch drops"
+    )]
+    cached: std::sync::Arc<CachedTopology>,
+    pool: std::sync::Arc<BufferPool>,
+    /// Multi-spin buffers rented from `pool`.
+    pooled: Vec<metal::Buffer>,
 }
 
 impl EncodedBatch {
@@ -606,6 +767,25 @@ impl EncodedBatch {
     /// Number of command buffers this batch was split into.
     pub(crate) fn chunk_count(&self) -> usize {
         self.plan.len()
+    }
+}
+
+impl Drop for EncodedBatch {
+    fn drop(&mut self) {
+        // Give every pooled buffer back when `cmds` is empty or every command
+        // buffer has status `Completed` or `Error`. Otherwise drop them: the
+        // GPU may still be using them.
+        let retired = self.cmds.iter().all(|cmd| {
+            matches!(
+                cmd.status(),
+                metal::MTLCommandBufferStatus::Completed | metal::MTLCommandBufferStatus::Error
+            )
+        });
+        if retired {
+            for buf in self.pooled.drain(..) {
+                self.pool.give(buf);
+            }
+        }
     }
 }
 
@@ -770,33 +950,31 @@ fn validate_batch<'a>(
 /// Build and upload one batch's CSR structure and per-problem `h` / `J`.
 ///
 /// The CSR structure is shared by every problem in the batch (same topology),
-/// so the multi-spin kernel reads one shared copy. The SA and Gibbs kernels
-/// read a tiled copy through the offset arrays.
+/// so the multi-spin kernel reads the one untiled copy in `cached`. The SA and
+/// Gibbs kernels read a tiled copy through the offset arrays.
 fn upload_inputs(
     device: &crate::metal_device::MetalDevice,
-    topo: &SelfFeedingTopology,
+    cached: &CachedTopology,
     graphs: &[&IsingGraph],
     kernel: Kernel,
 ) -> InputBuffers {
+    let topo = &cached.topo;
     let num_problems = graphs.len();
     let n = topo.n;
     let nnz_alloc = topo.nnz.max(1);
     let rp_len = topo.row_ptr.len().max(1);
 
     // Shared CSR structure for MSA, tiled for SA / Gibbs; per-problem J / h values.
-    let zero = [0i32];
-    let base_row: &[i32] = if topo.row_ptr.is_empty() {
-        &zero
-    } else {
-        &topo.row_ptr
-    };
-    let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
     let (row, col) = if kernel == Kernel::Msa {
-        (
-            device.new_buffer_from_slice(base_row),
-            device.new_buffer_from_slice(base_col),
-        )
+        (cached.row.clone(), cached.col.clone())
     } else {
+        let zero = [0i32];
+        let base_row: &[i32] = if topo.row_ptr.is_empty() {
+            &zero
+        } else {
+            &topo.row_ptr
+        };
+        let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
         (
             device.new_buffer_from_slice(&tile_i32(base_row, num_problems)),
             device.new_buffer_from_slice(&tile_i32(base_col, num_problems)),
@@ -813,12 +991,23 @@ fn upload_inputs(
     }
     let row_ptr_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * rp_len) as i32).collect();
     let col_ind_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * nnz_alloc) as i32).collect();
+    let (j, h) = if kernel == Kernel::Msa {
+        (
+            pooled_from_slice(&device.buffer_pool, &device.device, &all_j),
+            pooled_from_slice(&device.buffer_pool, &device.device, &all_h),
+        )
+    } else {
+        (
+            device.new_buffer_from_slice(&all_j),
+            device.new_buffer_from_slice(&all_h),
+        )
+    };
 
     InputBuffers {
         row,
         col,
-        j: device.new_buffer_from_slice(&all_j),
-        h: device.new_buffer_from_slice(&all_h),
+        j,
+        h,
         row_off: device.new_buffer_from_slice(&row_ptr_offsets),
         col_off: device.new_buffer_from_slice(&col_ind_offsets),
     }
@@ -905,15 +1094,17 @@ fn new_gibbs_persistent(
 /// threshold row is rebuilt at every rung and the sweep offsets are hashed
 /// from their coordinates, so nothing else survives a chunk boundary.
 fn new_msa_persistent(
-    device: &crate::metal_device::MetalDevice,
+    pool: &BufferPool,
+    device: &metal::DeviceRef,
     num_streams: usize,
     n: usize,
     threads_per_group: usize,
 ) -> [metal::Buffer; 2] {
     const RNG_BYTES_PER_STREAM: usize = 16;
     [
-        device.new_zeroed_buffer((num_streams * n.max(1) * 4) as u64),
-        device.new_zeroed_buffer(
+        pool.take(device, (num_streams * n.max(1) * 4) as u64),
+        pool.take(
+            device,
             (num_streams * threads_per_group.max(1) * RNG_BYTES_PER_STREAM) as u64,
         ),
     ]
@@ -1085,44 +1276,83 @@ fn encode_batch_inner(
         }
     }
 
-    let topo = if kernel == Kernel::Msa && msa_four_color() {
-        SelfFeedingTopology::build_with_advantage2_coloring(first)
-    } else {
-        SelfFeedingTopology::build(first)
-    };
-    let inputs = upload_inputs(device, &topo, graphs, kernel);
-    let out = DispatchBuffers {
-        beta: device.new_buffer_from_slice(&beta),
-        samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
-        energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
-    };
+    let cached = device.topology_cache.get_or_build(
+        device,
+        first,
+        kernel == Kernel::Msa && msa_four_color(),
+    );
+    let inputs = upload_inputs(device, &cached, graphs, kernel);
 
     let plan = match plan_override {
         Some(p) => p.to_vec(),
         None => chunk_plan(kernel, &dims, groups, in_flight),
     };
-    let kstate = match kernel {
-        Kernel::Sa => KernelEncode::Sa {
-            persist: new_sa_persistent(device, &dims),
-        },
-        Kernel::Gibbs => KernelEncode::Gibbs {
-            persist: new_gibbs_persistent(device, &dims, node_parallel, threads_per_group),
-        },
-        Kernel::Msa => KernelEncode::Msa {
-            persist: new_msa_persistent(device, groups, n, threads_per_group),
-            words: words as i32,
-            state_bytes: state_bytes as u64,
-        },
+    let mut pooled = Vec::new();
+    let (out, kstate) = match kernel {
+        Kernel::Sa => (
+            DispatchBuffers {
+                beta: device.new_buffer_from_slice(&beta),
+                samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
+                energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
+            },
+            KernelEncode::Sa {
+                persist: new_sa_persistent(device, &dims),
+            },
+        ),
+        Kernel::Gibbs => (
+            DispatchBuffers {
+                beta: device.new_buffer_from_slice(&beta),
+                samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
+                energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
+            },
+            KernelEncode::Gibbs {
+                persist: new_gibbs_persistent(device, &dims, node_parallel, threads_per_group),
+            },
+        ),
+        Kernel::Msa => {
+            let beta_buf = pooled_from_slice(&device.buffer_pool, &device.device, &beta);
+            // The kernel writes `samples`, `energies`, and the persistent buffers
+            // in full before any read (first chunk initializes state and RNG, and
+            // every read's bytes are packed), so pooled buffers need no zeroing.
+            let samples = device
+                .buffer_pool
+                .take(&device.device, (num_samples * packed_size) as u64);
+            let energies = device
+                .buffer_pool
+                .take(&device.device, (num_samples * 4) as u64);
+            let persist = new_msa_persistent(
+                &device.buffer_pool,
+                &device.device,
+                groups,
+                n,
+                threads_per_group,
+            );
+            pooled.extend([
+                inputs.j.clone(),
+                inputs.h.clone(),
+                beta_buf.clone(),
+                samples.clone(),
+                energies.clone(),
+                persist[0].clone(),
+                persist[1].clone(),
+            ]);
+            (
+                DispatchBuffers {
+                    beta: beta_buf,
+                    samples,
+                    energies,
+                },
+                KernelEncode::Msa {
+                    persist,
+                    words: words as i32,
+                    state_bytes: state_bytes as u64,
+                },
+            )
+        }
     };
 
-    let colors = if kernel == Kernel::Sa {
-        Vec::new()
-    } else {
-        [&topo.colors.starts, &topo.colors.counts, &topo.colors.nodes]
-            .into_iter()
-            .map(|values| device.new_buffer_from_slice(&pad_i32(values)))
-            .collect()
-    };
+    let colors = cached.colors.clone();
+    let num_colors = cached.topo.colors.num_colors;
     Ok(EncodedBatch {
         device_energy: kernel == Kernel::Msa && graphs.iter().all(|g| device_energy_exact(g)),
         cmds: Vec::with_capacity(plan.len()),
@@ -1138,10 +1368,13 @@ fn encode_batch_inner(
         dims,
         kstate,
         colors,
-        num_colors: topo.colors.num_colors,
+        num_colors,
         groups,
         threads_per_group,
         plan,
+        cached,
+        pool: std::sync::Arc::clone(&device.buffer_pool),
+        pooled,
     })
 }
 
@@ -1755,6 +1988,59 @@ mod tests {
         let edges: Vec<(usize, usize)> = (0..n - 1).map(|i| (i, i + 1)).collect();
         let j = vec![-1.0; edges.len()];
         IsingGraph::new(h, j, edges)
+    }
+
+    #[test]
+    fn topology_cache_hits_on_the_same_edges_and_misses_on_new_ones() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let a = chain(50);
+        let mut a2 = chain(50);
+        a2.j[0] = -a2.j[0]; // same topology, different couplings
+        let b = ring();
+        let first = dev.topology_cache.get_or_build(&dev, &a, false);
+        let again = dev.topology_cache.get_or_build(&dev, &a2, false);
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        let other = dev.topology_cache.get_or_build(&dev, &b, false);
+        assert!(!std::sync::Arc::ptr_eq(&first, &other));
+        assert_eq!(other.n, b.num_nodes());
+        let colored = dev.topology_cache.get_or_build(&dev, &b, true);
+        assert!(!std::sync::Arc::ptr_eq(&other, &colored));
+    }
+
+    #[test]
+    fn buffer_pool_reuses_a_returned_buffer_of_fitting_size() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let pool = BufferPool::default();
+        let a = pool.take(&dev.device, 4096);
+        let ptr = a.contents();
+        pool.give(a);
+        let b = pool.take(&dev.device, 3000);
+        assert_eq!(b.contents(), ptr);
+        let c = pool.take(&dev.device, 100_000);
+        assert!(c.length() >= 100_000);
+    }
+
+    #[test]
+    fn consecutive_batches_on_one_topology_give_consensus_energies() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        for graph in [chain(80), chain(80), ring(), chain(80)] {
+            let results = sample_ising(&dev, &graph, &params(32), Kernel::Msa).unwrap();
+            for r in &results {
+                assert_eq!(
+                    r.energy_milli,
+                    energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+                );
+            }
+        }
     }
 
     #[test]
