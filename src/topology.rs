@@ -3,7 +3,8 @@
 //!
 //! Mirrors `GPU/sampler_utils.py::build_csr_structure_from_edges` /
 //! `build_edge_position_index` / `compute_color_blocks`, but computes a
-//! generic greedy coloring by default. The opt-in MSA candidate maps the
+//! generic greedy coloring by default (`build_with_advantage2_coloring` uses
+//! the MSA four-colouring when the graph is Advantage2). The candidate maps the
 //! audited Advantage2 System 1 compact labels back to physical labels and
 //! validates its four-color partition against every supplied edge.
 //!

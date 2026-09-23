@@ -74,9 +74,12 @@ annealing in `quip-miner-cuda`'s `quip-cuda-msa` and `quip-miner-cpu`'s
 `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer, *Optimised simulated
 annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015). 32
 replicas share one 32-bit word per spin. The Metropolis test is an integer
-comparison against a per-rung geometric threshold table. The kernel updates
-spins one colour class at a time (the greedy colouring the Gibbs kernel
-uses). One threadgroup anneals one 32-replica word of one problem in
+comparison against a per-rung geometric threshold table. The kernel drives
+spins one colour class at a time, using the Advantage2 four-colouring by
+default and falling back to the greedy colouring the Gibbs kernel uses when
+the graph is not Advantage2. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`,
+or `off` (case-insensitive) to force the greedy colouring. One threadgroup
+anneals one 32-replica word of one problem in
 threadgroup memory. A 128-read job dispatches four threadgroups per problem.
 
 The CUDA kernel packs 64 replicas per `u64` in 99 KB of shared memory. Apple

@@ -393,16 +393,25 @@ pub(crate) fn gibbs_node_parallel() -> bool {
     })
 }
 
-/// Experimental MSA schedule. Read once per process so a streaming session
-/// keeps the same update order. Other kernels always use their usual coloring.
+/// Whether the multi-spin MSA kernel uses the Advantage2 four-colouring — the
+/// default. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`, or `off`
+/// (case-insensitive) to disable it and fall back to the greedy colouring.
+/// `build_with_advantage2_coloring` already falls back to the greedy colouring
+/// when the graph is not Advantage2.
+///
+/// Read once per process so a streaming session keeps the same update order.
+/// Other kernels always use their usual coloring.
+fn four_color_from(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
 fn msa_four_color() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("QUIP_METAL_MSA_FOUR_COLOR").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
+    *ENABLED
+        .get_or_init(|| four_color_from(std::env::var("QUIP_METAL_MSA_FOUR_COLOR").ok().as_deref()))
 }
 
 /// Largest `N` the kernel's fixed-size arrays admit.
@@ -1622,6 +1631,15 @@ fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, Sample
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_color_is_on_unless_disabled() {
+        assert!(four_color_from(None));
+        assert!(four_color_from(Some("1")));
+        assert!(!four_color_from(Some("0")));
+        assert!(!four_color_from(Some("false")));
+        assert!(!four_color_from(Some("OFF")));
+    }
 
     #[test]
     fn device_energy_is_exact_only_for_whole_i8_coefficients() {
