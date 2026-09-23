@@ -363,27 +363,8 @@ impl Controller {
             .is_some_and(|(n, edges)| *n == graph.num_nodes() && *edges == graph.edges)
     }
 
-    /// Reset on a topology change. Return the job's schedule plan.
+    /// Reset gate state on a gated topology change. Return the job's schedule plan.
     pub(crate) fn admit(&mut self, job: &StreamJob) -> (Ticket, Vec<f32>, Vec<usize>) {
-        if !self.matches_topology(&job.graph) {
-            self.plan = Arc::new(Mutex::new(StagePlan::new(self.settings)));
-            self.topology = Some((job.graph.num_nodes(), job.graph.edges.clone()));
-            self.topology_epoch = self.topology_epoch.wrapping_add(1);
-            self.yield_epoch = self.yield_epoch.wrapping_add(1);
-            self.yield_check = self
-                .settings
-                .yield_per_million
-                .zip(self.settings.target_milli)
-                .map(|(rate, target)| Yield::new(rate, target, Duration::from_secs(3600)));
-        }
-        if let Some(check) = &mut self.yield_check {
-            check.admit();
-        }
-        self.plan
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .audit_rng
-            .get_or_insert(job.params.seed.max(1));
         let stages = if self.settings.enabled {
             &self.settings.stages[..]
         } else {
@@ -391,6 +372,21 @@ impl Controller {
         };
         let (schedule, checkpoints) =
             segment_schedule(&job.graph, &job.params, stages, self.settings.reheat_beta);
+        if checkpoints.len() > 1 {
+            if !self.matches_topology(&job.graph) {
+                self.plan = Arc::new(Mutex::new(StagePlan::new(self.settings)));
+                self.topology = Some((job.graph.num_nodes(), job.graph.edges.clone()));
+                self.topology_epoch = self.topology_epoch.wrapping_add(1);
+            }
+            self.plan
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .audit_rng
+                .get_or_insert(job.params.seed.max(1));
+        }
+        if let Some(check) = &mut self.yield_check {
+            check.admit();
+        }
         let ticket = Ticket {
             gates: checkpoints.len() - 1,
             stage: 0,
@@ -517,7 +513,9 @@ pub(crate) fn segment_schedule(
         .take_while(|&s| s > 0 && s < params.num_sweeps)
         .collect();
     checkpoints.push(params.num_sweeps);
-    let (hot, cold) = default_ising_beta_range(graph);
+    let (hot, cold) = params
+        .beta_range
+        .unwrap_or_else(|| default_ising_beta_range(graph));
     let valid_reheat = reheat_beta > hot && reheat_beta < cold;
     if !valid_reheat {
         tracing::warn!(
@@ -1069,6 +1067,7 @@ mod tests {
     fn configured_stage_roots_and_effective_budgets_preserve_the_original_job() {
         let settings = CascadeSettings {
             stages: [32, 128, 256],
+            reheat_beta: 1.0,
             ..enabled_settings()
         };
         let mut c = Controller::new(settings);
@@ -1179,5 +1178,84 @@ mod tests {
         assert_eq!(CALIBRATION.k0, 1.0);
         assert_eq!(CALIBRATION.reheat_beta, 0.25);
         assert_eq!(CascadeSettings::default().reheat_beta, 0.25);
+    }
+
+    #[test]
+    fn short_second_topology_preserves_inflight_training() {
+        let mut c = Controller::new(enabled_settings());
+        let (mut ticket, _, _) = c.admit(&job(0, 1000));
+        let plan = Arc::clone(&c.plan);
+        let epochs = (c.topology_epoch, c.yield_epoch);
+        let rng = c.plan.lock().unwrap().audit_rng;
+        let mut short = job(1, 32);
+        short.graph.h.push(0.0);
+        let (short_ticket, _, _) = c.admit(&short);
+        assert_eq!(short_ticket.gates, 0);
+        assert!(Arc::ptr_eq(&plan, &c.plan));
+        assert_eq!((c.topology_epoch, c.yield_epoch), epochs);
+        assert!(c.matches_topology(&ring()));
+        assert_eq!(c.plan.lock().unwrap().audit_rng, rng);
+        c.checkpoint(&mut ticket, -100);
+        assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 1);
+    }
+
+    #[test]
+    fn disabled_admission_leaves_topology_unset_and_plan_untouched() {
+        let mut c = Controller::new(CascadeSettings::default());
+        let plan = Arc::clone(&c.plan);
+        let (ticket, _, checkpoints) = c.admit(&job(0, 1000));
+        assert_eq!(ticket.gates, 0);
+        assert_eq!(checkpoints, vec![1000]);
+        assert!(c.topology.is_none());
+        assert!(Arc::ptr_eq(&plan, &c.plan));
+        assert_eq!((c.topology_epoch, c.yield_epoch), (0, 0));
+        assert_eq!(c.plan.lock().unwrap().audit_rng, None);
+    }
+
+    #[test]
+    fn real_topology_change_keeps_yield_state_and_epoch() {
+        let mut c = Controller::new(CascadeSettings {
+            target_milli: Some(-100),
+            yield_per_million: Some(10_000_000.0),
+            ..enabled_settings()
+        });
+        let (ticket, _, _) = c.admit(&job(0, 32));
+        c.finish(&ticket, Some(-100), true);
+        let yield_epoch = c.yield_epoch;
+        c.admit(&job(1, 1000));
+        c.plan.lock().unwrap().cutoffs[0].observe(0.0);
+        let topology_epoch = c.topology_epoch;
+        let mut changed = job(2, 1000);
+        changed.graph.h.push(0.0);
+        c.admit(&changed);
+        assert_eq!(c.topology_epoch, topology_epoch + 1);
+        assert_eq!(c.yield_epoch, yield_epoch);
+        assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
+        let (hits, bound) = c.yield_check.as_ref().unwrap().observation();
+        assert_eq!(hits, 1.0);
+        assert!((bound - (30f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn custom_beta_range_controls_reheat_validation_and_tails() {
+        let mut params = params(1000, 2);
+        params.beta_range = Some((0.5, 4.0));
+        let (fallback, checkpoints) = segment_schedule(&ring(), &params, &[32, 256], 0.25);
+        let expected: Vec<_> = build_beta_schedule(&ring(), 1000, 2, params.beta_range)
+            .0
+            .into_iter()
+            .flat_map(|b| [b; 2])
+            .collect();
+        assert_eq!(fallback, expected);
+        assert_eq!(checkpoints, vec![32, 256, 1000]);
+        let (reheated, reheated_checkpoints) = segment_schedule(&ring(), &params, &[32, 256], 1.0);
+        assert_eq!(reheated_checkpoints, checkpoints);
+        assert_eq!(reheated.len(), 1000);
+        for i in [32, 256] {
+            assert_eq!(reheated[i], 1.0);
+        }
+        for i in [31, 255, 999] {
+            assert_eq!(reheated[i], 4.0);
+        }
     }
 }
