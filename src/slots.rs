@@ -622,13 +622,14 @@ impl SlotPool {
         }
         let n = self.cached.n;
         // Byte expansion avoids per-spin shifts. Keep the same energy audit.
-        // Split within jobs as well: a 64-read job must not pin an entire
-        // decode worker while the runner waits for the slowest job.
+        // Bound both ends of leaf size: a minimum alone can leave 160 reads
+        // on one worker, whose remaining sequential work cannot be stolen.
         let decoded = self.decode.install(|| {
             use rayon::prelude::*;
             (0..count)
                 .into_par_iter()
                 .with_min_len(16)
+                .with_max_len(32)
                 .map(|index| {
                     let start = index * packed_size;
                     SamplerResult {
