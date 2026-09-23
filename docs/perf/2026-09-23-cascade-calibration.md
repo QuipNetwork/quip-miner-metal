@@ -12,12 +12,68 @@ nonces through 32, 64, 128, and 256 sweeps. Of the 200 nonces that a
 under a 256-read, 65,536-sweep solve. The deepest is −14,650,000. The 200
 random control nonces reach no deeper than −14,536,000.
 
-The cascade uses the stages [32, 128, 256] and then the full budget. It keeps
-1 in 3,000 nonces overall, which is 1 in 14.4 at each probe stage.
+The cascade uses the stages [32, 256] and then the full budget. It keeps 1 in
+2,000 nonces overall, which is 1 in 44.7 at each probe stage. These defaults
+come from the re-run in the section on independent stage seeds. The first
+round chose [32, 128, 256] at 1 in 3,000, and a harness defect biased it.
 
 Two findings miss their projections: the tail correlation and the normality
 check. The misses change the stage list, the keep target, and `k0`. They do
 not show a weak screen. The section on the tail correlation gives the reason.
+
+## Independent stage seeds
+
+The first round shared one device seed across the stages of each nonce. The
+harness put the stage index in bits 32 and up of the job seed, and the device
+reads only the low 32 bits. Each nonce's 32, 64, 128, and 256-sweep runs
+therefore started from the same state with the same random stream, and the
+stages agreed more than independent anneals do. The production relay mixes the
+stage into the low bits and was not affected. Arms A and B ran again with the
+harness fixed. Arm C1 is unchanged, because its runs are stage 0 and keep
+their seeds.
+
+| finding | first round | independent seeds |
+|---|---:|---:|
+| Spearman, 32 sweeps against full | 0.768 | 0.771 |
+| Spearman, 256 sweeps against full | 0.899 | 0.898 |
+| tail r on the deepest 500 | 0.372 | 0.323 |
+| normality at 1 in 100,000 | −0.58 sd | −0.54 sd |
+| cost per 64-read job | 122.3 + 2.367 µs × sweeps | 124.0 + 2.284 µs × sweeps |
+
+The comparisons against the full budget barely move. The comparisons between
+probe stages do. With independent seeds, the 128-sweep rung keeps the same
+deep nonces as [32, 256] and costs 20 to 30 µs more per nonce:
+
+| overall keep | stages | deepest 10 kept | deepest 50 kept | µs per nonce |
+|---|---|---:|---:|---:|
+| 1 in 1,000 | 32, 256 | 6 | 19 | 252 |
+| 1 in 1,000 | 32, 128, 256 | 6 | 19 | 279 |
+| 1 in 2,000 | 32, 256 | 4 | 11 | 229 |
+| 1 in 2,000 | 32, 128, 256 | 4 | 12 | 251 |
+| 1 in 3,000 | 32, 256 | 3 | 9 | 221 |
+| 1 in 3,000 | 32, 128, 256 | 3 | 10 | 240 |
+
+The stages return to the spec default, [32, 256]. The spec's action for the
+tail miss adds a rung, and this data does not support one. The keep target
+moves toward 1 in 1,000, as that action says, and stops at 1 in 2,000. At 1 in
+1,000 the target would equal the clamp's lower bound, and the model checks
+could not loosen further.
+
+The constants for these defaults:
+
+| constant | value |
+|---|---|
+| probe stages | 32, 256 sweeps |
+| keep target, overall | 1 in 2,000 |
+| keep per probe stage | 1 in 2,000^(1/2), about 1 in 44.7 |
+| audit miss rate `r0`, 32 to 256 | 0.0348 |
+| audit miss rate `r0`, 256 to 14,336 | 0.0357 |
+| skew at 32 and 256 sweeps | −0.147, −0.091 |
+| excess kurtosis at 32 and 256 sweeps | 0.041, 0.016 |
+| cost per 64-read job | 124.0 µs + 2.284 µs × sweeps |
+
+The second `r0` rests on 26 kept nonces in Arm A and is the least certain
+value. The data is in `docs/perf/data/2026-09-23-calibration-v2/`.
 
 ## Arms
 
@@ -104,7 +160,7 @@ screened nonce from the cost model, with a 14,336-sweep full budget.
 One 32-sweep stage alone loses most of the deep nonces. A second or third
 stage costs 15 to 50 µs per nonce and keeps several times as many.
 
-## Constants for the cascade relay
+## First-round constants, superseded
 
 | constant | value |
 |---|---|
