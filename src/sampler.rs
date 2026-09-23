@@ -156,19 +156,18 @@ const _: () = assert!(
 /// `max_total_threads_per_threadgroup`. The persistent RNG buffer is sized by
 /// that clamped width, not by this constant.
 const MSA_THREADS: usize = 1024;
-/// Static threadgroup bytes `msa_anneal` declares: an 8192-byte threshold row
-/// plus 64 `uint` cut values and 32 atomic lane totals.
+/// Static threadgroup bytes `msa_anneal` declares: 32 atomic lane totals.
 /// `msa_pipeline_compiles_and_admits_at_least_256_threads` checks the compiled figure
-/// against a bound using the literal 8576 bytes,
+/// against a bound using the literal 144 bytes (16 bytes of alignment headroom),
 /// rather than reading this constant.
-const MSA_STATIC_TG_BYTES: usize = 8192 + 64 * 4 + MSA_LANES * 4;
+const MSA_STATIC_TG_BYTES: usize = MSA_LANES * 4;
 /// Threadgroup memory every Apple GPU family offers per threadgroup, bytes.
 /// There is no opt-in above it (CUDA's `MAX_DYNAMIC_SHARED_SIZE_BYTES` has no
 /// counterpart), which is why the kernel uses 32-bit words: one `u64` per
 /// spin does not fit Advantage2's 4577 spins.
 const APPLE_TG_MEMORY_BYTES: usize = 32 * 1024;
 /// Multi-spin kernel `N` cap: `N * 4` bytes of spin words must fit beside the
-/// static arrays under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 8576 = 32,640).
+/// lane totals under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 128 = 24,192).
 ///
 /// `crate::METAL_MSA_IDENTITY` advertises this same cap, so the identity
 /// const and the dispatch guard have one source.
@@ -1090,9 +1089,8 @@ fn new_gibbs_persistent(
 }
 
 /// Multi-spin carry-over state: one `uint` word per (threadgroup, spin) plus
-/// one xoshiro128** stream (four `uint`) per (threadgroup, thread). The
-/// threshold row is rebuilt at every rung and the sweep offsets are hashed
-/// from their coordinates, so nothing else survives a chunk boundary.
+/// one xoshiro128** stream (four `uint`) per (threadgroup, thread). Only spin
+/// words and RNG streams persist across a chunk boundary.
 fn new_msa_persistent(
     pool: &BufferPool,
     device: &metal::DeviceRef,
@@ -1957,6 +1955,11 @@ mod tests {
             .max()
             .unwrap();
         assert_eq!(max_csr_degree(&g), builder_max);
+    }
+
+    #[test]
+    fn msa_static_threadgroup_budget_is_the_lane_totals_only() {
+        assert_eq!(MSA_STATIC_TG_BYTES, 32 * 4);
     }
 
     #[test]

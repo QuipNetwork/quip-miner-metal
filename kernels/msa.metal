@@ -23,7 +23,7 @@ using namespace metal;
 //   the beta ladder across command buffers (macOS GPU watchdog), so this
 //   kernel resumes from persistent buffers exactly as block_gibbs_parallel
 //   in kernels/gibbs.metal does.
-// - Thresholds are 32-bit: cut[m] = floor(exp(-2 beta m) * 2^32).
+// - Geometric thresholds are drawn inline from a 32-bit RNG per word update.
 //
 // Preconditions the host checks: J in {-1, 0, +1}, |h| <= 1, CSR degree
 // <= MSA_MAX_DEG. On the last chunk the kernel writes each read's energy in
@@ -35,8 +35,6 @@ using namespace metal;
 #define MSA_PLANES     6
 #define MSA_MAX_COUNT  63
 #define MSA_MAX_FIELD  63
-#define MSA_ROW        8192
-#define MSA_ROW_MASK   8191
 #define MSA_MAX_DEG    20
 
 typedef unsigned int uint;
@@ -84,16 +82,17 @@ inline RngState seed_rng(uint seed) {
     return state;
 }
 
-// Cyclic shift into the threshold row for one sweep. A pure hash of the
-// coordinates, so a chunk that resumes mid-ladder computes the same shift
-// the unchunked run would.
-inline uint sweep_offset(uint base_seed, uint problem_id, uint word, int beta_idx, int sweep) {
-    uint z = base_seed
-           ^ (problem_id * 0x9E3779B9u)
-           ^ (word * 0x85EBCA6Bu)
-           ^ (uint(beta_idx) * 0xC2B2AE35u)
-           ^ uint(sweep);
-    return splitmix32(z) & MSA_ROW_MASK;
+// One geometric draw M with P(M >= m) = exp(-2 beta m), capped at
+// MSA_MAX_FIELD. Same distribution as the old per-rung threshold row
+// (M = max m with u < floor(exp(-2 beta m) 2^32)), drawn per word update so
+// no row is rebuilt at each rung.
+inline int geometric_draw(uint u, float two_beta) {
+    if (two_beta <= 0.0f) {
+        return MSA_MAX_FIELD;
+    }
+    float x = min((float(u) + 1.0f) * 2.3283064365386963e-10f, 1.0f);
+    float m = floor(-log(x) / two_beta);
+    return int(clamp(m, 0.0f, float(MSA_MAX_FIELD)));
 }
 
 // ==============================================================================
@@ -252,8 +251,6 @@ kernel void msa_anneal(
     uint3 threads_per_group [[threads_per_threadgroup]]
 ) {
     threadgroup atomic_int lane_total[MSA_LANES];
-    threadgroup uchar row[MSA_ROW];              // geometric draws M for the current rung
-    threadgroup uint cut[MSA_MAX_FIELD + 1];     // cut[m] = floor(exp(-2 beta m) * 2^32)
 #ifdef QUIP_MSA_DIAGNOSTICS
     ulong accept_count = 0;                      // per-thread flips across this chunk's sweeps
 #endif
@@ -307,30 +304,9 @@ kernel void msa_anneal(
     for (int beta_idx = beta_start; beta_idx < chunk_end; beta_idx++) {
         float beta = beta_schedule[beta_idx];
 
-        // Threshold table for this rung. cut[0] is never read (m starts at 1).
-        if (tid <= uint(MSA_MAX_FIELD)) {
-            float p = exp(-2.0f * beta * float(tid));
-            cut[tid] = (p >= 1.0f) ? 0xFFFFFFFFu : uint(p * 4294967296.0f);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // One geometric draw per row slot: M = max m with u < cut[m].
-        for (uint i = tid; i < uint(MSA_ROW); i += gsz) {
-            uint u = xoshiro128starstar(rng);
-            int m = 0;
-            if (u < cut[1]) {
-                m = 1;
-                while (m < MSA_MAX_FIELD && u < cut[m + 1]) {
-                    ++m;
-                }
-            }
-            row[i] = uchar(m);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float two_beta = 2.0f * beta;
 
         for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
-            int off = int(sweep_offset(base_seed, problem_id, w, beta_idx, sweep));
-
             for (int color = 0; color < num_colors; color++) {
                 int block_start = color_block_starts[color];
                 int block_count = color_block_counts[color];
@@ -374,7 +350,7 @@ kernel void msa_anneal(
                     popcount21(x, planes);
 
                     // Metropolis: flip where L <= (d + M) / 2.
-                    int m = row[(var + off) & MSA_ROW_MASK];
+                    int m = geometric_draw(xoshiro128starstar(rng), two_beta);
                     int limit = (d + m) >> 1;
                     uint accept = (limit >= d) ? 0xFFFFFFFFu : le_constant(planes, limit);
                     state[var] = bi ^ accept;

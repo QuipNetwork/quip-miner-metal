@@ -253,6 +253,15 @@ mod tests {
     }
 
     #[test]
+    fn msa_static_threadgroup_memory_is_the_lane_totals_only() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = MetalDevice::open(0).unwrap();
+        assert!(dev.msa.static_threadgroup_memory_length() as usize <= 32 * 4 + 16);
+    }
+
+    #[test]
     fn msa_pipeline_compiles_and_admits_at_least_256_threads() {
         if MetalDevice::device_count() == 0 {
             return;
@@ -261,10 +270,10 @@ mod tests {
         // The host requests 1,024 threads per multi-spin threadgroup and clamps
         // to the pipeline maximum. Require support for at least 256 threads.
         assert!(dev.msa.max_total_threads_per_threadgroup() >= 256);
-        // Static threadgroup arrays (row + cut + lane totals) must leave room for the
+        // Static threadgroup lane totals must leave room for the
         // largest advertised N at 4 bytes per spin under the 32 KB cap.
         let static_bytes = dev.msa.static_threadgroup_memory_length() as usize;
-        assert!(static_bytes <= 8576, "static tg bytes {static_bytes}");
+        assert!(static_bytes <= 144, "static tg bytes {static_bytes}");
         assert!(
             static_bytes + 6016 * 4 <= dev.device.max_threadgroup_memory_length() as usize,
             "6016 spins do not fit beside {static_bytes} static bytes"
