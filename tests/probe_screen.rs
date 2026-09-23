@@ -166,8 +166,9 @@ fn hex(seed: &[u8; 32]) -> String {
 struct Stage {
     num_reads: usize,
     num_sweeps: usize,
-    /// How many of the run's nonces this stage takes, from the front. `None`
-    /// takes all of them. A rate comparison needs a long shape and a short
+    /// How many of the run's nonces this stage takes. Unfiltered, that is a
+    /// prefix of the nonces. With `QUIP_SCREEN_FILTER`, it is the lowest-energy
+    /// nonces of the previous stage's keep. `None` takes all of them. A rate comparison needs a long shape and a short
     /// shape to run for a similar time, which needs different counts.
     nonces: Option<usize>,
 }
@@ -345,8 +346,8 @@ fn run_stage(
         blocked += block_time;
     }
     eprintln!(
-        "  producer: drawing {:.1} s, blocked on the device {:.1} s, of {wall_s:.1} s wall;\
-         {:.2} ms per instance",
+        "  producers, summed over threads: drawing {:.1} s, blocked on the device {:.1} s \
+         ({wall_s:.1} s wall); {:.2} ms per instance",
         drawing.as_secs_f64(),
         blocked.as_secs_f64(),
         1000.0 * drawing.as_secs_f64() / count as f64
@@ -384,10 +385,12 @@ fn derived_topology_reproduces_a_regenerated_problem() {
 #[test]
 #[ignore = "GPU study: an hour of device time at the default nonce count"]
 fn probe_then_solve_on_fresh_nonces() {
-    if MetalDevice::device_count() == 0 {
-        eprintln!("skipping probe-screen study: no Metal device");
-        return;
-    }
+    // An ignored study runs only on request, so a missing device is a failure,
+    // not a skip: a skip would exit 0 without writing the CSV.
+    assert!(
+        MetalDevice::device_count() > 0,
+        "probe-screen study requested but no Metal device is available"
+    );
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
