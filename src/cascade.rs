@@ -384,15 +384,27 @@ impl Controller {
     }
 
     /// Reset gate state on a gated topology change. Return the job's schedule plan.
+    #[cfg(test)]
     pub(crate) fn admit(&mut self, job: &StreamJob) -> (Ticket, Vec<f32>, Vec<usize>) {
-        let stages = if self.settings.enabled {
-            &self.settings.stages[..]
-        } else {
-            &[]
-        };
-        let (schedule, checkpoints) =
-            segment_schedule(&job.graph, &job.params, stages, self.settings.reheat_beta);
-        if checkpoints.len() > 1 {
+        let mut schedule = PreparedSchedule::new(job, self.settings);
+        let ticket = self.admit_prepared(job, &mut schedule);
+        (ticket, schedule.betas, schedule.checkpoints)
+    }
+
+    pub(crate) fn admit_prepared(
+        &mut self,
+        job: &StreamJob,
+        schedule: &mut PreparedSchedule,
+    ) -> Ticket {
+        // Only settings changes rebuild on the runner. Queued jobs must use
+        // the current gate plan, including when the cascade is disabled.
+        if schedule.settings.enabled != self.settings.enabled
+            || schedule.settings.stages != self.settings.stages
+            || schedule.settings.reheat_beta.to_bits() != self.settings.reheat_beta.to_bits()
+        {
+            *schedule = PreparedSchedule::new(job, self.settings);
+        }
+        if schedule.checkpoints.len() > 1 {
             if !self.matches_topology(&job.graph) {
                 self.plan = Arc::new(Mutex::new(StagePlan::new(self.settings)));
                 self.topology = Some((job.graph.num_nodes(), job.graph.edges.clone()));
@@ -407,16 +419,15 @@ impl Controller {
         if let Some(check) = &mut self.yield_check {
             check.admit();
         }
-        let ticket = Ticket {
-            gates: checkpoints.len() - 1,
+        Ticket {
+            gates: schedule.checkpoints.len() - 1,
             stage: 0,
             audited: false,
             topology_epoch: self.topology_epoch,
             yield_epoch: self.yield_epoch,
             plan: Arc::clone(&self.plan),
             final_sweeps: job.params.num_sweeps,
-        };
-        (ticket, schedule, checkpoints)
+        }
     }
 
     /// Called at a non-last checkpoint. true = keep running.
@@ -521,6 +532,29 @@ impl Controller {
     }
 }
 
+pub(crate) struct PreparedSchedule {
+    settings: CascadeSettings,
+    pub(crate) betas: Vec<f32>,
+    pub(crate) checkpoints: Vec<usize>,
+}
+
+impl PreparedSchedule {
+    pub(crate) fn new(job: &StreamJob, settings: CascadeSettings) -> Self {
+        let stages = if settings.enabled {
+            &settings.stages[..]
+        } else {
+            &[]
+        };
+        let (betas, checkpoints) =
+            segment_schedule(&job.graph, &job.params, stages, settings.reheat_beta);
+        Self {
+            settings,
+            betas,
+            checkpoints,
+        }
+    }
+}
+
 pub(crate) fn segment_schedule(
     graph: &IsingGraph,
     params: &SampleParams,
@@ -551,7 +585,7 @@ pub(crate) fn segment_schedule(
         params.num_sweeps
     };
     let (standard, repeats) =
-        build_beta_schedule(graph, first, params.sweeps_per_beta, params.beta_range);
+        build_beta_schedule(graph, first, params.sweeps_per_beta, Some((hot, cold)));
     let mut schedule = Vec::with_capacity(params.num_sweeps);
     for beta in &standard {
         schedule.extend(std::iter::repeat_n(
@@ -577,6 +611,89 @@ pub(crate) fn segment_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_schedule_preserves_legacy_bits() {
+        let graph = ring();
+        for range in [None, Some((0.1, 6.0))] {
+            for sweeps in [1, 31, 32, 33, 1000] {
+                for repeats in [1, 4, 64] {
+                    let mut params = params(sweeps, repeats);
+                    params.beta_range = range;
+                    for reheat in [0.25, 10.0] {
+                        let (actual, checkpoints) =
+                            segment_schedule(&graph, &params, &[32, 256], reheat);
+                        let (hot, cold) = range.unwrap_or_else(|| default_ising_beta_range(&graph));
+                        let reheated = reheat > hot && reheat < cold;
+                        let first = if reheated { checkpoints[0] } else { sweeps };
+                        // Legacy construction passes the original optional range,
+                        // including a second default-range computation for None.
+                        let (standard, repeat) = build_beta_schedule(&graph, first, repeats, range);
+                        let mut expected: Vec<_> = standard
+                            .iter()
+                            .flat_map(|b| std::iter::repeat_n(*b, repeat))
+                            .take(first)
+                            .collect();
+                        expected.resize(first, standard.last().copied().unwrap_or(cold as f32));
+                        if reheated {
+                            for pair in checkpoints.windows(2) {
+                                expected.extend(
+                                    geometric_beta_schedule(reheat, cold, pair[1] - pair[0])
+                                        .into_iter()
+                                        .map(|b| b as f32),
+                                );
+                            }
+                        }
+                        assert_eq!(
+                            actual.iter().map(|b| b.to_bits()).collect::<Vec<_>>(),
+                            expected.iter().map(|b| b.to_bits()).collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_schedule_refreshes_before_admission() {
+        let job = StreamJob {
+            job_id: vec![1],
+            graph: ring(),
+            params: params(1000, 1),
+            watermark: None,
+        };
+        let old = CascadeSettings {
+            enabled: true,
+            stages: [32, 256, 0],
+            ..Default::default()
+        };
+        for new in [
+            CascadeSettings {
+                stages: [16, 128, 512],
+                ..old
+            },
+            CascadeSettings {
+                reheat_beta: 0.5,
+                ..old
+            },
+            CascadeSettings {
+                enabled: false,
+                ..old
+            },
+        ] {
+            let mut prepared = PreparedSchedule::new(&job, old);
+            let mut controller = Controller::new(old);
+            controller.refresh(new);
+            let ticket = controller.admit_prepared(&job, &mut prepared);
+            let mut expected = Controller::new(new);
+            let (expected_ticket, betas, checkpoints) = expected.admit(&job);
+            assert_eq!(prepared.betas, betas);
+            assert_eq!(prepared.checkpoints, checkpoints);
+            assert_eq!(ticket.gates, expected_ticket.gates);
+            assert_eq!(ticket.stage, expected_ticket.stage);
+            assert_eq!(ticket.final_sweeps, expected_ticket.final_sweeps);
+        }
+    }
     use crate::sampler::build_beta_schedule;
     use crate::{IsingGraph, SampleParams};
     use quip_solver_core::beta::default_ising_beta_range;

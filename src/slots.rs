@@ -4,6 +4,7 @@
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, BufferPool, CachedTopology, Kernel, SampleError, MSA_THREADS};
 use crate::topology::fill_h_j_matching;
+use crate::topology::SelfFeedingTopology;
 use crate::{IsingGraph, SampleParams, SamplerResult};
 use metal::{MTLCommandBufferStatus, MTLSize};
 use std::sync::Arc;
@@ -16,6 +17,7 @@ pub(crate) struct SlotJob {
 }
 
 impl SlotJob {
+    #[cfg(test)]
     fn validate(&self, sched_stride: usize) -> Result<(), SampleError> {
         if self.schedule.len() > sched_stride {
             return Err(SampleError::TooLarge("schedule exceeds slot stride".into()));
@@ -27,21 +29,54 @@ impl SlotJob {
                 "slot jobs require exact device-energy coefficients".into(),
             ));
         }
-        if self.schedule.is_empty()
-            || self.schedule.iter().any(|b| !b.is_finite() || *b < 0.0)
-            || self.checkpoints.first().is_none_or(|&p| p == 0)
-            || self.checkpoints.last() != Some(&self.schedule.len())
-            || self.checkpoints.windows(2).any(|p| p[0] >= p[1])
-        {
-            return Err(SampleError::Driver(
-                "invalid slot schedule or checkpoints".into(),
-            ));
-        }
-        Ok(())
+        validate_schedule(&self.schedule, &self.checkpoints)
+    }
+}
+
+pub(crate) fn validate_schedule(
+    schedule: &[f32],
+    checkpoints: &[usize],
+) -> Result<(), SampleError> {
+    if schedule.is_empty()
+        || schedule.iter().any(|b| !b.is_finite() || *b < 0.0)
+        || checkpoints.first().is_none_or(|&p| p == 0)
+        || checkpoints.last() != Some(&schedule.len())
+        || checkpoints.windows(2).any(|p| p[0] >= p[1])
+    {
+        return Err(SampleError::Driver(
+            "invalid slot schedule or checkpoints".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Host allocations only. Construction binds coefficients to the exact graph.
+pub(crate) struct PreparedInputs {
+    graph: IsingGraph,
+    couplings: Vec<i8>,
+    fields: Vec<i8>,
+}
+
+impl PreparedInputs {
+    pub(crate) fn new(
+        graph: &IsingGraph,
+        topology: &SelfFeedingTopology,
+        edges: &[(usize, usize)],
+    ) -> Option<Self> {
+        let (couplings, fields) = fill_h_j_matching(topology, edges, graph)?;
+        Some(Self {
+            graph: graph.clone(),
+            couplings,
+            fields,
+        })
     }
 }
 
 pub(crate) type SlotId = usize;
+
+fn device_time_share(total: u64, count: usize, index: usize) -> u64 {
+    total / count as u64 + u64::from((index as u64) < total % count as u64)
+}
 
 fn checked_read_pointer<T>(
     contents: *mut std::ffi::c_void,
@@ -237,19 +272,55 @@ impl SlotPool {
 
     /// Validate topology exactly during coefficient construction. Callers can
     /// admit directly without a prior matches query or a topology hash.
+    #[cfg(test)]
     pub(crate) fn admit(&mut self, job: SlotJob) -> Result<SlotId, SampleError> {
         self.idle()?;
         job.validate(self.sched_stride)?;
+        let (couplings, fields) =
+            fill_h_j_matching(&self.cached.topo, &self.cached.edges, &job.graph)
+                .ok_or_else(|| SampleError::Driver("job topology differs from slot pool".into()))?;
+        self.upload(job, &couplings, &fields)
+    }
+
+    /// Validation and quantization have already run on a preparation worker.
+    pub(crate) fn admit_prepared(
+        &mut self,
+        inputs: PreparedInputs,
+        schedule: Vec<f32>,
+        checkpoints: Vec<usize>,
+        seed: u64,
+    ) -> Result<SlotId, SampleError> {
+        self.idle()?;
+        if schedule.len() > self.sched_stride {
+            return Err(SampleError::TooLarge("schedule exceeds slot stride".into()));
+        }
+        if !self.matches(&inputs.graph, self.num_reads) {
+            return Err(SampleError::Driver(
+                "job topology differs from slot pool".into(),
+            ));
+        }
+        let job = SlotJob {
+            graph: inputs.graph,
+            schedule,
+            checkpoints,
+            seed,
+        };
+        self.upload(job, &inputs.couplings, &inputs.fields)
+    }
+
+    fn upload(
+        &mut self,
+        job: SlotJob,
+        couplings: &[i8],
+        fields: &[i8],
+    ) -> Result<SlotId, SampleError> {
         let slot = self
             .slots
             .iter()
             .position(Option::is_none)
             .ok_or_else(|| SampleError::TooLarge("slot pool is full".into()))?;
-        let (couplings, fields) =
-            fill_h_j_matching(&self.cached.topo, &self.cached.edges, &job.graph)
-                .ok_or_else(|| SampleError::Driver("job topology differs from slot pool".into()))?;
-        self.write(2, slot * self.cached.topo.nnz, &couplings)?;
-        self.write(15, slot * self.cached.n, &fields)?;
+        self.write(2, slot * self.cached.topo.nnz, couplings)?;
+        self.write(15, slot * self.cached.n, fields)?;
         self.write(9, slot * self.sched_stride, &job.schedule)?;
         self.slots[slot] = Some(ResidentJob {
             job,
@@ -368,7 +439,7 @@ impl SlotPool {
                 "slot command buffer has not completed".into(),
             ));
         }
-        let share = sampler::gpu_time_us(command) / self.steps.len() as u64;
+        let device_us = sampler::gpu_time_us(command);
         let energies = self.read_pointer::<i32>(11, self.capacity() * self.num_reads)?;
         self.command = None;
         let output_count = self
@@ -377,13 +448,17 @@ impl SlotPool {
             .filter(|step| step.flags & SLOT_WRITE_OUTPUT != 0)
             .count();
         let mut checkpoints = Vec::with_capacity(output_count);
-        for step in &self.steps {
+        for (index, step) in self.steps.iter().enumerate() {
             let slot = step.slot as usize;
             let Some(r) = self.slots[slot].as_mut() else {
                 continue;
             };
             r.position += step.beta_count as usize;
-            r.device_us = r.device_us.saturating_add(share);
+            // Attribute equal shares, distributing the integer remainder so
+            // per-job totals reconcile exactly with command-buffer time.
+            r.device_us =
+                r.device_us
+                    .saturating_add(device_time_share(device_us, self.steps.len(), index));
             if step.flags & SLOT_WRITE_OUTPUT != 0 {
                 let index = r.next_checkpoint;
                 r.next_checkpoint += 1;
@@ -544,6 +619,33 @@ pub(crate) fn slot_seed(seed: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_time_shares_conserve_command_time() {
+        for count in [1, 2, 20, 40] {
+            for total in [0, 1, 19, 20, 21, 1250243] {
+                let shares: Vec<_> = (0..count)
+                    .map(|index| device_time_share(total, count, index))
+                    .collect();
+                assert_eq!(shares.iter().sum::<u64>(), total);
+                assert!(shares.iter().max().unwrap() - shares.iter().min().unwrap() <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_coefficients_match_slot_quantization() {
+        let graph = advantage2_system1(7);
+        let topology = SelfFeedingTopology::build_with_advantage2_coloring(&graph);
+        let host_topology = SelfFeedingTopology::build(&graph);
+        let inputs = PreparedInputs::new(&graph, &host_topology, &graph.edges).unwrap();
+        let (couplings, fields) = fill_h_j_matching(&topology, &graph.edges, &graph).unwrap();
+        assert_eq!(inputs.couplings, couplings);
+        assert_eq!(inputs.fields, fields);
+        let mut other = graph.clone();
+        other.edges.swap(0, 1);
+        assert!(PreparedInputs::new(&other, &topology, &graph.edges).is_none());
+    }
     use crate::metal_device::MetalDevice;
     use crate::sampler::{build_beta_schedule, energy_milli, unpack_spins, MSA_THREADS};
     use crate::topology::{fill_h_j, SelfFeedingTopology};
@@ -644,11 +746,14 @@ mod tests {
         for j in jobs {
             pool.admit(j).unwrap();
         }
-        let mut expected_us = 0;
+        let mut expected_us = [0; 3];
         for index in 0..2 {
             assert!(pool.commit_step(32).unwrap());
             pool.wait();
-            expected_us += sampler::gpu_time_us(pool.command.as_ref().unwrap()) / 3;
+            let command_us = sampler::gpu_time_us(pool.command.as_ref().unwrap());
+            for (slot, us) in expected_us.iter_mut().enumerate() {
+                *us += device_time_share(command_us, 3, slot);
+            }
             assert_eq!(
                 pool.take_checkpoints().unwrap().len(),
                 if index == 0 { 0 } else { 3 }
@@ -682,7 +787,7 @@ mod tests {
                     )
                 );
             }
-            assert_eq!(pool.device_us(slot), expected_us);
+            assert_eq!(pool.device_us(slot), expected_us[slot]);
         }
     }
 
@@ -1218,7 +1323,10 @@ mod tests {
         reason = "explicit throughput study reports both measured rates"
     )]
     fn pool_probe_rate_against_run_stream() {
+        use crate::cascade::{CascadeSettings, Controller, Ticket};
+        use crate::resident::{Preparation, PREP_BOUND};
         use crate::sampler::{encode_batch, harvest_batch, EncodedBatch};
+        use quip_solver_core::StreamJob;
         use std::time::{Duration, Instant};
 
         fn timed<T>(total: &mut Duration, action: impl FnOnce() -> T) -> T {
@@ -1240,16 +1348,49 @@ mod tests {
         let templates: Vec<_> = (0..capacity)
             .map(|i| advantage2_system1(i as u64 + 1))
             .collect();
-        let schedule = build_beta_schedule(&templates[0], SWEEPS, 1, None).0;
         let mut pools = [
             SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
             SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
         ];
-        let mut pool_host = [Duration::ZERO; 6];
+        let settings = CascadeSettings {
+            enabled: true,
+            stages: [SWEEPS, 0, 0],
+            ..Default::default()
+        };
+        let mut controller = Controller::new(settings);
+        let mut tickets: [Vec<Option<Ticket>>; 2] =
+            std::array::from_fn(|_| (0..capacity).map(|_| None).collect());
+        let mut preparation = Preparation::new().unwrap();
+        let mut submitted = 0;
+        let mut feed = |preparation: &mut Preparation| {
+            while preparation.len() < PREP_BOUND && submitted < STEPS * capacity {
+                let index = submitted;
+                preparation.submit(
+                    StreamJob {
+                        job_id: index.to_le_bytes().to_vec(),
+                        graph: templates[index % capacity].clone(),
+                        params: SampleParams {
+                            num_reads: READS,
+                            num_sweeps: SWEEPS,
+                            sweeps_per_beta: 1,
+                            seed: index as u64 + 1,
+                            ..Default::default()
+                        },
+                        watermark: None,
+                    },
+                    settings,
+                );
+                submitted += 1;
+            }
+        };
+        let mut pool_host = [Duration::ZERO; 7];
         let mut pool_gpu_us = 0u64;
+        let mut attributed_gpu_us = 0u64;
         let start = Instant::now();
+        timed(&mut pool_host[6], || feed(&mut preparation));
         for batch_index in 0..STEPS + 2 {
             let pool = &mut pools[batch_index % 2];
+            let tickets = &mut tickets[batch_index % 2];
             if pool.in_flight() {
                 timed(&mut pool_host[2], || pool.wait());
                 pool_gpu_us += sampler::gpu_time_us(pool.command.as_ref().unwrap());
@@ -1259,26 +1400,45 @@ mod tests {
                     .iter()
                     .map(|checkpoint| {
                         assert!(checkpoint.last);
+                        attributed_gpu_us += pool.device_us(checkpoint.slot);
                         checkpoint.slot
                     })
                     .collect();
                 let reads = timed(&mut pool_host[4], || {
                     pool.reads_many(&slots, READS).unwrap()
                 });
-                std::hint::black_box(reads);
-                for slot in slots {
-                    timed(&mut pool_host[5], || pool.release(slot).unwrap());
+                for (slot, reads) in slots.into_iter().zip(reads) {
+                    timed(&mut pool_host[5], || {
+                        controller.finish(
+                            &tickets[slot].take().unwrap(),
+                            reads.iter().map(|r| r.energy_milli).min(),
+                            true,
+                        );
+                        pool.release(slot).unwrap();
+                    });
+                    std::hint::black_box(reads);
                 }
             }
             if batch_index < STEPS {
-                for (i, graph) in templates.iter().enumerate() {
-                    let job = SlotJob {
-                        graph: graph.clone(),
-                        schedule: schedule.clone(),
-                        checkpoints: vec![SWEEPS],
-                        seed: (batch_index * capacity + i + 1) as u64,
-                    };
-                    timed(&mut pool_host[0], || pool.admit(job).unwrap());
+                for _ in 0..capacity {
+                    let prepared = timed(&mut pool_host[6], || {
+                        let prepared = preparation.next().unwrap();
+                        feed(&mut preparation);
+                        prepared
+                    });
+                    let mut data = prepared.data.unwrap();
+                    timed(&mut pool_host[0], || {
+                        let ticket = controller.admit_prepared(&prepared.job, &mut data.schedule);
+                        let slot = pool
+                            .admit_prepared(
+                                data.inputs,
+                                data.schedule.betas,
+                                data.schedule.checkpoints,
+                                prepared.job.params.seed,
+                            )
+                            .unwrap();
+                        tickets[slot] = Some(ticket);
+                    });
                 }
                 assert!(timed(&mut pool_host[1], || pool
                     .commit_step(SWEEPS)
@@ -1286,6 +1446,11 @@ mod tests {
             }
         }
         let pool_seconds = start.elapsed().as_secs_f64();
+        assert_eq!(
+            attributed_gpu_us, pool_gpu_us,
+            "slot time must conserve command time"
+        );
+        drop(preparation);
         let mut batches: [Option<(EncodedBatch, Vec<IsingGraph>)>; 2] = [None, None];
         let mut stream_host = [Duration::ZERO; 4];
         let mut stream_gpu_us = 0u64;
@@ -1324,7 +1489,7 @@ mod tests {
         let jobs = (STEPS * capacity) as f64;
         let pool_rate = jobs / pool_seconds;
         let stream_rate = jobs / stream_seconds;
-        eprintln!("S4 one gate: {STEPS} steps, capacity={capacity}, reads={READS}, sweeps={SWEEPS}, two in flight, no later gates, no controller, no warmup");
+        eprintln!("S4 one gate: {STEPS} steps, capacity={capacity}, reads={READS}, sweeps={SWEEPS}, two in flight, no later gates, controller admission, four preparation workers, no warmup");
         eprintln!("pool={pool_rate:.2} jobs/s ({pool_seconds:.3}s), run_stream-equivalent={stream_rate:.2} jobs/s ({stream_seconds:.3}s), ratio={:.4}", pool_rate / stream_rate);
         for (phase, elapsed) in [
             "admit",
@@ -1333,6 +1498,7 @@ mod tests {
             "take_checkpoints",
             "reads",
             "release",
+            "preparation",
         ]
         .into_iter()
         .zip(pool_host)
@@ -1354,11 +1520,16 @@ mod tests {
             "pool summed GPU time: {pool_gpu_us} us; stream summed GPU time: {stream_gpu_us} us"
         );
         eprintln!(
+            "pool attributed slot GPU time: {attributed_gpu_us} us, {:.3} us/job",
+            attributed_gpu_us as f64 / jobs
+        );
+        eprintln!(
             "host other (job copies, cleanup, timer overhead): pool={:.6}s stream={:.6}s",
             pool_seconds - pool_host.iter().sum::<Duration>().as_secs_f64(),
             stream_seconds - stream_host.iter().sum::<Duration>().as_secs_f64()
         );
         eprintln!("Host phases are exclusive wall intervals, including blocking waits. GPU time overlaps host work; do not add it to host totals. Result destruction is in host other. Pool construction is outside timing.");
+        eprintln!("Preparation includes submission and ordered result waits. Worker validation, schedule construction, quantization, and graph copies overlap other host phases and GPU work.");
         let read_ratio = pool_host[4].as_secs_f64() / stream_host[3].as_secs_f64();
         eprintln!("decode host time: pool={:.2} us/job, stream={:.2} us/job, ratio={read_ratio:.4}, target<=1.2",
             pool_host[4].as_secs_f64() * 1_000_000.0 / jobs,
