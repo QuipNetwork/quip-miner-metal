@@ -37,7 +37,15 @@
 //! sweep budget (default 14336) and every job asks for 64 reads. The job seed
 //! is `job_seed(0, nonce)`, the same derivation the stage loop uses for its
 //! first stage. `QUIP_SCREEN_CASCADE_TOML`, when set, is appended after
-//! `cascade = true`. The CSV columns are
+//! `cascade = true`. `QUIP_G5_MODE` is `system` (default) or `one-gate`.
+//! One-gate mode overrides the backend stages with `[32]` and keep with 2000.
+//! Set `QUIP_SCREEN_FULL=32` to measure only the gate at its minimum budget.
+//! `QUIP_SCREEN_SECOND_SECONDS` (default 0, off) runs a second stream on the
+//! same sampler and producer threads. Nonce indices and drawn seeds continue
+//! from the first stream. The nonce cap applies only to the first stream,
+//! while a seed file caps both streams at its end. Both streams share the CSV.
+//! Rates print every 10 seconds as `cascade:` and `cascade-2:`.
+//! The CSV columns are
 //! `nonce,seed,best,reads,device_us,ok`.
 //!
 //! The instance for a nonce is `draw_ising_milli` on the chain's topology
@@ -456,16 +464,58 @@ fn names_energy_audit_mismatch(text: &str) -> bool {
     text.contains("device energy") && text.contains("host energy")
 }
 
-fn cascade_backend_toml() -> String {
-    let mut toml = String::from("cascade = true\n");
-    if let Ok(extra) = std::env::var("QUIP_SCREEN_CASCADE_TOML") {
-        let extra = extra.trim();
-        if !extra.is_empty() {
-            toml.push_str(extra);
-            toml.push('\n');
-        }
+fn cascade_backend_toml(mode: &str, extra: &str) -> String {
+    assert!(
+        mode == "system" || mode == "one-gate",
+        "QUIP_G5_MODE must be system or one-gate (or unset), got {mode:?}"
+    );
+    let mut config: toml::Table = extra
+        .parse()
+        .expect("QUIP_SCREEN_CASCADE_TOML must be TOML");
+    config
+        .entry("cascade")
+        .or_insert(toml::Value::Boolean(true));
+    if mode == "one-gate" {
+        config.remove("cascade_stages");
+        config.remove("cascade_keep");
     }
-    toml
+    // Emit root settings before tables so appended overrides remain at the root.
+    let tables: toml::Table = config
+        .iter()
+        .filter(|(_, value)| value.is_table())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    config.retain(|_, value| !value.is_table());
+    let mut text = toml::to_string(&config).expect("backend TOML");
+    if mode == "one-gate" {
+        text.push_str("cascade_stages = [32]\ncascade_keep = 2000\n");
+    }
+    text.push_str(&toml::to_string(&tables).expect("backend tables"));
+    text
+}
+
+#[test]
+fn cascade_modes_build_valid_toml() {
+    assert_eq!(cascade_backend_toml("system", ""), "cascade = true\n");
+    let config = cascade_backend_toml(
+        "one-gate",
+        "cascade_stages = [16, 64]\ncascade_keep = 10\ncascade_audit = 7",
+    );
+    let parsed: toml::Table = toml::from_str(&config).expect("valid TOML");
+    assert_eq!(
+        parsed["cascade_stages"].as_array().expect("stages").len(),
+        1
+    );
+    assert_eq!(parsed["cascade_stages"][0].as_integer(), Some(32));
+    assert_eq!(parsed["cascade_keep"].as_integer(), Some(2000));
+    assert_eq!(parsed["cascade_audit"].as_integer(), Some(7));
+    assert!(config.ends_with("cascade_stages = [32]\ncascade_keep = 2000\n"));
+}
+
+#[test]
+#[should_panic(expected = "QUIP_G5_MODE must be system or one-gate")]
+fn cascade_mode_rejects_unknown_values() {
+    cascade_backend_toml("typo", "");
 }
 
 fn cascade_job_id(index: usize, seed: &[u8; 32]) -> Vec<u8> {
@@ -518,6 +568,18 @@ impl NonceSupply {
             seconds,
             limit: Some(limit),
         }
+    }
+
+    fn restart(&mut self, seconds: u64) {
+        self.start = Instant::now();
+        self.seconds = seconds;
+        self.limit = self
+            .inner
+            .get_mut()
+            .expect("nonce supply")
+            .listed
+            .as_ref()
+            .map(Vec::len);
     }
 
     /// Next nonce, or `None` once the time limit or the job cap is reached.
@@ -580,7 +642,19 @@ fn run_cascade_study(target: i64, producers: usize, out_path: &str) {
     let edges = aglais_edges();
     let sweeps = env_parse("QUIP_SCREEN_FULL", 14_336usize);
     let seconds = env_parse("QUIP_SCREEN_SECONDS", 1_800u64);
-    let supply = if let Ok(path) = std::env::var("QUIP_SCREEN_SEEDS") {
+    let second_seconds = env_parse("QUIP_SCREEN_SECOND_SECONDS", 0u64);
+    let mode = match std::env::var("QUIP_G5_MODE") {
+        Ok(mode) => mode,
+        Err(std::env::VarError::NotPresent) => "system".to_owned(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("QUIP_G5_MODE must be system or one-gate (or unset)")
+        }
+    };
+    let backend_toml = cascade_backend_toml(
+        &mode,
+        &std::env::var("QUIP_SCREEN_CASCADE_TOML").unwrap_or_default(),
+    );
+    let mut supply = if let Ok(path) = std::env::var("QUIP_SCREEN_SEEDS") {
         Arc::new(NonceSupply::listed(read_seeds(&path), seconds))
     } else {
         let run_seed = env_or("QUIP_SCREEN_SEED", 20_260_918u64);
@@ -595,116 +669,166 @@ fn run_cascade_study(target: i64, producers: usize, out_path: &str) {
         Arc::new(NonceSupply::drawn(run_seed, limit, seconds))
     };
     eprintln!(
-        "cascade: {NUM_READS} reads, {sweeps} sweeps, {seconds} s, target {target} milli, output {out_path}"
+        "cascade: {NUM_READS} reads, {sweeps} sweeps, {seconds} s, target {target} milli, output {out_path}, mode={mode} backend_toml={backend_toml:?}"
     );
 
     let mut out = std::io::BufWriter::new(std::fs::File::create(out_path).expect("create csv"));
     writeln!(out, "nonce,seed,best,reads,device_us,ok").expect("write");
 
-    let (job_tx, job_rx) = tokio::sync::mpsc::channel(128);
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(128);
-    let cancel = CancelToken::default();
-    let mut producer_threads = Vec::new();
-    for _ in 0..producers {
-        let edges = edges.clone();
-        let supply = Arc::clone(&supply);
-        let job_tx = job_tx.clone();
-        producer_threads.push(std::thread::spawn(move || {
-            let mut admitted = 0usize;
-            while let Some((index, seed)) = supply.next_nonce() {
-                let graph = instance(seed, &edges);
-                let job = StreamJob {
-                    job_id: cascade_job_id(index, &seed),
-                    graph,
-                    params: SampleParams {
-                        num_reads: NUM_READS,
-                        num_sweeps: sweeps,
-                        sweeps_per_beta: 1,
-                        beta_range: None,
-                        // The relay derives later probe seeds from this one.
-                        // Stage 0 is the derivation `run_stage` uses first.
-                        seed: job_seed(0, index),
-                    },
-                    watermark: None,
-                };
-                if job_tx.blocking_send(job).is_err() {
-                    break;
-                }
-                admitted += 1;
-            }
-            admitted
-        }));
-    }
-    drop(job_tx);
-
-    let backend_toml = cascade_backend_toml();
+    let (streams_tx, streams_rx) = std::sync::mpsc::channel::<(
+        tokio::sync::mpsc::Receiver<StreamJob>,
+        tokio::sync::mpsc::Sender<quip_solver_core::StreamResult>,
+    )>();
     let worker = std::thread::spawn(move || {
         let device = MetalDevice::open(0).expect("Metal device 0");
         let gov = UtilGovernor::start(0, 100, false);
         let sampler = MetalSampler::new(device, gov, Kernel::Msa);
         sampler.apply_config(&backend_toml);
-        sampler.sample_stream(job_rx, out_tx, cancel);
+        for (jobs, results) in streams_rx {
+            sampler.sample_stream(jobs, results, CancelToken::default());
+        }
     });
 
-    let mut done = 0usize;
-    let mut errors = 0usize;
-    let mut hits = 0usize;
-    let mut last_report = Instant::now();
-    while let Some(result) = out_rx.blocking_recv() {
-        let (index, seed_hex) = parse_cascade_job_id(&result.job_id);
-        let device_us = result.device_access_time_us;
-        let (best, reads_n, ok) = match result.outcome {
-            StreamOutcome::Completed(Ok(reads)) => {
-                let best = reads.iter().map(|read| read.energy_milli).min();
-                (best, reads.len(), 1u8)
-            }
-            StreamOutcome::Completed(Err(error)) => {
-                let text = error.to_string();
-                if names_energy_audit_mismatch(&text) {
-                    let _ = out.flush();
-                    panic!("nonce {index} device-energy audit mismatch: {text}");
+    let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+    let mut producer_inputs = Vec::new();
+    let mut producer_threads = Vec::new();
+    for _ in 0..producers {
+        let edges = edges.clone();
+        let admitted_tx = admitted_tx.clone();
+        let (input_tx, input_rx) =
+            std::sync::mpsc::channel::<(Arc<NonceSupply>, tokio::sync::mpsc::Sender<StreamJob>)>();
+        producer_inputs.push(input_tx);
+        producer_threads.push(std::thread::spawn(move || {
+            for (supply, job_tx) in input_rx {
+                let mut admitted = 0usize;
+                while let Some((index, seed)) = supply.next_nonce() {
+                    let graph = instance(seed, &edges);
+                    let job = StreamJob {
+                        job_id: cascade_job_id(index, &seed),
+                        graph,
+                        params: SampleParams {
+                            num_reads: NUM_READS,
+                            num_sweeps: sweeps,
+                            sweeps_per_beta: 1,
+                            beta_range: None,
+                            // Resident slots continue the job's own RNG stream.
+                            // Stage 0 is the derivation `run_stage` uses first.
+                            seed: job_seed(0, index),
+                        },
+                        watermark: None,
+                    };
+                    if job_tx.blocking_send(job).is_err() {
+                        break;
+                    }
+                    admitted += 1;
                 }
-                eprintln!("nonce {index} failed: {text}");
-                (None, 0, 0)
+                drop(job_tx);
+                drop(supply);
+                admitted_tx.send(admitted).expect("producer count");
             }
-            StreamOutcome::Cancelled => {
-                eprintln!("nonce {index} cancelled");
-                (None, 0, 0)
-            }
-        };
-        if ok == 0 {
-            errors += 1;
+        }));
+    }
+    drop(admitted_tx);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("rate timer");
+    for (stream, duration) in [seconds, second_seconds].into_iter().enumerate() {
+        if stream == 1 && duration == 0 {
+            break;
         }
-        if let Some(best) = best {
-            if best <= target {
-                hits += 1;
-            }
-            writeln!(out, "{index},{seed_hex},{best},{reads_n},{device_us},{ok}")
+        let label = if stream == 0 { "cascade" } else { "cascade-2" };
+        let cpu_start = process_cpu_seconds();
+        let supply_mut = Arc::get_mut(&mut supply).expect("producers released nonce supply");
+        if stream == 1 {
+            supply_mut.restart(duration);
         } else {
-            writeln!(out, "{index},{seed_hex},,{reads_n},{device_us},{ok}")
+            supply_mut.start = Instant::now();
         }
-        .expect("write");
-        done += 1;
-        if last_report.elapsed().as_secs() >= 60 {
-            let elapsed = supply.start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 {
-                done as f64 / elapsed
-            } else {
-                0.0
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(128);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(128);
+        streams_tx.send((job_rx, out_tx)).expect("stream worker");
+        for input in &producer_inputs {
+            input
+                .send((Arc::clone(&supply), job_tx.clone()))
+                .expect("producer input");
+        }
+        drop(job_tx);
+        let mut done = 0usize;
+        let mut errors = 0usize;
+        let mut hits = 0usize;
+        let mut last_report = supply.start;
+        let mut last_done = 0usize;
+        loop {
+            let deadline = last_report + Duration::from_secs(10);
+            let received = runtime
+                .block_on(async { tokio::time::timeout_at(deadline.into(), out_rx.recv()).await });
+            let now = Instant::now();
+            if now >= deadline {
+                let elapsed = now.duration_since(supply.start).as_secs_f64();
+                let window =
+                    (done - last_done) as f64 / now.duration_since(last_report).as_secs_f64();
+                let total = done as f64 / elapsed;
+                eprintln!("{label}: t={elapsed:.0} s results={done} window={window:.1}/s total={total:.1}/s");
+                last_report = now;
+                last_done = done;
+            }
+            let result = match received {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(_) => continue,
             };
-            eprintln!("cascade: {done} results after {elapsed:.0} s, {rate:.2} jobs/s");
-            last_report = Instant::now();
+            let (index, seed_hex) = parse_cascade_job_id(&result.job_id);
+            let device_us = result.device_access_time_us;
+            let (best, reads_n, ok) = match result.outcome {
+                StreamOutcome::Completed(Ok(reads)) => {
+                    let best = reads.iter().map(|read| read.energy_milli).min();
+                    (best, reads.len(), 1u8)
+                }
+                StreamOutcome::Completed(Err(error)) => {
+                    let text = error.to_string();
+                    if names_energy_audit_mismatch(&text) {
+                        let _ = out.flush();
+                        panic!("nonce {index} device-energy audit mismatch: {text}");
+                    }
+                    eprintln!("nonce {index} failed: {text}");
+                    (None, 0, 0)
+                }
+                StreamOutcome::Cancelled => {
+                    eprintln!("nonce {index} cancelled");
+                    (None, 0, 0)
+                }
+            };
+            if ok == 0 {
+                errors += 1;
+            }
+            if let Some(best) = best {
+                if best <= target {
+                    hits += 1;
+                }
+                writeln!(out, "{index},{seed_hex},{best},{reads_n},{device_us},{ok}")
+            } else {
+                writeln!(out, "{index},{seed_hex},,{reads_n},{device_us},{ok}")
+            }
+            .expect("write");
+            done += 1;
         }
+        let wall_s = supply.start.elapsed().as_secs_f64();
+        out.flush().expect("flush csv");
+        let mut admitted = 0usize;
+        for _ in 0..producers {
+            admitted += admitted_rx.recv().expect("producer count");
+        }
+        let cpu_s = process_cpu_seconds() - cpu_start;
+        eprintln!("{label}: summary");
+        print_cascade_summary(admitted, done, errors, wall_s, cpu_s, hits);
     }
-    let wall_s = supply.start.elapsed().as_secs_f64();
-    out.flush().expect("flush csv");
-    worker.join().expect("stream worker");
-    let mut admitted = 0usize;
+    drop(producer_inputs);
     for producer in producer_threads {
-        admitted += producer.join().expect("producer");
+        producer.join().expect("producer");
     }
-    let cpu_s = process_cpu_seconds();
-    print_cascade_summary(admitted, done, errors, wall_s, cpu_s, hits);
+    drop(streams_tx);
+    worker.join().expect("stream worker");
     eprintln!("wrote {out_path}");
 }
 
@@ -918,6 +1042,26 @@ fn cascade_nonce_supply_matches_the_stage_draw() {
     assert!(!names_energy_audit_mismatch(
         "device fault: metal command buffer did not complete: status Error"
     ));
+}
+
+#[test]
+fn cascade_second_stream_continues_nonce_supply() {
+    let mut supply = NonceSupply::drawn(3, Some(2), 60);
+    let expected = draw_seeds(3, 4);
+    assert_eq!(supply.next_nonce(), Some((0, expected[0])));
+    assert_eq!(supply.next_nonce(), Some((1, expected[1])));
+    assert!(supply.next_nonce().is_none());
+    supply.restart(60);
+    assert_eq!(supply.next_nonce(), Some((2, expected[2])));
+    assert_eq!(supply.next_nonce(), Some((3, expected[3])));
+    supply.restart(0);
+    assert!(supply.next_nonce().is_none());
+
+    let mut listed = NonceSupply::listed(expected[..2].to_vec(), 60);
+    assert_eq!(listed.next_nonce(), Some((0, expected[0])));
+    listed.restart(60);
+    assert_eq!(listed.next_nonce(), Some((1, expected[1])));
+    assert!(listed.next_nonce().is_none());
 }
 
 #[test]
