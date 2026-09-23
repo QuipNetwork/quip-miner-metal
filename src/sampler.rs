@@ -1195,12 +1195,12 @@ pub(crate) fn encode_batch(
     kernel: Kernel,
     in_flight: usize,
 ) -> Result<EncodedBatch, SampleError> {
-    encode_batch_inner(device, graphs, params, kernel, in_flight, None)
+    encode_batch_inner(device, graphs, params, kernel, in_flight, None, None)
 }
 
-/// [`encode_batch`] with an optional chunk-plan override, so a test can split
-/// one anneal at chosen rung boundaries and compare it with the unsplit run.
-/// Production passes `None` and lets [`chunk_plan`] decide.
+/// [`encode_batch`] with optional chunk-plan and beta-schedule overrides.
+/// A beta override supplies one rung per sweep, including reheating schedules.
+/// Production passes `None` for both overrides.
 fn encode_batch_inner(
     device: &crate::metal_device::MetalDevice,
     graphs: &[&IsingGraph],
@@ -1208,6 +1208,7 @@ fn encode_batch_inner(
     kernel: Kernel,
     in_flight: usize,
     plan_override: Option<&[(i32, i32)]>,
+    beta_override: Option<Vec<f32>>,
 ) -> Result<EncodedBatch, SampleError> {
     let (first, n) = validate_batch(graphs, params, kernel)?;
 
@@ -1216,12 +1217,23 @@ fn encode_batch_inner(
     let num_samples = num_problems * num_reads;
     let packed_size = n.div_ceil(8).max(1);
 
-    let (beta, sweeps_per) = build_beta_schedule(
-        first,
-        params.num_sweeps,
-        params.sweeps_per_beta,
-        params.beta_range,
-    );
+    let (beta, sweeps_per) = match beta_override {
+        Some(beta) => {
+            if beta.is_empty() || beta.len() > MAX_SWEEPS {
+                return Err(SampleError::TooLarge(format!(
+                    "beta override length {} must be in 1..={MAX_SWEEPS}",
+                    beta.len()
+                )));
+            }
+            (beta, 1)
+        }
+        None => build_beta_schedule(
+            first,
+            params.num_sweeps,
+            params.sweeps_per_beta,
+            params.beta_range,
+        ),
+    };
 
     // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
     // only the dispatch geometry below differs.
@@ -1642,6 +1654,267 @@ fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, Sample
 mod tests {
     use super::*;
 
+    /// Run one shape at a time, retaining the normal harvest and audit path.
+    fn seeded_experiment_batch(
+        device: &crate::metal_device::MetalDevice,
+        graphs: &[&IsingGraph],
+        params: &SampleParams,
+        schedule: Option<Vec<f32>>,
+    ) -> (Vec<Vec<SamplerResult>>, u64) {
+        let expected_rungs = schedule.as_ref().map(Vec::len);
+        let mut batch = encode_batch_inner(device, graphs, params, Kernel::Msa, 1, None, schedule)
+            .expect("encode experiment batch");
+        if let Some(rungs) = expected_rungs {
+            assert_eq!(batch.dims.num_betas as usize, rungs);
+            assert_eq!(batch.dims.sweeps_per, 1);
+            assert_eq!(
+                batch
+                    .plan
+                    .iter()
+                    .map(|(_, count)| *count as usize)
+                    .sum::<usize>(),
+                rungs
+            );
+            assert!(batch.out.beta.length() >= (rungs * size_of::<f32>()) as u64);
+        }
+        assert!(batch.device_energy, "Aglais must use device energies");
+        while batch.commit_next(|| false) {
+            batch.wait_until_completed();
+            assert!(batch.failed_status().is_none(), "GPU command failed");
+        }
+        let results = harvest_batch(&batch, graphs).expect("harvest and device-energy audit");
+        // The normal audit samples jobs. This experiment also checks every read.
+        for (reads, graph) in results.iter().zip(graphs) {
+            for read in reads {
+                assert_eq!(
+                    read.energy_milli,
+                    energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges),
+                    "experiment device-energy audit"
+                );
+            }
+        }
+        (results, batch.gpu_time_us())
+    }
+
+    #[test]
+    #[ignore = "GPU experiment: several minutes of device time"]
+    #[expect(
+        clippy::print_stderr,
+        reason = "experiment diagnostics and paired results"
+    )]
+    fn seeded_start_from_probe_spins_against_cold_anneal() {
+        use crate::metal_device::MetalDevice;
+        use quip_solver_core::quip_protocol::chacha8::draw_ising_milli;
+        use std::io::Write;
+
+        if MetalDevice::device_count() == 0 {
+            eprintln!("skipping: no Metal device");
+            return;
+        }
+        let seed_path = std::env::var("QUIP_SEEDED_SEEDS").expect("QUIP_SEEDED_SEEDS is required");
+        let seeds: Vec<[u8; 32]> = std::fs::read_to_string(seed_path)
+            .expect("read seeds file")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                assert!(
+                    line.is_ascii() && line.len() == 64,
+                    "expected 32-byte hex seed"
+                );
+                let mut seed = [0; 32];
+                for (i, byte) in seed.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&line[2 * i..2 * i + 2], 16).expect("hex seed");
+                }
+                seed
+            })
+            .collect();
+        let count = std::env::var("QUIP_SEEDED_NONCES")
+            .map(|s| {
+                s.parse::<usize>()
+                    .expect("QUIP_SEEDED_NONCES must be an integer")
+            })
+            .unwrap_or(seeds.len())
+            .min(seeds.len());
+        assert!(count > 0, "at least one nonce is required");
+        let betas: Vec<f64> = std::env::var("QUIP_SEEDED_BETAS")
+            .unwrap_or_else(|_| "0.25,0.4,0.6".into())
+            .split(',')
+            .map(|s| s.trim().parse().expect("beta must be a number"))
+            .collect();
+        assert!(
+            betas.iter().all(|b| b.is_finite() && *b > 0.0),
+            "betas must be finite and positive"
+        );
+        let tails: Vec<usize> = std::env::var("QUIP_SEEDED_TAILS")
+            .unwrap_or_else(|_| "2048,4096,14304".into())
+            .split(',')
+            .map(|s| s.trim().parse().expect("tail must be an integer"))
+            .collect();
+        assert!(
+            tails.iter().all(|t| *t > 0 && *t <= MAX_SWEEPS - 32),
+            "tail exceeds sweep limits"
+        );
+        let mut arms = vec![("probe", None), ("cold", None)];
+        for beta in betas.iter().copied() {
+            for tail in tails.iter().copied() {
+                assert!(
+                    !arms.contains(&("seeded", Some((beta, tail)))),
+                    "duplicate seeded arm"
+                );
+                arms.push(("seeded", Some((beta, tail))));
+            }
+        }
+
+        // Same fixture compaction, orientation and missing edge as probe_screen.
+        let mut edges = Vec::with_capacity(41514);
+        for line in include_str!("../tests/fixtures/advantage2-system1.edges").lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut nodes = line.split_whitespace();
+            let u: usize = nodes.next().expect("edge start").parse().expect("node id");
+            let v: usize = nodes.next().expect("edge end").parse().expect("node id");
+            assert!(nodes.next().is_none(), "two node ids per edge");
+            assert!(u < 4577 && v < 4577, "fixture node range");
+            if (u, v) != (880, 2695) {
+                edges.push((u, v));
+            }
+        }
+        assert_eq!(edges.len(), 41514);
+        let device = MetalDevice::open(0).expect("Metal device 0");
+        let path = std::env::var("QUIP_SEEDED_OUT").unwrap_or_else(|_| "seeded-start.csv".into());
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path).expect("create CSV"));
+        writeln!(out, "nonce,arm,beta_r,tail,sweeps,best,median,device_us")
+            .expect("write CSV header");
+        let mut best_by_arm = vec![Vec::with_capacity(count); arms.len()];
+        for (batch_index, seeds) in seeds[..count].chunks(20).enumerate() {
+            let start = batch_index * 20;
+            let graphs: Vec<_> = seeds
+                .iter()
+                .map(|seed| {
+                    let (h, j) = draw_ising_milli(*seed, 4577, edges.len(), &[0], &[-1000, 1000])
+                        .expect("draw Aglais instance");
+                    assert_eq!(h.len(), 4577);
+                    assert_eq!(j.len(), 41514);
+                    assert!(h.iter().all(|v| *v == 0));
+                    assert!(j.iter().all(|v| *v == -1000 || *v == 1000));
+                    let milli = |v: &i32| f64::from(*v) / 1000.0;
+                    IsingGraph::new(
+                        h.iter().map(milli).collect(),
+                        j.iter().map(milli).collect(),
+                        edges.clone(),
+                    )
+                })
+                .collect();
+            let graphs: Vec<_> = graphs.iter().collect();
+            let (hot, cold) = default_ising_beta_range(graphs[0]);
+            if start == 0 {
+                eprintln!("default beta range: hot={hot}, cold={cold}");
+                for beta in &betas {
+                    if *beta < hot || *beta > cold {
+                        eprintln!(
+                            "warning: beta_r={beta} is outside [{hot}, {cold}]; running anyway"
+                        );
+                    }
+                }
+            }
+            for (arm_index, &(arm, seeded)) in arms.iter().enumerate() {
+                let sweeps = seeded.map_or(if arm == "probe" { 32 } else { 14336 }, |(_, tail)| {
+                    32 + tail
+                });
+                let params = SampleParams {
+                    num_reads: 64,
+                    num_sweeps: sweeps,
+                    sweeps_per_beta: 1,
+                    beta_range: None,
+                    // Like run_stream, the first job supplies the batch seed.
+                    // Stable batch positions preserve each nonce's paired RNG stream.
+                    seed: start as u64,
+                };
+                let schedule = seeded.map(|(beta, tail)| {
+                    let mut schedule = build_beta_schedule(graphs[0], 32, 1, None).0;
+                    schedule.extend(
+                        geometric_beta_schedule(beta, cold, tail)
+                            .iter()
+                            .map(|b| *b as f32),
+                    );
+                    schedule
+                });
+                let (results, device_us) =
+                    seeded_experiment_batch(&device, &graphs, &params, schedule);
+                if start == 0 && arm == "probe" {
+                    let standard = build_beta_schedule(graphs[0], 32, 1, None).0;
+                    // Deliberately disagree with the override: its length and
+                    // one-sweep rungs must control both planning and dispatch.
+                    let override_params = SampleParams {
+                        num_sweeps: 1,
+                        sweeps_per_beta: 7,
+                        ..params.clone()
+                    };
+                    let (overridden, _) =
+                        seeded_experiment_batch(&device, &graphs, &override_params, Some(standard));
+                    for (normal, overridden) in results.iter().zip(&overridden) {
+                        assert_eq!(normal.len(), overridden.len());
+                        for (normal, overridden) in normal.iter().zip(overridden) {
+                            assert_eq!(normal.spins, overridden.spins, "standard override spins");
+                            assert_eq!(
+                                normal.energy_milli, overridden.energy_milli,
+                                "standard override energies"
+                            );
+                        }
+                    }
+                    eprintln!("standard 32-rung override parity passed");
+                }
+                for (offset, reads) in results.iter().enumerate() {
+                    assert_eq!(reads.len(), 64);
+                    let mut energies: Vec<_> = reads.iter().map(|r| r.energy_milli).collect();
+                    energies.sort_unstable();
+                    let (best, median) = (energies[0], energies[energies.len() / 2]);
+                    best_by_arm[arm_index].push(best);
+                    let nonce = start + offset;
+                    let (beta, tail) = seeded.map_or((String::new(), String::new()), |(b, t)| {
+                        (b.to_string(), t.to_string())
+                    });
+                    // GPU timestamps measure the whole batch, as in run_stream.
+                    writeln!(
+                        out,
+                        "{nonce},{arm},{beta},{tail},{sweeps},{best},{median},{device_us}"
+                    )
+                    .expect("write CSV row");
+                }
+            }
+            out.flush().expect("flush CSV progress");
+            let done = start + seeds.len();
+            if done.is_multiple_of(100) || done == count {
+                eprintln!("seeded experiment: {done}/{count} nonces complete, all arms");
+            }
+        }
+        const TARGET: i64 = -14_625_068;
+        let cold = &best_by_arm[1];
+        let cold_hits = cold.iter().filter(|e| **e <= TARGET).count();
+        for (arm_index, &(_, seeded)) in arms.iter().enumerate().skip(2) {
+            let (beta, tail) = seeded.expect("seeded arm");
+            let best = &best_by_arm[arm_index];
+            let differences: Vec<_> = best.iter().zip(cold).map(|(s, c)| (s - c) as f64).collect();
+            let mean = differences.iter().sum::<f64>() / count as f64;
+            let se = if count > 1 {
+                (differences.iter().map(|d| (d - mean).powi(2)).sum::<f64>()
+                    / ((count - 1) as f64 * count as f64))
+                    .sqrt()
+                    .to_string()
+            } else {
+                "undefined (n=1)".into()
+            };
+            let deeper = differences.iter().filter(|d| **d < 0.0).count();
+            let equal = differences.iter().filter(|d| **d == 0.0).count();
+            let shallower = count - deeper - equal;
+            let hits = best.iter().filter(|e| **e <= TARGET).count();
+            eprintln!("seeded beta_r={beta} tail={tail} n={count}: mean_difference_milli={mean} standard_error_milli={se} deeper={deeper} equal={equal} shallower={shallower} target_hits={hits} cold_target_hits={cold_hits}");
+        }
+    }
+
     /// Deterministic xorshift64 for fixture generation.
     fn xorshift64(s: &mut u64) -> u64 {
         *s ^= *s << 13;
@@ -1730,7 +2003,16 @@ mod tests {
                 seed,
                 ..full_params.clone()
             };
-            encode_batch_inner(&device, &full_graphs, &params, Kernel::Msa, 2, Some(&plan)).unwrap()
+            encode_batch_inner(
+                &device,
+                &full_graphs,
+                &params,
+                Kernel::Msa,
+                2,
+                Some(&plan),
+                None,
+            )
+            .unwrap()
         };
 
         let mut pending = std::collections::VecDeque::new();
@@ -2096,6 +2378,7 @@ mod tests {
             Kernel::Msa,
             1,
             Some(&[(0, 20), (20, 44)]),
+            None,
         )
         .unwrap();
         while batch.commit_next(|| false) {
@@ -2469,6 +2752,7 @@ mod tests {
                 kernel,
                 1,
                 Some(&[(0, 1), (1, 1), (2, 1), (3, 1)]),
+                None,
             )
             .unwrap();
             batch.wait_until_completed();
@@ -2493,7 +2777,8 @@ mod tests {
         let plan: Vec<_> = (0..128).map(|start| (start, 1)).collect();
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             let mut batch =
-                encode_batch_inner(&device, &[&graph], &params, kernel, 2, Some(&plan)).unwrap();
+                encode_batch_inner(&device, &[&graph], &params, kernel, 2, Some(&plan), None)
+                    .unwrap();
             let cancel = quip_solver_core::CancelToken::default();
             assert!(batch.commit_next(|| cancel.is_cancelled(Some(1))));
             cancel.cancel_through(1);
@@ -2562,12 +2847,20 @@ mod tests {
             seed: 7,
         };
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
-            let mut whole =
-                encode_batch_inner(&device, &[&graph], &params, kernel, 1, Some(&[(0, 128)]))
-                    .unwrap();
+            let mut whole = encode_batch_inner(
+                &device,
+                &[&graph],
+                &params,
+                kernel,
+                1,
+                Some(&[(0, 128)]),
+                None,
+            )
+            .unwrap();
             let plan: Vec<_> = (0..128).map(|start| (start, 1)).collect();
             let mut split =
-                encode_batch_inner(&device, &[&graph], &params, kernel, 1, Some(&plan)).unwrap();
+                encode_batch_inner(&device, &[&graph], &params, kernel, 1, Some(&plan), None)
+                    .unwrap();
             while whole.commit_next(|| false) {
                 whole.wait_until_completed();
             }
