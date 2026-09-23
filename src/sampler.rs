@@ -153,8 +153,8 @@ const _: () = assert!(
     "simd_rounded_reads must produce whole 32-lane multi-spin words"
 );
 /// 1,024 threads split each colour class, bounded at dispatch by the pipeline's
-/// `max_total_threads_per_threadgroup`.
-/// Also the per-threadgroup RNG stream count the persistent buffer is sized by.
+/// `max_total_threads_per_threadgroup`. The persistent RNG buffer is sized by
+/// that clamped width, not by this constant.
 const MSA_THREADS: usize = 1024;
 /// Static threadgroup bytes `msa_anneal` declares: an 8192-byte threshold row
 /// plus 64 `uint` cut values and 32 atomic lane totals.
@@ -1902,7 +1902,9 @@ mod tests {
         let a = chain(200);
         let mut b = chain(200);
         b.j.iter_mut().step_by(3).for_each(|v| *v = -*v);
-        let graphs = [&a, &b, &a];
+        let mut c = chain(200);
+        c.j.iter_mut().skip(1).step_by(5).for_each(|v| *v = -*v);
+        let graphs = [&a, &b, &c];
         let p = params(64);
         let mut batch = encode_batch(&dev, &graphs, &p, Kernel::Msa, 1).unwrap();
         while batch.commit_next(|| false) {
@@ -1910,9 +1912,9 @@ mod tests {
         }
         batch.wait_until_completed();
         let got = harvest_batch(&batch, &graphs).unwrap();
-        // Problems 0 and 2 share h and J, so equal seeds would give equal spins;
-        // they differ in RNG stream (threadgroup index), so compare energies to
-        // consensus instead, and check the row structure is not per-problem.
+        // Every problem has its own J, so a problem reading another's slice
+        // gives reads whose energies disagree with consensus. The row and
+        // column structure is one untiled copy.
         for (reads, g) in got.iter().zip(graphs) {
             for r in reads {
                 assert_eq!(r.energy_milli, energy_milli(&r.spins, &g.h, &g.j, &g.edges));
@@ -1921,6 +1923,10 @@ mod tests {
         assert_eq!(
             batch.inputs.row.length() as usize,
             (a.num_nodes() + 1) * std::mem::size_of::<i32>()
+        );
+        assert_eq!(
+            batch.inputs.col.length() as usize,
+            2 * a.edges.len() * std::mem::size_of::<i32>()
         );
     }
 
