@@ -48,11 +48,8 @@ compile_error!(
 
 pub mod sampler;
 
+mod cascade;
 mod combined;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the cascade relay in the next task")
-)]
 mod cutoff;
 
 pub mod iokit_gov;
@@ -236,6 +233,7 @@ pub struct MetalSampler {
     device: crate::metal_device::MetalDevice,
     gov: crate::iokit_gov::UtilGovernor,
     kernel: Kernel,
+    cascade: std::sync::Mutex<cascade::CascadeSettings>,
 }
 
 /// Metal backend config, parsed from the verbatim `config.toml` subsection in
@@ -249,6 +247,8 @@ struct MetalConfig {
     yielding: Option<bool>,
     enable_ane: Option<bool>,
     enable_metal: Option<bool>,
+    #[serde(flatten)]
+    cascade: cascade::CascadeToml,
     #[serde(flatten)]
     unknown: std::collections::BTreeMap<String, toml::Value>,
 }
@@ -282,7 +282,15 @@ impl MetalSampler {
             device,
             gov,
             kernel,
+            cascade: std::sync::Mutex::new(cascade::CascadeSettings::default()),
         }
+    }
+
+    pub(crate) fn set_cascade(&self, settings: cascade::CascadeSettings) {
+        *self
+            .cascade
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = settings;
     }
 }
 
@@ -321,7 +329,24 @@ impl quip_solver_core::Sampler for MetalSampler {
         // behavior, so the dependency is made explicit in the signature. The
         // governor is passed whole (not just a throttle closure) because sizing
         // is a loop: the stream reports its GPU time back through it.
-        streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
+        let settings = *self
+            .cascade
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if settings.enabled && self.kernel == Kernel::Msa {
+            cascade::run(
+                settings,
+                jobs,
+                &out,
+                &cancel,
+                self.stream_width(),
+                |rx, tx| {
+                    streaming::run_stream(&self.device, self.kernel, rx, &tx, &self.gov, &cancel);
+                },
+            );
+        } else {
+            streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
+        }
     }
 
     fn stream_width(&self) -> usize {
@@ -349,6 +374,12 @@ impl quip_solver_core::Sampler for MetalSampler {
             self.gov.yielding(),
         );
         self.gov.reconfigure(ceiling, yielding);
+        if let Ok(cfg) = toml::from_str::<MetalConfig>(backend_toml) {
+            self.cascade
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .merge(&cfg.cascade);
+        }
     }
 }
 

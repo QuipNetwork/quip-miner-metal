@@ -37,6 +37,7 @@ pub(crate) struct CombinedSampler {
     kernel: Kernel,
     device: usize,
     settings: Mutex<Settings>,
+    cascade: Mutex<crate::cascade::CascadeSettings>,
     metal: OnceLock<Result<MetalSampler, String>>,
     ane: Mutex<Option<Result<Arc<AneSampler>, String>>>,
 }
@@ -54,6 +55,7 @@ impl CombinedSampler {
                 yielding,
             }),
             metal: OnceLock::new(),
+            cascade: Mutex::new(crate::cascade::CascadeSettings::default()),
             ane: Mutex::new(None),
         }
     }
@@ -76,6 +78,11 @@ impl CombinedSampler {
         // Configuration can arrive while the device is opening.
         let cfg = settings(&self.settings);
         metal.gov.reconfigure(cfg.utilization, cfg.yielding);
+        let cascade = self
+            .cascade
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        metal.set_cascade(*cascade);
         Ok(metal)
     }
 
@@ -182,6 +189,16 @@ impl Sampler for CombinedSampler {
             }
         };
         quip_solver_core::config::warn_unknown_fields("metal", cfg.unknown.keys());
+        {
+            let mut cascade = self
+                .cascade
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            cascade.merge(&cfg.cascade);
+            if let Some(Ok(metal)) = self.metal.get() {
+                metal.set_cascade(*cascade);
+            }
+        }
         {
             let mut current = self
                 .settings
@@ -1032,6 +1049,16 @@ mod tests {
             assert!(sampler.metal.get().is_none());
             assert!(sampler.ane.lock().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn cascade_config_is_stored_before_metal_opens() {
+        let sampler = CombinedSampler::new(Kernel::Msa, 0, 73, true);
+        sampler.apply_config("cascade = true\ncascade_keep = 5000");
+        let cfg = *sampler.cascade.lock().unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.keep, 5000.0);
+        assert!(sampler.metal.get().is_none());
     }
 
     #[test]

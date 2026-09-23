@@ -52,6 +52,7 @@ impl Moments {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 distribution checks"))]
     pub(crate) fn skew(&self) -> f64 {
         if self.m2 <= 0.0 {
             0.0
@@ -60,6 +61,7 @@ impl Moments {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 distribution checks"))]
     pub(crate) fn excess_kurtosis(&self) -> f64 {
         if self.m2 <= 0.0 {
             0.0
@@ -200,9 +202,14 @@ pub(crate) fn inverse_normal_cdf(p: f64) -> f64 {
     }
 }
 
-/// Keep-denominator markers the empirical layer tracks. A denominator between
-/// two markers interpolates in `ln D`.
-const MARKERS: [f64; 4] = [1_000.0, 3_000.0, 10_000.0, 30_000.0];
+/// Keep denominators the empirical layer tracks: four points spaced evenly in
+/// `ln D` across the clamp, so every reachable denominator lies between two
+/// markers. A denominator between two markers interpolates in `ln D`. The
+/// default clamp gives 1,000, 3,107, 9,655, and 30,000.
+fn marker_denominators(cfg: &CutoffConfig) -> [f64; 4] {
+    let (lo, hi) = (cfg.keep_min.ln(), cfg.keep_max.ln());
+    [0.0, 1.0, 2.0, 3.0].map(|i| (lo + i / 3.0 * (hi - lo)).exp())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CutoffConfig {
@@ -238,6 +245,8 @@ pub(crate) struct Cutoff {
     cfg: CutoffConfig,
     moments: Moments,
     markers: [P2; 4],
+    /// The denominator each marker estimates, from [`marker_denominators`].
+    marker_d: [f64; 4],
     /// Load layer, in `ln D`, clamped so `D` stays inside the clamp.
     log_adjust: f64,
     /// Model-check loosening, a factor at most 1 applied to `D`.
@@ -246,10 +255,12 @@ pub(crate) struct Cutoff {
 
 impl Cutoff {
     pub(crate) fn new(cfg: CutoffConfig) -> Self {
+        let marker_d = marker_denominators(&cfg);
         Self {
             cfg,
             moments: Moments::default(),
-            markers: MARKERS.map(|d| P2::new(1.0 / d)),
+            markers: marker_d.map(|d| P2::new(1.0 / d)),
+            marker_d,
             log_adjust: 0.0,
             loosen: 1.0,
         }
@@ -266,6 +277,7 @@ impl Cutoff {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 distribution checks"))]
     pub(crate) fn moments(&self) -> &Moments {
         &self.moments
     }
@@ -305,16 +317,17 @@ impl Cutoff {
 
     fn empirical(&self, d: f64) -> Option<f64> {
         let ln_d = d.ln();
-        let last = MARKERS.len() - 1;
-        if d <= MARKERS[0] {
+        let m = &self.marker_d;
+        let last = m.len() - 1;
+        if d <= m[0] {
             return self.markers[0].estimate();
         }
-        if d >= MARKERS[last] {
+        if d >= m[last] {
             return self.markers[last].estimate();
         }
-        let i = (0..last).find(|&i| d <= MARKERS[i + 1]).unwrap_or(last - 1);
+        let i = (0..last).find(|&i| d <= m[i + 1]).unwrap_or(last - 1);
         let (lo, hi) = (self.markers[i].estimate()?, self.markers[i + 1].estimate()?);
-        let t = (ln_d - MARKERS[i].ln()) / (MARKERS[i + 1].ln() - MARKERS[i].ln());
+        let t = (ln_d - m[i].ln()) / (m[i + 1].ln() - m[i].ln());
         Some(lo + t * (hi - lo))
     }
 
@@ -326,18 +339,26 @@ impl Cutoff {
     }
 
     /// Halve the denominator, down to the loosest clamp.
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 model checks"))]
     pub(crate) fn loosen_step(&mut self) {
         self.loosen = (self.loosen * 0.5).max(self.cfg.keep_min / self.cfg.keep_max);
     }
 
     /// Undo one [`Self::loosen_step`].
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 model checks"))]
     pub(crate) fn restore_step(&mut self) {
         self.loosen = (self.loosen * 2.0).min(1.0);
     }
 
     /// Give the Gaussian anchor more weight for longer.
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 model checks"))]
     pub(crate) fn double_k0(&mut self) {
         self.cfg.k0 *= 2.0;
+    }
+
+    /// Current load integral, used by the relay's idle-error decay.
+    pub(crate) fn log_adjust(&self) -> f64 {
+        self.log_adjust
     }
 
     /// Load layer: positive `error` tightens, negative loosens.
@@ -423,6 +444,32 @@ mod tests {
             .for_each(|x| c.observe(x));
         let d = c.denominator();
         assert!(d > 9_000.0 && d <= 10_000.0, "{d}");
+    }
+
+    #[test]
+    fn markers_span_a_per_stage_clamp_and_hold_its_keep_rate() {
+        // One of three probe stages under an overall 1 in 3,000 keep with a
+        // [1,000, 30,000] clamp: each bound is the cube root of the overall one.
+        let root = |d: f64| d.powf(1.0 / 3.0);
+        let cfg = CutoffConfig {
+            keep: root(3_000.0),
+            keep_min: root(1_000.0),
+            keep_max: root(30_000.0),
+            ..CutoffConfig::default()
+        };
+        let m = marker_denominators(&cfg);
+        assert!((m[0] - cfg.keep_min).abs() < 1e-9 && (m[3] - cfg.keep_max).abs() < 1e-9);
+        let mut c = Cutoff::new(cfg);
+        let n = 200_000usize;
+        let mut kept = 0usize;
+        for (i, x) in normal_stream(11, 0.0, 1.0).take(n).enumerate() {
+            if c.decide(x) && i >= n / 2 {
+                kept += 1;
+            }
+        }
+        let rate = kept as f64 / (n / 2) as f64;
+        let want = 1.0 / cfg.keep;
+        assert!((rate - want).abs() < 0.05 * want, "{rate} vs {want}");
     }
 
     #[test]
