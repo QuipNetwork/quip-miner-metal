@@ -1,0 +1,26 @@
+   Compiling quip-miner-metal v0.3.3-rc3 (/Users/carback1/Code/quip/quip-miner-metal/.claude/worktrees/msa-cascade)
+    Finished `release` profile [optimized] target(s) in 4.90s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/probe_screen.rs (target/release/deps/probe_screen-31d2414799d6b67c)
+
+running 1 test
+1000000 nonces, 4 stages, target -14625068 milli, output docs/perf/data/2026-09-23-calibration/B.csv
+test probe_then_solve_on_fresh_nonces has been running for over 60 seconds
+stage 64x32: 292561/1000000 after 60 s, 4875.58 jobs/s
+stage 64x32: 582421/1000000 after 120 s, 4853.16 jobs/s
+stage 64x32: 866321/1000000 after 180 s, 4812.59 jobs/s
+  producers, summed over threads: drawing 162.9 s, blocked on the device 1085.9 s (208.2 s wall); 0.16 ms per instance
+stage 64x32: 1000000 of 1000000 jobs in 208.2 s = 4803.31 jobs/s; lead 0.03 s; wall_seconds=208.189896
+stage 64x64: 214041/368000 after 60 s, 3567.22 jobs/s
+  producers, summed over threads: drawing 84.3 s, blocked on the device 532.2 s (102.9 s wall); 0.23 ms per instance
+stage 64x64: 368000 of 368000 jobs in 102.9 s = 3575.54 jobs/s; lead 0.02 s; wall_seconds=102.921555
+  producers, summed over threads: drawing 54.6 s, blocked on the device 283.3 s (57.0 s wall); 0.40 ms per instance
+stage 64x128: 135424 of 135424 jobs in 57.0 s = 2374.62 jobs/s; lead 0.03 s; wall_seconds=57.029692
+  producers, summed over threads: drawing 21.1 s, blocked on the device 201.0 s (37.5 s wall); 0.42 ms per instance
+stage 64x256: 49837 of 49837 jobs in 37.5 s = 1328.45 jobs/s; lead 0.06 s; wall_seconds=37.515212
+wrote docs/perf/data/2026-09-23-calibration/B.csv
+test probe_then_solve_on_fresh_nonces ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 407.24s
+
