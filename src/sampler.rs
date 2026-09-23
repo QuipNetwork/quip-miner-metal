@@ -393,6 +393,14 @@ pub(crate) fn gibbs_node_parallel() -> bool {
     })
 }
 
+/// Parses `QUIP_METAL_MSA_FOUR_COLOR`: on unless `0`, `false`, or `off`.
+fn four_color_from(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
 /// Whether the multi-spin MSA kernel uses the Advantage2 four-colouring — the
 /// default. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`, or `off`
 /// (case-insensitive) to disable it and fall back to the greedy colouring.
@@ -401,13 +409,6 @@ pub(crate) fn gibbs_node_parallel() -> bool {
 ///
 /// Read once per process so a streaming session keeps the same update order.
 /// Other kernels always use their usual coloring.
-fn four_color_from(value: Option<&str>) -> bool {
-    !matches!(
-        value.map(str::to_ascii_lowercase).as_deref(),
-        Some("0") | Some("false") | Some("off")
-    )
-}
-
 fn msa_four_color() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
