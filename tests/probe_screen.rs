@@ -29,6 +29,17 @@
 //! `QUIP_SCREEN_TARGET` (milli, default the Aglais target of 2026-09-18),
 //! `QUIP_SCREEN_OUT` (CSV path, default `probe-screen.csv`).
 //!
+//! `QUIP_SCREEN_CASCADE=1` admits one job per nonce to the public MSA sampler
+//! with the cascade on, instead of the stage loop. Admission stops after
+//! `QUIP_SCREEN_SECONDS` seconds (default 1800) or, when `QUIP_SCREEN_NONCES`
+//! is set, after that many jobs, whichever comes first. A `QUIP_SCREEN_SEEDS`
+//! file still replaces the draw and caps the run. `QUIP_SCREEN_FULL` is the
+//! sweep budget (default 14336) and every job asks for 64 reads. The job seed
+//! is `job_seed(0, nonce)`, the same derivation the stage loop uses for its
+//! first stage. `QUIP_SCREEN_CASCADE_TOML`, when set, is appended after
+//! `cascade = true`. The CSV columns are
+//! `nonce,seed,best,reads,device_us,ok`.
+//!
 //! The instance for a nonce is `draw_ising_milli` on the chain's topology
 //! `cbec1eb4…`, which is the committed Advantage2 System 1 fixture without
 //! its edge `(880, 2695)`. A random 32-byte seed samples the same instance
@@ -39,12 +50,14 @@
     reason = "the study reports stage rates on stderr, like the other benches"
 )]
 
+use quip_miner_metal::iokit_gov::UtilGovernor;
 use quip_miner_metal::metal_device::MetalDevice;
 use quip_miner_metal::streaming::{run_stream, GpuGovernor};
-use quip_miner_metal::{IsingGraph, Kernel};
+use quip_miner_metal::{IsingGraph, Kernel, MetalSampler};
 use quip_solver_core::quip_protocol::chacha8::draw_ising_milli;
-use quip_solver_core::{CancelToken, SampleParams, StreamJob, StreamOutcome};
+use quip_solver_core::{CancelToken, SampleParams, Sampler, StreamJob, StreamOutcome};
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct NoGovernor;
@@ -127,17 +140,23 @@ fn xorshift64(s: &mut u64) -> u64 {
     *s
 }
 
+fn next_drawn_seed(state: &mut u64) -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    for word in seed.as_chunks_mut::<8>().0 {
+        *word = xorshift64(state).to_le_bytes();
+    }
+    seed
+}
+
 fn draw_seeds(run_seed: u64, count: usize) -> Vec<[u8; 32]> {
-    let mut s = run_seed | 1;
-    (0..count)
-        .map(|_| {
-            let mut seed = [0u8; 32];
-            for word in seed.as_chunks_mut::<8>().0 {
-                *word = xorshift64(&mut s).to_le_bytes();
-            }
-            seed
-        })
-        .collect()
+    let mut state = run_seed | 1;
+    (0..count).map(|_| next_drawn_seed(&mut state)).collect()
+}
+
+/// Sample seed for one stage of one nonce. The shift keeps a probe and a
+/// full job on the same nonce off the same RNG stream.
+fn job_seed(stage_index: usize, nonce: usize) -> u64 {
+    ((stage_index as u64) << 32) + nonce as u64
 }
 
 fn parse_seed(hex: &str) -> [u8; 32] {
@@ -243,7 +262,6 @@ fn run_stage(
 
     // Each stage draws its own RNG stream: a probe and a full job on the same
     // nonce must not share a seed.
-    let seed_base = (stage_index as u64) << 32;
     let mut producer_threads = Vec::new();
     for producer_index in 0..producers.min(count) {
         let edges = edges.to_vec();
@@ -272,7 +290,7 @@ fn run_stage(
                         num_sweeps: stage.num_sweeps,
                         sweeps_per_beta: 1,
                         beta_range: None,
-                        seed: seed_base + i as u64,
+                        seed: job_seed(stage_index, i),
                     },
                     watermark: None,
                 };
@@ -355,6 +373,337 @@ fn run_stage(
     (summaries, wall_s, lead_s)
 }
 
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be an integer")),
+        Err(_) => default,
+    }
+}
+
+fn screen_producers() -> usize {
+    let producers: usize = std::env::var("QUIP_SCREEN_PRODUCERS")
+        .map(|value| {
+            value
+                .parse()
+                .expect("QUIP_SCREEN_PRODUCERS must be an integer")
+        })
+        .unwrap_or(1);
+    assert!(producers > 0, "QUIP_SCREEN_PRODUCERS must be positive");
+    producers
+}
+
+/// `ps -o cputime=` on macOS. Minutes may exceed 59 (`158:16.45` is 158
+/// minutes plus 16.45 seconds). A day prefix uses `D-HH:MM:SS`.
+fn parse_cputime(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (days, clock) = if let Some((days, clock)) = text.split_once('-') {
+        (days.parse::<f64>().ok()?, clock)
+    } else {
+        (0.0, text)
+    };
+    if !days.is_finite() || days < 0.0 {
+        return None;
+    }
+    let mut parts = clock.split(':');
+    let first = parts.next()?;
+    let second = parts.next()?;
+    let third = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let (hours, minutes, seconds) = if let Some(third) = third {
+        (
+            first.parse::<f64>().ok()?,
+            second.parse::<f64>().ok()?,
+            third.parse::<f64>().ok()?,
+        )
+    } else {
+        (0.0, first.parse::<f64>().ok()?, second.parse::<f64>().ok()?)
+    };
+    if [hours, minutes, seconds]
+        .iter()
+        .any(|part| !part.is_finite() || *part < 0.0)
+    {
+        return None;
+    }
+    Some(days * 86_400.0 + hours * 3_600.0 + minutes * 60.0 + seconds)
+}
+
+fn process_cpu_seconds() -> f64 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "cputime=", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("ps cputime");
+    assert!(
+        output.status.success(),
+        "ps cputime exited {}",
+        output.status
+    );
+    let text = String::from_utf8(output.stdout).expect("ps cputime utf-8");
+    parse_cputime(text.trim()).unwrap_or_else(|| panic!("ps cputime format: {text:?}"))
+}
+
+fn names_energy_audit_mismatch(text: &str) -> bool {
+    text.contains("device energy") && text.contains("host energy")
+}
+
+fn cascade_backend_toml() -> String {
+    let mut toml = String::from("cascade = true\n");
+    if let Ok(extra) = std::env::var("QUIP_SCREEN_CASCADE_TOML") {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            toml.push_str(extra);
+            toml.push('\n');
+        }
+    }
+    toml
+}
+
+fn cascade_job_id(index: usize, seed: &[u8; 32]) -> Vec<u8> {
+    format!("{index}:{}", hex(seed)).into_bytes()
+}
+
+fn parse_cascade_job_id(job_id: &[u8]) -> (usize, String) {
+    let text = String::from_utf8(job_id.to_vec()).expect("job id utf-8");
+    let (index, seed) = text.split_once(':').expect("job id");
+    let index = index.parse().expect("nonce index");
+    (index, seed.to_owned())
+}
+
+struct NonceInner {
+    cursor: usize,
+    rng: u64,
+    listed: Option<Vec<[u8; 32]>>,
+}
+
+struct NonceSupply {
+    inner: Mutex<NonceInner>,
+    start: Instant,
+    seconds: u64,
+    limit: Option<usize>,
+}
+
+impl NonceSupply {
+    fn drawn(run_seed: u64, limit: Option<usize>, seconds: u64) -> Self {
+        Self {
+            inner: Mutex::new(NonceInner {
+                cursor: 0,
+                rng: run_seed | 1,
+                listed: None,
+            }),
+            start: Instant::now(),
+            seconds,
+            limit,
+        }
+    }
+
+    fn listed(seeds: Vec<[u8; 32]>, seconds: u64) -> Self {
+        let limit = seeds.len();
+        Self {
+            inner: Mutex::new(NonceInner {
+                cursor: 0,
+                rng: 0,
+                listed: Some(seeds),
+            }),
+            start: Instant::now(),
+            seconds,
+            limit: Some(limit),
+        }
+    }
+
+    /// Next nonce, or `None` once the time limit or the job cap is reached.
+    /// The lock covers only the counter and the xorshift step. The caller
+    /// draws the instance after this returns.
+    fn next_nonce(&self) -> Option<(usize, [u8; 32])> {
+        let mut inner = self.inner.lock().expect("nonce supply");
+        if self.start.elapsed() >= Duration::from_secs(self.seconds) {
+            return None;
+        }
+        if self.limit.is_some_and(|limit| inner.cursor >= limit) {
+            return None;
+        }
+        let index = inner.cursor;
+        let seed = if inner.listed.is_some() {
+            inner
+                .listed
+                .as_ref()
+                .and_then(|seeds| seeds.get(index).copied())
+                .expect("listed nonce")
+        } else {
+            next_drawn_seed(&mut inner.rng)
+        };
+        inner.cursor += 1;
+        Some((index, seed))
+    }
+}
+
+fn print_cascade_summary(
+    admitted: usize,
+    results: usize,
+    errors: usize,
+    wall_s: f64,
+    cpu_s: f64,
+    hits: usize,
+) {
+    let rate = if wall_s > 0.0 {
+        results as f64 / wall_s
+    } else {
+        0.0
+    };
+    let cpu_ms = if results > 0 {
+        cpu_s * 1000.0 / results as f64
+    } else {
+        0.0
+    };
+    eprintln!("jobs admitted: {admitted}");
+    eprintln!("results: {results}");
+    eprintln!("errors: {errors}");
+    eprintln!("wall seconds: {wall_s:.3}");
+    eprintln!("jobs per second: {rate:.2}");
+    eprintln!("process CPU seconds: {cpu_s:.3}");
+    eprintln!("CPU ms per job: {cpu_ms:.3}");
+    eprintln!("at or below target: {hits}");
+}
+
+/// One full-budget job per nonce through `MetalSampler::sample_stream`.
+fn run_cascade_study(target: i64, producers: usize, out_path: &str) {
+    const NUM_READS: usize = 64;
+    let edges = aglais_edges();
+    let sweeps = env_parse("QUIP_SCREEN_FULL", 14_336usize);
+    let seconds = env_parse("QUIP_SCREEN_SECONDS", 1_800u64);
+    let supply = if let Ok(path) = std::env::var("QUIP_SCREEN_SEEDS") {
+        Arc::new(NonceSupply::listed(read_seeds(&path), seconds))
+    } else {
+        let run_seed = env_or("QUIP_SCREEN_SEED", 20_260_918u64);
+        let limit = match std::env::var("QUIP_SCREEN_NONCES") {
+            Ok(value) => Some(
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("QUIP_SCREEN_NONCES must be an integer")),
+            ),
+            Err(_) => None,
+        };
+        Arc::new(NonceSupply::drawn(run_seed, limit, seconds))
+    };
+    eprintln!(
+        "cascade: {NUM_READS} reads, {sweeps} sweeps, {seconds} s, target {target} milli, output {out_path}"
+    );
+
+    let mut out = std::io::BufWriter::new(std::fs::File::create(out_path).expect("create csv"));
+    writeln!(out, "nonce,seed,best,reads,device_us,ok").expect("write");
+
+    let (job_tx, job_rx) = tokio::sync::mpsc::channel(128);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(128);
+    let cancel = CancelToken::default();
+    let mut producer_threads = Vec::new();
+    for _ in 0..producers {
+        let edges = edges.clone();
+        let supply = Arc::clone(&supply);
+        let job_tx = job_tx.clone();
+        producer_threads.push(std::thread::spawn(move || {
+            let mut admitted = 0usize;
+            while let Some((index, seed)) = supply.next_nonce() {
+                let graph = instance(seed, &edges);
+                let job = StreamJob {
+                    job_id: cascade_job_id(index, &seed),
+                    graph,
+                    params: SampleParams {
+                        num_reads: NUM_READS,
+                        num_sweeps: sweeps,
+                        sweeps_per_beta: 1,
+                        beta_range: None,
+                        // The relay derives later probe seeds from this one.
+                        // Stage 0 is the derivation `run_stage` uses first.
+                        seed: job_seed(0, index),
+                    },
+                    watermark: None,
+                };
+                if job_tx.blocking_send(job).is_err() {
+                    break;
+                }
+                admitted += 1;
+            }
+            admitted
+        }));
+    }
+    drop(job_tx);
+
+    let backend_toml = cascade_backend_toml();
+    let worker = std::thread::spawn(move || {
+        let device = MetalDevice::open(0).expect("Metal device 0");
+        let gov = UtilGovernor::start(0, 100, false);
+        let sampler = MetalSampler::new(device, gov, Kernel::Msa);
+        sampler.apply_config(&backend_toml);
+        sampler.sample_stream(job_rx, out_tx, cancel);
+    });
+
+    let mut done = 0usize;
+    let mut errors = 0usize;
+    let mut hits = 0usize;
+    let mut last_report = Instant::now();
+    while let Some(result) = out_rx.blocking_recv() {
+        let (index, seed_hex) = parse_cascade_job_id(&result.job_id);
+        let device_us = result.device_access_time_us;
+        let (best, reads_n, ok) = match result.outcome {
+            StreamOutcome::Completed(Ok(reads)) => {
+                let best = reads.iter().map(|read| read.energy_milli).min();
+                (best, reads.len(), 1u8)
+            }
+            StreamOutcome::Completed(Err(error)) => {
+                let text = error.to_string();
+                if names_energy_audit_mismatch(&text) {
+                    let _ = out.flush();
+                    panic!("nonce {index} device-energy audit mismatch: {text}");
+                }
+                eprintln!("nonce {index} failed: {text}");
+                (None, 0, 0)
+            }
+            StreamOutcome::Cancelled => {
+                eprintln!("nonce {index} cancelled");
+                (None, 0, 0)
+            }
+        };
+        if ok == 0 {
+            errors += 1;
+        }
+        if let Some(best) = best {
+            if best <= target {
+                hits += 1;
+            }
+            writeln!(out, "{index},{seed_hex},{best},{reads_n},{device_us},{ok}")
+        } else {
+            writeln!(out, "{index},{seed_hex},,{reads_n},{device_us},{ok}")
+        }
+        .expect("write");
+        done += 1;
+        if last_report.elapsed().as_secs() >= 60 {
+            let elapsed = supply.start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                done as f64 / elapsed
+            } else {
+                0.0
+            };
+            eprintln!("cascade: {done} results after {elapsed:.0} s, {rate:.2} jobs/s");
+            last_report = Instant::now();
+        }
+    }
+    let wall_s = supply.start.elapsed().as_secs_f64();
+    out.flush().expect("flush csv");
+    worker.join().expect("stream worker");
+    let mut admitted = 0usize;
+    for producer in producer_threads {
+        admitted += producer.join().expect("producer");
+    }
+    let cpu_s = process_cpu_seconds();
+    print_cascade_summary(admitted, done, errors, wall_s, cpu_s, hits);
+    eprintln!("wrote {out_path}");
+}
+
 /// Positive control for the fixture derivation. `scripts/testnet/regen`
 /// writes a problem from the chain's own topology record; this test draws
 /// the same seed on the derived edge list and compares. Set
@@ -398,6 +747,13 @@ fn probe_then_solve_on_fresh_nonces() {
         )
         .with_writer(std::io::stderr)
         .try_init();
+    let target: i64 = env_or("QUIP_SCREEN_TARGET", AGLAIS_TARGET_MILLI);
+    let producers = screen_producers();
+    let out_path = std::env::var("QUIP_SCREEN_OUT").unwrap_or_else(|_| "probe-screen.csv".into());
+    if std::env::var("QUIP_SCREEN_CASCADE").ok().as_deref() == Some("1") {
+        run_cascade_study(target, producers, &out_path);
+        return;
+    }
     let seeds = match std::env::var("QUIP_SCREEN_SEEDS") {
         Ok(path) => read_seeds(&path),
         Err(_) => draw_seeds(
@@ -408,7 +764,6 @@ fn probe_then_solve_on_fresh_nonces() {
     let stages = parse_stages(
         &std::env::var("QUIP_SCREEN_STAGES").unwrap_or_else(|_| "64x1024,64x14336".into()),
     );
-    let target: i64 = env_or("QUIP_SCREEN_TARGET", AGLAIS_TARGET_MILLI);
     let filter = std::env::var("QUIP_SCREEN_FILTER").ok().map(|value| {
         let fraction: f64 = value.parse().expect("QUIP_SCREEN_FILTER must be a number");
         assert!(
@@ -417,15 +772,6 @@ fn probe_then_solve_on_fresh_nonces() {
         );
         fraction
     });
-    let producers: usize = std::env::var("QUIP_SCREEN_PRODUCERS")
-        .map(|value| {
-            value
-                .parse()
-                .expect("QUIP_SCREEN_PRODUCERS must be an integer")
-        })
-        .unwrap_or(1);
-    assert!(producers > 0, "QUIP_SCREEN_PRODUCERS must be positive");
-    let out_path = std::env::var("QUIP_SCREEN_OUT").unwrap_or_else(|_| "probe-screen.csv".into());
     let edges = aglais_edges();
     eprintln!(
         "{} nonces, {} stages, target {target} milli, output {out_path}",
@@ -515,4 +861,57 @@ fn filtered_selection_preserves_indices_and_uses_completed_count() {
         vec![(0, seeds[0]), (1, seeds[1])]
     );
     assert!(select_seeds(&seeds, Some(&[None; 6]), Some(0.5), None).is_empty());
+}
+
+#[test]
+fn cputime_parses_the_ps_clock() {
+    let micros = |text: &str| {
+        let seconds = parse_cputime(text).unwrap_or_else(|| panic!("parse {text}"));
+        (seconds * 1_000_000.0).round() as i64
+    };
+    assert_eq!(micros("0:00.02"), 20_000);
+    assert_eq!(micros("158:16.45"), (158 * 60 * 1_000_000) + 16_450_000);
+    assert_eq!(
+        micros("1-02:03:04"),
+        86_400_000_000 + 2 * 3_600_000_000 + 3 * 60_000_000 + 4_000_000
+    );
+    assert_eq!(
+        micros("  2:03:04.50 "),
+        2 * 3_600_000_000 + 3 * 60_000_000 + 4_500_000
+    );
+    assert!(parse_cputime("nope").is_none());
+    assert!(parse_cputime("").is_none());
+}
+
+#[test]
+fn cascade_nonce_supply_matches_the_stage_draw() {
+    let supply = NonceSupply::drawn(20_260_918, Some(4), 60);
+    let expected = draw_seeds(20_260_918, 4);
+    for (index, seed) in expected.iter().enumerate() {
+        let (got_index, got_seed) = supply.next_nonce().expect("nonce");
+        assert_eq!(got_index, index);
+        assert_eq!(got_seed, *seed);
+        assert_eq!(job_seed(0, index), index as u64);
+        let (parsed_index, parsed_seed) = parse_cascade_job_id(&cascade_job_id(index, seed));
+        assert_eq!(parsed_index, index);
+        assert_eq!(parsed_seed, hex(seed));
+    }
+    assert!(supply.next_nonce().is_none());
+    assert_eq!(job_seed(1, 5), (1u64 << 32) + 5);
+
+    let listed = draw_seeds(3, 2);
+    let supply = NonceSupply::listed(listed.clone(), 60);
+    assert_eq!(supply.next_nonce().expect("listed 0").1, listed[0]);
+    assert_eq!(supply.next_nonce().expect("listed 1").1, listed[1]);
+    assert!(supply.next_nonce().is_none());
+
+    let stopped = NonceSupply::drawn(1, None, 0);
+    assert!(stopped.next_nonce().is_none());
+
+    assert!(names_energy_audit_mismatch(
+        "device fault: device energy 1 != host energy 2 for problem 0 read 0"
+    ));
+    assert!(!names_energy_audit_mismatch(
+        "device fault: metal command buffer did not complete: status Error"
+    ));
 }
