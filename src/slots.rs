@@ -887,6 +887,270 @@ mod tests {
         pool.reads_many(&[4], 33).unwrap_err();
     }
 
+    const AGLAIS_NODES: usize = 4577;
+    const AGLAIS_EDGES: usize = 41514;
+    const AGLAIS_MISSING_EDGE: (usize, usize) = (880, 2695);
+    const AGLAIS_ALLOWED_H: [i32; 1] = [0];
+    const AGLAIS_ALLOWED_J: [i32; 2] = [-1000, 1000];
+
+    fn aglais_edges() -> Vec<(usize, usize)> {
+        let mut edges = Vec::with_capacity(AGLAIS_EDGES);
+        for line in include_str!("../tests/fixtures/advantage2-system1.edges").lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut nodes = line.split_whitespace();
+            let u: usize = nodes.next().expect("edge start").parse().expect("node id");
+            let v: usize = nodes.next().expect("edge end").parse().expect("node id");
+            assert!(nodes.next().is_none(), "two node ids per edge");
+            assert!(u < AGLAIS_NODES && v < AGLAIS_NODES, "fixture node range");
+            if (u, v) != AGLAIS_MISSING_EDGE {
+                edges.push((u, v));
+            }
+        }
+        assert_eq!(edges.len(), AGLAIS_EDGES);
+        edges
+    }
+
+    /// The exact instance the chain would validate for `seed`.
+    fn instance(seed: [u8; 32], edges: &[(usize, usize)]) -> IsingGraph {
+        use quip_solver_core::quip_protocol::chacha8::draw_ising_milli;
+
+        let (h, j) = draw_ising_milli(
+            seed,
+            AGLAIS_NODES,
+            edges.len(),
+            &AGLAIS_ALLOWED_H,
+            &AGLAIS_ALLOWED_J,
+        )
+        .expect("draw");
+        assert!(h.iter().all(|v| AGLAIS_ALLOWED_H.contains(v)));
+        assert!(j.iter().all(|v| AGLAIS_ALLOWED_J.contains(v)));
+        let milli = |v: &i32| f64::from(*v) / 1000.0;
+        IsingGraph::new(
+            h.iter().map(milli).collect(),
+            j.iter().map(milli).collect(),
+            edges.to_vec(),
+        )
+    }
+
+    fn next_drawn_seed(state: &mut u64) -> [u8; 32] {
+        let mut seed = [0u8; 32];
+        for word in seed.as_chunks_mut::<8>().0 {
+            *word = xorshift64(state).to_le_bytes();
+        }
+        seed
+    }
+
+    fn draw_seeds(run_seed: u64, count: usize) -> Vec<[u8; 32]> {
+        let mut state = run_seed | 1;
+        (0..count).map(|_| next_drawn_seed(&mut state)).collect()
+    }
+
+    fn parse_seed(hex: &str) -> [u8; 32] {
+        assert_eq!(hex.len(), 64, "32-byte hex seed");
+        assert!(hex.is_ascii(), "ASCII hex seed");
+        let mut seed = [0u8; 32];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex seed");
+        }
+        seed
+    }
+
+    fn read_seeds(path: &str) -> Vec<[u8; 32]> {
+        std::fs::read_to_string(path)
+            .expect("read seeds file")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(parse_seed)
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "seeded segment calibration; run only on the controller's GPU"]
+    #[expect(
+        clippy::print_stderr,
+        reason = "calibration progress for the task monitor"
+    )]
+    fn seeded_segments_calibration() {
+        use std::io::{BufWriter, Write};
+        use std::time::Instant;
+
+        let Some(device) = device() else {
+            return;
+        };
+        let count: usize = std::env::var("QUIP_SEGMENTS_NONCES")
+            .map(|v| v.parse().expect("QUIP_SEGMENTS_NONCES integer"))
+            .unwrap_or(2000);
+        assert!(count > 0, "at least one nonce");
+        let mut seeds = match std::env::var("QUIP_SEGMENTS_SEEDS") {
+            Ok(path) => read_seeds(&path),
+            Err(std::env::VarError::NotPresent) => draw_seeds(20260918, count),
+            Err(error) => panic!("QUIP_SEGMENTS_SEEDS: {error}"),
+        };
+        seeds.truncate(count);
+        assert!(!seeds.is_empty(), "at least one seed");
+        let reheats: Vec<f64> = std::env::var("QUIP_SEGMENTS_REHEAT")
+            .unwrap_or_else(|_| "0.10,0.15,0.25".into())
+            .split(',')
+            .map(|v| v.trim().parse().expect("reheat beta"))
+            .collect();
+        assert!(reheats.iter().all(|r| r.is_finite() && *r > 0.0));
+        let mut names = std::collections::HashSet::new();
+        for reheat in &reheats {
+            assert!(
+                names.insert(format!("{reheat:.2}")),
+                "duplicate output name"
+            );
+        }
+        let out = std::path::PathBuf::from(
+            std::env::var_os("QUIP_SEGMENTS_OUT").expect("QUIP_SEGMENTS_OUT directory"),
+        );
+        std::fs::create_dir_all(&out).expect("create output directory");
+        let edges = aglais_edges();
+        let capacity = crate::streaming::declared_stream_width(Kernel::Msa) / 2;
+        let mut pool = SlotPool::new(
+            &device,
+            &instance(seeds[0], &edges),
+            READS,
+            capacity,
+            14_336,
+        )
+        .unwrap();
+        for reheat in reheats {
+            let mut prefix = vec![None; seeds.len()];
+            for (name, intermediate) in [("A", false), ("B", true)] {
+                let start = Instant::now();
+                let file_name = format!("{name}-r{reheat:.2}.csv");
+                let mut csv = BufWriter::new(
+                    std::fs::File::create(out.join(&file_name)).expect("create calibration CSV"),
+                );
+                let checkpoints = if intermediate {
+                    vec![32, 256, 14_336]
+                } else {
+                    vec![32, 14_336]
+                };
+                let header = if intermediate {
+                    "nonce,best_64x32,best_64x256,best_64x14336"
+                } else {
+                    "nonce,best_64x32,best_64x14336"
+                };
+                writeln!(csv, "{header}").unwrap();
+                let mut completed = 0;
+                for (batch, chunk) in seeds.chunks(pool.capacity()).enumerate() {
+                    let mut nonces = vec![None; pool.capacity()];
+                    let mut rows = vec![vec![None; checkpoints.len()]; pool.capacity()];
+                    for (offset, &seed) in chunk.iter().enumerate() {
+                        let nonce = batch * pool.capacity() + offset;
+                        let graph = instance(seed, &edges);
+                        let schedule = segment_schedule(&graph, reheat, intermediate);
+                        let slot = pool
+                            .admit(SlotJob {
+                                graph,
+                                schedule,
+                                checkpoints: checkpoints.clone(),
+                                seed: nonce as u64,
+                            })
+                            .unwrap();
+                        nonces[slot] = Some(nonce);
+                    }
+                    while pool.live() > 0 {
+                        // Bound command duration while retaining every rung and checkpoint.
+                        for checkpoint in finish_step(&mut pool, 32) {
+                            let nonce = nonces[checkpoint.slot].expect("admitted nonce");
+                            let row = &mut rows[checkpoint.slot];
+                            assert!(row[checkpoint.index].replace(checkpoint.best).is_none());
+                            if !checkpoint.last {
+                                continue;
+                            }
+                            assert!(
+                                row.iter().all(Option::is_some),
+                                "missing checkpoint for {nonce}"
+                            );
+                            if intermediate {
+                                assert_eq!(
+                                    row[0], prefix[nonce],
+                                    "shared prefix: nonce {nonce}, reheat {reheat}"
+                                );
+                            } else {
+                                prefix[nonce] = row[0];
+                            }
+                            let mut line = nonce.to_string();
+                            for energy in row {
+                                use std::fmt::Write;
+                                write!(line, ",{}", energy.expect("checkpoint energy in milli"))
+                                    .unwrap();
+                            }
+                            assert_eq!(line.split(',').count(), header.split(',').count());
+                            writeln!(csv, "{line}").unwrap();
+                            pool.release(checkpoint.slot).unwrap();
+                            completed += 1;
+                            if completed % 200 == 0 {
+                                csv.flush().unwrap();
+                                eprintln!(
+                                    "{file_name}: {completed}/{} nonces, wall_seconds={:.3}",
+                                    seeds.len(),
+                                    start.elapsed().as_secs_f64()
+                                );
+                            }
+                        }
+                    }
+                }
+                assert_eq!(completed, seeds.len());
+                csv.flush().unwrap();
+                eprintln!(
+                    "{file_name}: complete {completed} nonces, wall_seconds={:.3}",
+                    start.elapsed().as_secs_f64()
+                );
+            }
+        }
+    }
+
+    fn segment_schedule(graph: &IsingGraph, reheat: f64, intermediate: bool) -> Vec<f32> {
+        use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+
+        let cold = default_ising_beta_range(graph).1;
+        let mut schedule = build_beta_schedule(graph, 32, 1, None).0;
+        let segments: &[usize] = if intermediate {
+            &[224, 14_080]
+        } else {
+            &[14_304]
+        };
+        for &length in segments {
+            schedule.extend(
+                geometric_beta_schedule(reheat, cold, length)
+                    .into_iter()
+                    .map(|beta| beta as f32),
+            );
+        }
+        schedule
+    }
+
+    #[test]
+    fn seeded_segment_schedules_preserve_prefix_and_cold_boundaries() {
+        use quip_solver_core::beta::default_ising_beta_range;
+
+        let graph = advantage2_system1(7);
+        let standard = build_beta_schedule(&graph, 32, 1, None).0;
+        let cold = default_ising_beta_range(&graph).1 as f32;
+        for reheat in [0.10, 0.15, 0.25] {
+            for intermediate in [false, true] {
+                let schedule = segment_schedule(&graph, reheat, intermediate);
+                assert_eq!(schedule.len(), 14_336);
+                assert_eq!(&schedule[..32], standard.as_slice());
+                assert_eq!(schedule[31], cold);
+                assert_eq!(schedule[32], reheat as f32);
+                assert_eq!(schedule[14_335], cold);
+                if intermediate {
+                    assert_eq!(schedule[255], cold);
+                    assert_eq!(schedule[256], reheat as f32);
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "one-gate S4 throughput study; run only on the controller's GPU"]
     #[expect(
