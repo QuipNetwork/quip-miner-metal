@@ -7,7 +7,6 @@ use quip_solver_conformance::driver::{
     drive_miner, DriverReport, Terminal, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER,
 };
 use quip_solver_core::quip_proto::v1::RejectReason;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 /// The four jobs the driver expects a `Result` for, and the only four a
@@ -223,77 +222,6 @@ async fn quip_metal_msa_passes_conformance() {
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     // `msa` is not `gibbs`, so the resolved budget is not doubled.
     assert_conformant("quip-metal-msa", &report, CONFIGURED_SWEEPS);
-}
-
-/// Same walk as `quip_metal_msa_passes_conformance`, with the cascade on.
-///
-/// The published driver sends a fixed `backend_toml`. The wrapper exports
-/// `QUIP_METAL_BACKEND_EXTRA`, which `apply_config` appends. `enable_ane` is
-/// false so the router sends every job to Metal, where the relay runs.
-/// Stages `[8, 32]` sit under the driver's 512-sweep budget.
-#[tokio::test]
-async fn quip_metal_msa_cascade_passes_conformance() {
-    ensure_built(&["quip-metal-msa"]);
-    let extra = "\
-cascade = true
-cascade_stages = [8, 32]
-cascade_keep = 20
-cascade_keep_min = 10
-cascade_keep_max = 40
-enable_ane = false
-";
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let wrapper = std::env::temp_dir().join(format!(
-        "quip-metal-msa-cascade-{}-{stamp}.sh",
-        std::process::id()
-    ));
-    let log = std::env::temp_dir().join(format!(
-        "quip-metal-msa-cascade-{}-{stamp}.log",
-        std::process::id()
-    ));
-    let _cleanup = RemoveOnDrop(vec![wrapper.clone(), log.clone()]);
-    let miner = profile_bin("quip-metal-msa");
-    let script = format!(
-        "#!/bin/sh\nexport QUIP_METAL_BACKEND_EXTRA='{extra}'\nexec '{miner}' \"$@\" 2>'{log}'\n",
-        extra = extra.replace('\'', "'\\''"),
-        miner = miner.replace('\'', "'\\''"),
-        log = log.display().to_string().replace('\'', "'\\''"),
-    );
-    std::fs::write(&wrapper, script).expect("write cascade wrapper");
-    let mut perms = std::fs::metadata(&wrapper)
-        .expect("wrapper metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&wrapper, perms).expect("chmod cascade wrapper");
-
-    let socket = format!(
-        "/tmp/quip-metal-msa-cascade-{}-{stamp}.sock",
-        std::process::id()
-    );
-    let report = drive_miner(
-        wrapper.to_str().expect("wrapper path"),
-        &format!("unix://{socket}"),
-    )
-    .await;
-    let miner_log = std::fs::read_to_string(&log).unwrap_or_default();
-    assert!(
-        miner_log.contains("cascade relay started"),
-        "cascade relay did not start; miner log:\n{miner_log}"
-    );
-    assert_conformant("quip-metal-msa-cascade", &report, CONFIGURED_SWEEPS);
-}
-
-struct RemoveOnDrop(Vec<std::path::PathBuf>);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        for path in &self.0 {
-            let _ = std::fs::remove_file(path);
-        }
-    }
 }
 
 #[test]

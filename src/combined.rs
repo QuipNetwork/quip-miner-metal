@@ -29,24 +29,6 @@ fn settings(lock: &Mutex<Settings>) -> Settings {
     *lock.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// Append coordinator text with an optional extra fragment.
-///
-/// `None` and blank extras leave the coordinator text unchanged. A non-empty
-/// extra is a following TOML table fragment, so a newline separates the two.
-fn merge_backend_extra(backend_toml: &str, extra: Option<&str>) -> String {
-    match extra.map(str::trim).filter(|extra| !extra.is_empty()) {
-        Some(extra) => format!("{backend_toml}\n{extra}"),
-        None => backend_toml.to_owned(),
-    }
-}
-
-/// `QUIP_METAL_BACKEND_EXTRA` carries keys the conformance driver cannot put
-/// in `Configure.backend_toml`. Unset, this is the coordinator text alone.
-fn backend_toml_for_apply(backend_toml: &str) -> String {
-    let extra = std::env::var("QUIP_METAL_BACKEND_EXTRA").ok();
-    merge_backend_extra(backend_toml, extra.as_deref())
-}
-
 pub(crate) fn stream_width(kernel: Kernel) -> usize {
     crate::streaming::declared_stream_width(kernel) + usize::from(kernel == Kernel::Msa)
 }
@@ -195,8 +177,7 @@ impl Sampler for CombinedSampler {
         }
     }
     fn apply_config(&self, backend_toml: &str) {
-        let backend_toml = backend_toml_for_apply(backend_toml);
-        let cfg: MetalConfig = match toml::from_str(&backend_toml) {
+        let cfg: MetalConfig = match toml::from_str(backend_toml) {
             Ok(cfg) => cfg,
             Err(error) => {
                 tracing::warn!(%error, "invalid engine configuration; rejecting jobs until valid configuration arrives");
@@ -1078,31 +1059,6 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.keep, 5000.0);
         assert!(sampler.metal.get().is_none());
-    }
-
-    #[test]
-    fn merge_backend_extra_appends_cascade_keys_after_the_coordinator_text() {
-        let merged = merge_backend_extra(
-            "num_sweeps = 512\n",
-            Some(
-                "cascade = true\ncascade_stages = [8, 32]\ncascade_keep = 20\ncascade_keep_min = 10\ncascade_keep_max = 40\n",
-            ),
-        );
-        assert!(merged.starts_with("num_sweeps = 512\n"));
-        let cfg: crate::MetalConfig = toml::from_str(&merged).unwrap();
-        assert_eq!(cfg.cascade.cascade, Some(true));
-        assert_eq!(cfg.cascade.cascade_stages.as_deref(), Some(&[8, 32][..]));
-        assert_eq!(cfg.cascade.cascade_keep, Some(20));
-        assert_eq!(cfg.cascade.cascade_keep_min, Some(10));
-        assert_eq!(cfg.cascade.cascade_keep_max, Some(40));
-        assert_eq!(
-            merge_backend_extra("num_sweeps = 512\n", None),
-            "num_sweeps = 512\n"
-        );
-        assert_eq!(
-            merge_backend_extra("num_sweeps = 512\n", Some("  \n")),
-            "num_sweeps = 512\n"
-        );
     }
 
     #[test]
