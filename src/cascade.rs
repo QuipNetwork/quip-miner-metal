@@ -14,6 +14,7 @@ use quip_solver_core::{CancelToken, SampleError, StreamJob, StreamOutcome, Strea
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::cutoff::{Cutoff, CutoffConfig};
+use crate::model_checks::{Action, AuditLane, Drift, Yield};
 
 pub(crate) const MAX_STAGES: usize = 3;
 
@@ -21,11 +22,8 @@ pub(crate) const MAX_STAGES: usize = 3;
 pub(crate) struct Calibration {
     pub(crate) stages: &'static [usize],
     /// Audit-lane miss rate r0 for each probe-to-next-stage transition.
-    #[expect(dead_code, reason = "Task 10 audit-lane model checks")]
     pub(crate) false_negative: &'static [f64],
-    #[expect(dead_code, reason = "Task 10 distribution checks")]
     pub(crate) skew: &'static [f64],
-    #[expect(dead_code, reason = "Task 10 distribution checks")]
     pub(crate) excess_kurtosis: &'static [f64],
     pub(crate) cost_a_us: f64,
     pub(crate) cost_b_us: f64,
@@ -156,10 +154,25 @@ fn copy_job(job: &StreamJob) -> StreamJob {
     }
 }
 
+fn kept_median(kept: &VecDeque<i64>) -> Option<f64> {
+    if kept.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<_> = kept.iter().copied().collect();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        Some(sorted[mid - 1] as f64 / 2.0 + sorted[mid] as f64 / 2.0)
+    } else {
+        Some(sorted[mid] as f64)
+    }
+}
+
 struct Active {
     original: StreamJob,
     stage: usize,
     probes: usize,
+    audited: bool,
     device_us: u64,
     topology_epoch: u64,
 }
@@ -167,6 +180,11 @@ struct Active {
 struct Relay {
     settings: CascadeSettings,
     cutoffs: Vec<Cutoff>,
+    audit_lanes: Vec<AuditLane>,
+    kept: Vec<VecDeque<i64>>,
+    audit_rng: Option<u64>,
+    drift: Drift,
+    yield_check: Option<Yield>,
     active: HashMap<Vec<u8>, Active>,
     ready: VecDeque<StreamJob>,
     topology: Option<(usize, Vec<(usize, usize)>)>,
@@ -196,6 +214,16 @@ impl Relay {
         Self {
             settings,
             cutoffs: (0..=count).map(|_| Cutoff::new(cfg)).collect(),
+            audit_lanes: (0..count)
+                .map(|s| AuditLane::new(CALIBRATION.false_negative[s]))
+                .collect(),
+            kept: (0..count).map(|_| VecDeque::with_capacity(256)).collect(),
+            audit_rng: None,
+            drift: Drift::new(CALIBRATION.skew[0], CALIBRATION.excess_kurtosis[0]),
+            yield_check: settings
+                .yield_per_million
+                .zip(settings.target_milli)
+                .map(|(rate, target)| Yield::new(rate, target, Duration::from_secs(3600))),
             active: HashMap::new(),
             ready: VecDeque::new(),
             topology: None,
@@ -209,6 +237,15 @@ impl Relay {
     }
 
     fn admit(&mut self, job: StreamJob) {
+        // Xorshift must not start in its absorbing zero state.
+        self.audit_rng.get_or_insert(if job.params.seed == 0 {
+            1
+        } else {
+            job.params.seed
+        });
+        if let Some(check) = &mut self.yield_check {
+            check.admit();
+        }
         let same = self
             .topology
             .as_ref()
@@ -217,6 +254,11 @@ impl Relay {
             for cutoff in &mut self.cutoffs {
                 cutoff.reset();
             }
+            for (stage, lane) in self.audit_lanes.iter_mut().enumerate() {
+                *lane = AuditLane::new(CALIBRATION.false_negative[stage]);
+                self.kept[stage].clear();
+            }
+            self.drift = Drift::new(CALIBRATION.skew[0], CALIBRATION.excess_kurtosis[0]);
             self.topology = Some((job.graph.num_nodes(), job.graph.edges.clone()));
             self.topology_epoch = self.topology_epoch.wrapping_add(1);
         }
@@ -237,6 +279,7 @@ impl Relay {
                 original: job,
                 stage: 0,
                 probes,
+                audited: false,
                 device_us: 0,
                 topology_epoch: self.topology_epoch,
             },
@@ -255,10 +298,51 @@ impl Relay {
         if let StreamOutcome::Completed(Ok(reads)) = &result.outcome {
             if let Some(best) = reads.iter().map(|r| r.energy_milli).min() {
                 let current_topology = active.topology_epoch == self.topology_epoch;
+                if current_topology && active.stage > 0 {
+                    let previous = active.stage - 1;
+                    if active.audited {
+                        if let Some(median) = kept_median(&self.kept[previous]) {
+                            let miss = best as f64 <= median;
+                            let (observed, expected) = self.audit_lanes[previous].observation(miss);
+                            let action = self.audit_lanes[previous].record(miss);
+                            self.apply_action(
+                                previous,
+                                action,
+                                "audit misses",
+                                &[observed],
+                                &[expected],
+                            );
+                        }
+                    } else {
+                        let kept = &mut self.kept[previous];
+                        if kept.len() == 256 {
+                            kept.pop_front();
+                        }
+                        kept.push_back(best);
+                    }
+                }
                 if active.stage < active.probes {
                     // Old-topology work can finish, but must not train the new
                     // distribution. Screen it out with its available reads.
-                    if current_topology && self.cutoffs[active.stage].decide(best as f64) {
+                    let mut advance = false;
+                    if current_topology {
+                        let keep = self.cutoffs[active.stage].decide(best as f64);
+                        active.audited = !keep && self.audit_selected(active.stage);
+                        advance = keep || active.audited;
+                        if active.stage == 0 {
+                            let m = self.cutoffs[0].moments();
+                            let observed = [m.skew(), m.excess_kurtosis()];
+                            let action = self.drift.check(m);
+                            self.apply_action(
+                                0,
+                                action,
+                                "distribution drift",
+                                &observed,
+                                &[CALIBRATION.skew[0], CALIBRATION.excess_kurtosis[0]],
+                            );
+                        }
+                    }
+                    if advance {
                         active.stage += 1;
                         let mut next = copy_job(&active.original);
                         if active.stage < active.probes {
@@ -278,7 +362,70 @@ impl Relay {
             }
         }
         result.device_access_time_us = active.device_us;
-        let _ = out.blocking_send(result);
+        let best = match &result.outcome {
+            StreamOutcome::Completed(Ok(reads)) => reads.iter().map(|r| r.energy_milli).min(),
+            StreamOutcome::Completed(Err(_)) | StreamOutcome::Cancelled => None,
+        };
+        if out.blocking_send(result).is_ok() {
+            if let (Some(check), Some(best)) = (&mut self.yield_check, best) {
+                check.result(best);
+            }
+        }
+    }
+
+    fn audit_selected(&mut self, stage: usize) -> bool {
+        let Some(state) = &mut self.audit_rng else {
+            return false;
+        };
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state % u64::from(self.audit_lanes[stage].denominator(self.settings.audit)) == 0
+    }
+
+    fn apply_action(
+        &mut self,
+        stage: usize,
+        action: Action,
+        check: &str,
+        observed: &[f64],
+        expected: &[f64],
+    ) {
+        let cutoff = &mut self.cutoffs[stage];
+        match action {
+            Action::None => return,
+            Action::Loosen { raise_audit } => {
+                cutoff.loosen_step();
+                if raise_audit {
+                    self.audit_lanes[stage].raise();
+                }
+            }
+            Action::Restore => cutoff.restore_step(),
+            Action::LoosenAndDoubleK0 => {
+                cutoff.loosen_step();
+                cutoff.double_k0();
+            }
+        }
+        tracing::warn!(
+            stage,
+            check,
+            ?action,
+            ?observed,
+            ?expected,
+            denominator = cutoff.denominator(),
+            audit_denominator = self.audit_lanes[stage].denominator(self.settings.audit),
+            "cascade model check"
+        );
+    }
+
+    fn check_yield(&mut self, now: Instant) {
+        if let Some(check) = &mut self.yield_check {
+            let (observed, expected) = check.observation();
+            let action = check.tick(now);
+            for stage in 0..self.audit_lanes.len() {
+                self.apply_action(stage, action, "yield hits", &[observed], &[expected]);
+            }
+        }
     }
 
     /// Cancellation before dispatch refunds the job once, including time from
@@ -343,6 +490,7 @@ impl Relay {
     }
 
     fn update_load(&mut self) {
+        self.check_yield(Instant::now());
         let elapsed = self.window.elapsed().as_secs_f64();
         if elapsed < 1.0 {
             return;
@@ -535,6 +683,142 @@ mod tests {
     }
 
     #[test]
+    fn yield_counts_forwarded_results_and_widens_each_probe() {
+        for hit in [false, true] {
+            let settings = CascadeSettings {
+                target_milli: Some(-100),
+                yield_per_million: Some(10_000_000.0),
+                ..CascadeSettings::default()
+            };
+            let mut relay = Relay::new(settings, 1);
+            relay.admit(job(0, 32));
+            let (out, mut results) = mpsc::channel(1);
+            let full = relay.ready.pop_front().unwrap();
+            relay.complete(with_energy(full, if hit { -100 } else { 0 }), &out);
+            results.try_recv().unwrap();
+            let (hits, bound) = relay.yield_check.as_ref().unwrap().observation();
+            assert_eq!(hits, if hit { 1.0 } else { 0.0 });
+            assert!((bound - (10f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
+            relay.check_yield(Instant::now() + Duration::from_secs(3601));
+            for lane in &relay.audit_lanes {
+                assert_eq!(lane.denominator(200), 50);
+            }
+            assert_eq!(relay.yield_check.as_ref().unwrap().observation().0, 0.0);
+        }
+        let relay = Relay::new(
+            CascadeSettings {
+                target_milli: Some(-100),
+                ..CascadeSettings::default()
+            },
+            1,
+        );
+        assert!(relay.yield_check.is_none());
+    }
+
+    #[test]
+    fn reference_median_and_zero_seed_are_well_defined() {
+        assert_eq!(kept_median(&VecDeque::new()), None);
+        assert_eq!(kept_median(&VecDeque::from([5, 1, 3])), Some(3.0));
+        assert_eq!(kept_median(&VecDeque::from([5, 1, 3, 7])), Some(4.0));
+        let mut relay = Relay::new(CascadeSettings::default(), 1);
+        let mut first = job(0, 1024);
+        first.params.seed = 0;
+        relay.admit(first);
+        let selected = (0..10_000).filter(|_| relay.audit_selected(0)).count();
+        assert!((20..100).contains(&selected), "{selected}");
+    }
+
+    #[test]
+    fn audit_returns_the_next_probe_when_that_probe_screens_it_out() {
+        let mut relay = Relay::new(
+            CascadeSettings {
+                audit: 2,
+                ..CascadeSettings::default()
+            },
+            1,
+        );
+        let (out, mut results) = mpsc::channel(1);
+        for id in 0..100 {
+            relay.admit(job(id, 1024));
+            let probe = relay.ready.pop_front().unwrap();
+            relay.complete(with_energy(probe, 0), &out);
+            if let Some(next) = relay.ready.pop_front() {
+                assert_eq!(next.params.num_sweeps, 128);
+                // Choose a non-audit draw for the next screening decision.
+                relay.audit_rng = Some(1);
+                relay.complete(with_energy(next, 123), &out);
+                let result = results.try_recv().unwrap();
+                let StreamOutcome::Completed(Ok(reads)) = result.outcome else {
+                    panic!("expected reads")
+                };
+                assert_eq!(reads[0].energy_milli, 123);
+                assert_eq!(result.device_access_time_us, 160);
+                assert!(relay.kept[0].is_empty());
+                return;
+            }
+            results.try_recv().unwrap();
+        }
+        panic!("expected an audited job");
+    }
+
+    #[test]
+    fn injected_false_negative_burst_loosens_the_stage() {
+        let settings = CascadeSettings {
+            stages: [32, 0, 0],
+            keep: 100.0,
+            keep_min: 2.0,
+            keep_max: 1000.0,
+            audit: 2,
+            ..CascadeSettings::default()
+        };
+        let mut relay = Relay::new(settings, 1);
+        relay.admit(job(0, 1024));
+        for _ in 0..100_000 {
+            relay.cutoffs[0].observe(-100.0);
+        }
+        let (out, mut results) = mpsc::channel(1);
+        // Establish a reference from an actually kept job.
+        let probe = relay.ready.pop_front().unwrap();
+        relay.complete(with_energy(probe, -1000), &out);
+        let full = relay.ready.pop_front().unwrap();
+        relay.complete(with_energy(full, -1000), &out);
+        results.try_recv().unwrap();
+        let before = relay.cutoffs[0].denominator();
+        for id in 1..1000 {
+            relay.admit(job(id, 1024));
+            let probe = relay.ready.pop_front().unwrap();
+            relay.complete(with_energy(probe, 0), &out);
+            if let Some(full) = relay.ready.pop_front() {
+                relay.complete(with_energy(full, -2000), &out);
+                let result = results.try_recv().unwrap();
+                let StreamOutcome::Completed(Ok(reads)) = result.outcome else {
+                    panic!("expected reads")
+                };
+                assert_eq!(reads[0].energy_milli, -2000);
+                assert_eq!(result.device_access_time_us, 1056);
+            } else {
+                results.try_recv().unwrap();
+            }
+            if relay.audit_lanes[0].denominator(200) == 50 {
+                assert!((relay.cutoffs[0].denominator() - before / 2.0).abs() < 0.01);
+                assert_eq!(relay.kept[0].len(), 1);
+                return;
+            }
+        }
+        panic!("audit burst did not loosen the screen");
+    }
+
+    fn with_energy(job: StreamJob, energy: i64) -> StreamResult {
+        let mut result = answer(job);
+        if let StreamOutcome::Completed(Ok(reads)) = &mut result.outcome {
+            for read in reads {
+                read.energy_milli = energy;
+            }
+        }
+        result
+    }
+
+    #[test]
     fn every_job_gets_exactly_one_result() {
         let settings = CascadeSettings {
             stages: [32, 256, 0],
@@ -643,7 +927,7 @@ mod tests {
             ..CascadeSettings::default()
         };
         let cancel = CancelToken::default();
-        let mut held_second_stage = false;
+        let mut held_second_stage = None;
         let results = exercise(
             settings,
             (0..201).map(|i| job(i, 1024)).collect(),
@@ -651,15 +935,17 @@ mod tests {
             |mut rx, tx| {
                 while let Some(job) = rx.blocking_recv() {
                     let sweeps = job.params.num_sweeps;
+                    let id = job.job_id.clone();
                     let mut reply = answer(job);
                     if sweeps == 128 {
                         // Hold this stage until cancellation. Its stage-0 result
                         // has already reached the relay, otherwise it cannot run.
-                        held_second_stage = true;
+                        held_second_stage = Some(id);
                         cancel.cancel_through(1);
                         reply.outcome = StreamOutcome::Cancelled;
                     } else if let StreamOutcome::Completed(Ok(reads)) = &mut reply.outcome {
-                        // Equal energies make job 200 pass after 200 warm-up jobs.
+                        // Equal energies permit normal keeps after warm-up.
+                        // An audit can reach the second stage before then.
                         for read in reads {
                             read.energy_milli = -32;
                         }
@@ -668,12 +954,9 @@ mod tests {
                 }
             },
         );
-        assert!(held_second_stage);
+        let held_id = held_second_stage.unwrap();
         assert_eq!(results.len(), 201);
-        let cancelled: Vec<_> = results
-            .iter()
-            .filter(|r| r.job_id == 200u64.to_le_bytes())
-            .collect();
+        let cancelled: Vec<_> = results.iter().filter(|r| r.job_id == held_id).collect();
         assert_eq!(cancelled.len(), 1);
         assert!(matches!(cancelled[0].outcome, StreamOutcome::Cancelled));
         assert_eq!(cancelled[0].device_access_time_us, 160);

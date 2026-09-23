@@ -51,6 +51,7 @@ pub mod sampler;
 mod cascade;
 mod combined;
 mod cutoff;
+mod model_checks;
 
 pub mod iokit_gov;
 pub mod metal_device;

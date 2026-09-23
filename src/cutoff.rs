@@ -52,7 +52,6 @@ impl Moments {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 distribution checks"))]
     pub(crate) fn skew(&self) -> f64 {
         if self.m2 <= 0.0 {
             0.0
@@ -61,7 +60,6 @@ impl Moments {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 distribution checks"))]
     pub(crate) fn excess_kurtosis(&self) -> f64 {
         if self.m2 <= 0.0 {
             0.0
@@ -277,7 +275,6 @@ impl Cutoff {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 distribution checks"))]
     pub(crate) fn moments(&self) -> &Moments {
         &self.moments
     }
@@ -339,19 +336,16 @@ impl Cutoff {
     }
 
     /// Halve the denominator, down to the loosest clamp.
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 model checks"))]
     pub(crate) fn loosen_step(&mut self) {
         self.loosen = (self.loosen * 0.5).max(self.cfg.keep_min / self.cfg.keep_max);
     }
 
     /// Undo one [`Self::loosen_step`].
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 model checks"))]
     pub(crate) fn restore_step(&mut self) {
         self.loosen = (self.loosen * 2.0).min(1.0);
     }
 
     /// Give the Gaussian anchor more weight for longer.
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 10 model checks"))]
     pub(crate) fn double_k0(&mut self) {
         self.cfg.k0 *= 2.0;
     }
