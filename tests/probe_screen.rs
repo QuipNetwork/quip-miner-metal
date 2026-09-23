@@ -5,7 +5,7 @@
 //! instance distribution. `#[ignore]`: an hour of GPU time at the default
 //! nonce count.
 //!
-//! Every nonce runs through every stage, so the CSV holds the joint
+//! By default every nonce runs through every stage, so the CSV holds the joint
 //! distribution of a short probe and the full job on the same instance. The
 //! analysis in `scripts/testnet/annealer/screen_yield.py` then scores any keep
 //! fraction and threshold from one run.
@@ -22,6 +22,10 @@
 //! `64x1024,64x14336`; the optional third field caps how many of the run's
 //! nonces that stage takes, so shapes of different cost can run for a
 //! similar time),
+//! `QUIP_SCREEN_FILTER` (optional keep fraction F, 0 < F <= 1; after the
+//! first stage, keep the best ceil(F * completed) from the previous stage,
+//! then apply the stage nonce cap; skipped CSV cells stay empty),
+//! `QUIP_SCREEN_PRODUCERS` (positive thread count for instance draws, default 1),
 //! `QUIP_SCREEN_TARGET` (milli, default the Aglais target of 2026-09-18),
 //! `QUIP_SCREEN_OUT` (CSV path, default `probe-screen.csv`).
 //!
@@ -194,16 +198,43 @@ struct Summary {
     below_target: usize,
 }
 
-/// Run every seed through `stage` and return one summary per seed, in seed
-/// order. Instances are generated on a producer thread as the stream takes
+/// Select original nonce indices, breaking energy ties by nonce index.
+fn select_seeds(
+    seeds: &[[u8; 32]],
+    previous: Option<&[Option<Summary>]>,
+    filter: Option<f64>,
+    cap: Option<usize>,
+) -> Vec<(usize, [u8; 32])> {
+    let mut indices: Vec<usize> = if let (Some(previous), Some(fraction)) = (previous, filter) {
+        let mut completed: Vec<_> = previous
+            .iter()
+            .enumerate()
+            .filter_map(|(i, summary)| summary.map(|s| (s.best, i)))
+            .collect();
+        completed.sort_unstable();
+        completed.truncate((fraction * completed.len() as f64).ceil() as usize);
+        completed.into_iter().map(|(_, i)| i).collect()
+    } else {
+        (0..seeds.len()).collect()
+    };
+    indices.truncate(cap.unwrap_or(indices.len()));
+    indices.into_iter().map(|i| (i, seeds[i])).collect()
+}
+
+/// Run every seed through `stage`, indexed by its original nonce position.
+/// Instances are generated on producer threads as the stream takes
 /// them, since 50,000 graphs at a megabyte each do not fit in memory.
 fn run_stage(
     edges: &[(usize, usize)],
-    seeds: &[[u8; 32]],
+    seeds: &[(usize, [u8; 32])],
     stage: Stage,
     stage_index: usize,
     target: i64,
+    producers: usize,
 ) -> (Vec<Option<Summary>>, f64, f64) {
+    if seeds.is_empty() {
+        return (Vec::new(), 0.0, 0.0);
+    }
     let (job_tx, job_rx) = tokio::sync::mpsc::channel(128);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(128);
     let cancel = CancelToken::default();
@@ -212,18 +243,25 @@ fn run_stage(
     // Each stage draws its own RNG stream: a probe and a full job on the same
     // nonce must not share a seed.
     let seed_base = (stage_index as u64) << 32;
-    let producer = {
+    let mut producer_threads = Vec::new();
+    for producer_index in 0..producers.min(count) {
         let edges = edges.to_vec();
-        let seeds = seeds.to_vec();
+        let seeds: Vec<_> = seeds
+            .iter()
+            .skip(producer_index)
+            .step_by(producers)
+            .copied()
+            .collect();
+        let job_tx = job_tx.clone();
         // Report how the producer split its time. Drawing one instance copies
         // about a megabyte, so a short probe can starve on the producer rather
         // than the device. `blocked` is time waiting on a full channel, which
         // is the device holding the producer back and the state we want.
-        std::thread::spawn(move || {
+        producer_threads.push(std::thread::spawn(move || {
             let (mut drawing, mut blocked) = (Duration::ZERO, Duration::ZERO);
-            for (i, seed) in seeds.iter().enumerate() {
+            for (i, seed) in seeds {
                 let t = Instant::now();
-                let graph = instance(*seed, &edges);
+                let graph = instance(seed, &edges);
                 drawing += t.elapsed();
                 let job = StreamJob {
                     job_id: i.to_string().into_bytes(),
@@ -245,15 +283,17 @@ fn run_stage(
                 }
             }
             (drawing, blocked)
-        })
-    };
+        }));
+    }
+    drop(job_tx);
 
     let start = Instant::now();
     let worker = std::thread::spawn(move || {
         let device = MetalDevice::open(0).expect("Metal device 0");
         run_stream(&device, Kernel::Msa, job_rx, &out_tx, &NoGovernor, &cancel);
     });
-    let mut summaries: Vec<Option<Summary>> = vec![None; count];
+    let size = seeds.iter().map(|(i, _)| i + 1).max().unwrap_or(0);
+    let mut summaries: Vec<Option<Summary>> = vec![None; size];
     let mut done = 0usize;
     let mut last_report = Instant::now();
     // Lead time: how long a cold miner waits for its first answer. It covers
@@ -298,7 +338,12 @@ fn run_stage(
     let wall_s = start.elapsed().as_secs_f64();
     worker.join().expect("stream worker");
     let lead_s = first_result.unwrap_or_default().as_secs_f64();
-    let (drawing, blocked) = producer.join().expect("producer");
+    let (mut drawing, mut blocked) = (Duration::ZERO, Duration::ZERO);
+    for producer in producer_threads {
+        let (draw_time, block_time) = producer.join().expect("producer");
+        drawing += draw_time;
+        blocked += block_time;
+    }
     eprintln!(
         "  producer: drawing {:.1} s, blocked on the device {:.1} s, of {wall_s:.1} s wall;\
          {:.2} ms per instance",
@@ -339,6 +384,10 @@ fn derived_topology_reproduces_a_regenerated_problem() {
 #[test]
 #[ignore = "GPU study: an hour of device time at the default nonce count"]
 fn probe_then_solve_on_fresh_nonces() {
+    if MetalDevice::device_count() == 0 {
+        eprintln!("skipping probe-screen study: no Metal device");
+        return;
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -357,6 +406,22 @@ fn probe_then_solve_on_fresh_nonces() {
         &std::env::var("QUIP_SCREEN_STAGES").unwrap_or_else(|_| "64x1024,64x14336".into()),
     );
     let target: i64 = env_or("QUIP_SCREEN_TARGET", AGLAIS_TARGET_MILLI);
+    let filter = std::env::var("QUIP_SCREEN_FILTER").ok().map(|value| {
+        let fraction: f64 = value.parse().expect("QUIP_SCREEN_FILTER must be a number");
+        assert!(
+            fraction > 0.0 && fraction <= 1.0,
+            "QUIP_SCREEN_FILTER must be in (0, 1]"
+        );
+        fraction
+    });
+    let producers: usize = std::env::var("QUIP_SCREEN_PRODUCERS")
+        .map(|value| {
+            value
+                .parse()
+                .expect("QUIP_SCREEN_PRODUCERS must be an integer")
+        })
+        .unwrap_or(1);
+    assert!(producers > 0, "QUIP_SCREEN_PRODUCERS must be positive");
     let out_path = std::env::var("QUIP_SCREEN_OUT").unwrap_or_else(|_| "probe-screen.csv".into());
     let edges = aglais_edges();
     eprintln!(
@@ -365,17 +430,22 @@ fn probe_then_solve_on_fresh_nonces() {
         stages.len()
     );
 
-    let mut columns = Vec::with_capacity(stages.len());
+    let mut columns: Vec<Vec<Option<Summary>>> = Vec::with_capacity(stages.len());
     for (k, stage) in stages.iter().enumerate() {
-        let run = &seeds[..stage.nonces.unwrap_or(seeds.len()).min(seeds.len())];
-        let (mut summaries, wall_s, lead_s) = run_stage(&edges, run, *stage, k, target);
+        let run = select_seeds(
+            &seeds,
+            columns.last().map(Vec::as_slice),
+            filter,
+            stage.nonces,
+        );
+        let (mut summaries, wall_s, lead_s) = run_stage(&edges, &run, *stage, k, target, producers);
         let done = summaries.iter().flatten().count();
         eprintln!(
             "stage {}x{}: {done} of {} jobs in {wall_s:.1} s = {:.2} jobs/s; lead {lead_s:.2} s; wall_seconds={wall_s:.6}",
             stage.num_reads,
             stage.num_sweeps,
             run.len(),
-            done as f64 / wall_s
+            if wall_s > 0.0 { done as f64 / wall_s } else { 0.0 }
         );
         summaries.resize(seeds.len(), None);
         columns.push(summaries);
@@ -401,4 +471,45 @@ fn probe_then_solve_on_fresh_nonces() {
     }
     out.flush().expect("flush csv");
     eprintln!("wrote {out_path}");
+}
+
+#[test]
+fn filtered_selection_preserves_indices_and_uses_completed_count() {
+    let seeds = draw_seeds(7, 6);
+    let summary = |best| {
+        Some(Summary {
+            best,
+            median: best,
+            below_target: 0,
+        })
+    };
+    let previous = vec![
+        summary(30),
+        None,
+        summary(10),
+        summary(20),
+        None,
+        summary(10),
+    ];
+    assert_eq!(
+        select_seeds(&seeds, Some(&previous), Some(0.5), None),
+        vec![(2, seeds[2]), (5, seeds[5])]
+    );
+    assert_eq!(
+        select_seeds(&seeds, Some(&previous), Some(0.01), None),
+        vec![(2, seeds[2])]
+    );
+    assert_eq!(
+        select_seeds(&seeds, Some(&previous), Some(1.0), Some(3)),
+        vec![(2, seeds[2]), (5, seeds[5]), (3, seeds[3])]
+    );
+    assert_eq!(
+        select_seeds(&seeds, Some(&previous), None, Some(2)),
+        vec![(0, seeds[0]), (1, seeds[1])]
+    );
+    assert_eq!(
+        select_seeds(&seeds, None, Some(0.5), Some(2)),
+        vec![(0, seeds[0]), (1, seeds[1])]
+    );
+    assert!(select_seeds(&seeds, Some(&[None; 6]), Some(0.5), None).is_empty());
 }
