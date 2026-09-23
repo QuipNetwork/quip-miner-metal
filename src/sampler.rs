@@ -1392,6 +1392,12 @@ mod tests {
             vec![(0, 1), (1, 2)],
         );
         assert!(!device_energy_exact(&nan));
+        // 127 units per node: 16,909 nodes stay under i32::MAX / 1000 units,
+        // 16,910 nodes would let the kernel's int sum wrap.
+        let fits = IsingGraph::new(vec![127.0; 16_909], vec![], vec![]);
+        assert!(device_energy_exact(&fits));
+        let wraps = IsingGraph::new(vec![127.0; 16_910], vec![], vec![]);
+        assert!(!device_energy_exact(&wraps));
     }
 
     #[test]
