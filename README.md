@@ -26,7 +26,7 @@ other coefficients, are scored on the host.
 
 Prebuilt `arm64` binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-metal/-/releases)
-(built best-effort on a macOS CI runner; see [`.gitlab-ci.yml`](.gitlab-ci.yml)).
+(built best-effort on a macOS CI runner. See [`.gitlab-ci.yml`](.gitlab-ci.yml)).
 
 ## Build
 
@@ -46,7 +46,7 @@ from crates.io at a pinned version, published from
 quip-metal-sa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
-**Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
+**Driver / fixed-input (run in isolation).** Use the coordinator's
 `drive` harness pointed at the binary — `--source random` for golden-drawn
 problems, `--source list <jsonl>` for a fixed replay:
 
