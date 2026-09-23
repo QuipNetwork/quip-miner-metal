@@ -49,6 +49,11 @@ compile_error!(
 pub mod sampler;
 
 mod combined;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the cascade relay in the next task")
+)]
+mod cutoff;
 
 pub mod iokit_gov;
 pub mod metal_device;
