@@ -105,6 +105,10 @@ work and exclude host preparation.
 has no `sweeps_done` field, so screened-out jobs report more sweeps than they
 run.
 
+Under a salt lease, a screened-out salt sends nothing to the coordinator. The
+session counts it in the lease's `LeaseDone` summary, and its probe energies
+can set that summary's best energy.
+
 ## Model checks
 
 Model checks let more jobs through when results differ from the model. Each

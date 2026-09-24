@@ -146,14 +146,15 @@ const _: () = assert!(
 ///
 /// ```
 /// use quip_miner_metal::METAL_SA_IDENTITY;
+/// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
-/// assert_eq!(METAL_SA_IDENTITY.backend, "metal");
-/// assert_eq!(METAL_SA_IDENTITY.algorithm, "sa");
+/// assert_eq!(METAL_SA_IDENTITY.backend, Backend::Metal);
+/// assert_eq!(METAL_SA_IDENTITY.algorithm, Algorithm::Sa);
 /// assert!(METAL_SA_IDENTITY.max_nodes > 0);
 /// ```
 pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "metal",
-    algorithm: "sa",
+    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
+    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Sa,
     // Single source of truth with the sampler's runtime guard: the advertised
     // cap and the guard cannot drift because this is the same constant. A job
     // over it would overrun the SA kernel's `thread int8_t delta_energy[4593]`
@@ -173,14 +174,15 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
 ///
 /// ```
 /// use quip_miner_metal::METAL_GIBBS_IDENTITY;
+/// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
-/// assert_eq!(METAL_GIBBS_IDENTITY.backend, "metal");
-/// assert_eq!(METAL_GIBBS_IDENTITY.algorithm, "gibbs");
+/// assert_eq!(METAL_GIBBS_IDENTITY.backend, Backend::Metal);
+/// assert_eq!(METAL_GIBBS_IDENTITY.algorithm, Algorithm::Gibbs);
 /// assert!(METAL_GIBBS_IDENTITY.max_nodes > 0);
 /// ```
 pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "metal",
-    algorithm: "gibbs",
+    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
+    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Gibbs,
     // Same single-source-of-truth rule as SA above; the Gibbs cap comes from
     // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
     max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
@@ -196,14 +198,15 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 ///
 /// ```
 /// use quip_miner_metal::METAL_MSA_IDENTITY;
+/// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
-/// assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
-/// assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
+/// assert_eq!(METAL_MSA_IDENTITY.backend, Backend::Metal);
+/// assert_eq!(METAL_MSA_IDENTITY.algorithm, Algorithm::Msa);
 /// assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads, 64);
 /// ```
 pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "metal",
-    algorithm: "msa",
+    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
+    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Msa,
     // Union capacity. Routing still enforces each engine's own limits.
     max_nodes: quip_miner_ane::ANE_MSA_IDENTITY.max_nodes,
     max_edges: DEFAULT_MAX_EDGES,
@@ -563,8 +566,14 @@ mod tests {
     #[test]
     fn msa_identity_advertises_the_multi_spin_kernel() {
         use super::{METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
-        assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
-        assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
+        assert_eq!(
+            METAL_MSA_IDENTITY.backend,
+            quip_solver_core::quip_proto::v1::Backend::Metal
+        );
+        assert_eq!(
+            METAL_MSA_IDENTITY.algorithm,
+            quip_solver_core::quip_proto::v1::Algorithm::Msa
+        );
         assert_eq!(METAL_MSA_IDENTITY.max_nodes, 16_384);
         assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
         // Reads are pinned to whole words.

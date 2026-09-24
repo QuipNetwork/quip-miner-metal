@@ -1,0 +1,46 @@
+    Finished `release` profile [optimized] target(s) in 0.16s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/probe_screen.rs (target/release/deps/probe_screen-728ebf3d2873ea89)
+cascade: 64 reads, 14336 sweeps, 300 s, target -14625068 milli, output /Users/carback1/Code/quip/quip-miner-metal/.claude/worktrees/lease-protocol/docs/perf/data/2026-09-24-lease-path/direct-3.csv, mode=system backend_toml=""
+2026-09-24T12:45:35.137636Z  WARN quip_miner_metal::cascade: cascade model check stage=0 check=Drift action=LoosenAndDoubleK0 observed=[-0.14443376065814295, 0.11490465423741192] expected=[-0.123, 0.014] denominator=31.622776601683793 audit_denominator=200
+cascade: t=10 s results=16388 window=1637.5/s total=1637.5/s
+cascade: t=20 s results=29572 window=1317.8/s total=1477.7/s
+cascade: t=30 s results=42879 window=1330.5/s total=1428.6/s
+cascade: t=40 s results=56349 window=1346.9/s total=1408.2/s
+cascade: t=50 s results=69350 window=1300.0/s total=1386.6/s
+cascade: t=60 s results=81735 window=1238.3/s total=1361.9/s
+cascade: t=70 s results=94002 window=1226.3/s total=1342.5/s
+cascade: t=80 s results=106576 window=1257.1/s total=1331.8/s
+cascade: t=90 s results=119267 window=1268.8/s total=1324.8/s
+cascade: t=100 s results=131718 window=1244.6/s total=1316.8/s
+cascade: t=110 s results=143920 window=1219.5/s total=1308.0/s
+cascade: t=120 s results=157304 window=1338.3/s total=1310.5/s
+cascade: t=130 s results=170330 window=1302.3/s total=1309.9/s
+cascade: t=140 s results=183277 window=1294.5/s total=1308.8/s
+cascade: t=150 s results=195851 window=1257.1/s total=1305.3/s
+cascade: t=160 s results=209320 window=1346.7/s total=1307.9/s
+cascade: t=170 s results=222436 window=1311.4/s total=1308.1/s
+cascade: t=180 s results=236446 window=1400.7/s total=1313.2/s
+cascade: t=190 s results=249107 window=1265.9/s total=1310.8/s
+cascade: t=200 s results=261005 window=1189.8/s total=1304.7/s
+cascade: t=210 s results=272977 window=1196.9/s total=1299.6/s
+cascade: t=220 s results=296158 window=2318.0/s total=1345.9/s
+cascade: t=230 s results=322894 window=2673.3/s total=1403.6/s
+cascade: t=240 s results=351915 window=2901.8/s total=1466.0/s
+cascade: t=250 s results=373101 window=2116.9/s total=1492.0/s
+cascade: t=260 s results=398092 window=2498.8/s total=1530.8/s
+cascade: t=270 s results=426831 window=2872.6/s total=1580.5/s
+cascade: t=280 s results=455393 window=2855.7/s total=1626.0/s
+cascade: t=290 s results=485586 window=3018.9/s total=1674.0/s
+cascade: t=300 s results=511458 window=2587.1/s total=1704.5/s
+cascade: summary
+jobs admitted: 511616
+results: 511616
+errors: 0
+wall seconds: 300.905
+jobs per second: 1700.26
+process CPU seconds: 567.990
+CPU ms per job: 1.110
+at or below target: 0
+wrote /Users/carback1/Code/quip/quip-miner-metal/.claude/worktrees/lease-protocol/docs/perf/data/2026-09-24-lease-path/direct-3.csv

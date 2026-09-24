@@ -11,7 +11,7 @@ use quip_solver_core::CommonArgs;
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 2"))]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,

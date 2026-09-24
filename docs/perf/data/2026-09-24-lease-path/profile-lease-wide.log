@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 0.09s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/lease.rs (target/release/deps/lease-46a2f48e6a900157)
+    Finished `release` profile [optimized] target(s) in 0.07s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+lease: 162 credits, 4000 salts per lease, 14336 sweeps, target -14625068, backend_toml=""
+lease: t=10 salts=5670 rate=565.50/s results=0
+lease: t=20 salts=11453 rate=571.49/s results=0
+lease: t=30 salts=17212 rate=572.63/s results=0
+lease: t=40 salts=22992 rate=573.72/s results=0
+lease: t=50 salts=28147 rate=561.88/s results=0
+lease: t=60 salts=32866 rate=546.76/s results=0
+lease: t=70 salts=37602 rate=536.17/s results=0
+lease: t=80 salts=42718 rate=533.00/s results=0
+lease: t=90 salts=48457 rate=537.42/s results=0
+lease: t=100 salts=54194 rate=540.95/s results=0
+lease: t=110 salts=59971 rate=544.21/s results=0
+lease: t=121 salts=66144 rate=547.18/s results=1
+lease summary: salts 66144 in 120.9 s = 547.18 salts/s; miner CPU ms per salt 2.567; results 1 verified 1; leases finished 0

@@ -35,8 +35,14 @@ cargo build --release
 ```
 
 The solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) comes
-from crates.io at a pinned version, published from
-[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core).
+from crates.io at version 0.0.2-rc3, published from
+[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core). It
+speaks protocol version 2, so the coordinator must also speak version 2.
+
+The miners accept `ISING_GENERATE` salt leases. The session draws each salt's
+problem from the lease, runs it through the same stream as a plain job, and
+sends a `Result` only for a salt whose reads meet the target. Each lease ends
+with one `LeaseDone` summary and a credit refund.
 
 ## Running
 

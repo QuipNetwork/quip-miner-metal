@@ -1,0 +1,41 @@
+    Finished `release` profile [optimized] target(s) in 0.08s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/lease.rs (target/release/deps/lease-46a2f48e6a900157)
+    Finished `release` profile [optimized] target(s) in 0.07s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+lease: 82 credits, 4000 salts per lease, 14336 sweeps, target -14625068, backend_toml=""
+lease: t=10 salts=5513 rate=549.86/s results=0
+lease: t=20 salts=11043 rate=550.87/s results=0
+lease: t=30 salts=16604 rate=552.25/s results=0
+2026-09-24T12:25:34.112384Z  WARN quip_miner_metal::cascade: cascade model check stage=0 check=Audit action=Loosen { raise_audit: true } observed=[8.0] expected=[7.663177536704026] denominator=31.622776601683793 audit_denominator=50
+lease: t=40 salts=22214 rate=554.17/s results=0
+2026-09-24T12:25:52.841302Z  WARN quip_miner_metal::cascade: cascade model check stage=0 check=Audit action=Restore observed=[10.0] expected=[14.130272678869705] denominator=33.27587790474185 audit_denominator=200
+lease: t=50 salts=27708 rate=553.06/s results=0
+lease: t=60 salts=33228 rate=552.73/s results=0
+lease: t=70 salts=38774 rate=552.85/s results=0
+lease: t=80 salts=44337 rate=553.17/s results=0
+lease: t=90 salts=49881 rate=553.21/s results=0
+lease: t=100 salts=55395 rate=552.93/s results=0
+lease: t=110 salts=60922 rate=552.82/s results=0
+lease: t=120 salts=66515 rate=553.28/s results=0
+lease: t=130 salts=72064 rate=553.32/s results=0
+lease: t=140 salts=77624 rate=553.41/s results=0
+lease: t=150 salts=83202 rate=553.64/s results=0
+lease: t=160 salts=88818 rate=554.06/s results=0
+lease: t=170 salts=94387 rate=554.15/s results=0
+lease: t=180 salts=99970 rate=554.30/s results=0
+lease: t=190 salts=105512 rate=554.23/s results=0
+lease: t=200 salts=111078 rate=554.27/s results=0
+lease: t=211 salts=116737 rate=554.30/s results=0
+lease: t=221 salts=122328 rate=554.45/s results=0
+lease: t=230 salts=127755 rate=554.43/s results=0
+lease: t=240 salts=133328 rate=554.49/s results=0
+lease: t=250 salts=138945 rate=554.74/s results=0
+lease: t=260 salts=144495 rate=554.70/s results=0
+lease: t=271 salts=150052 rate=554.69/s results=0
+lease: t=281 salts=155559 rate=554.51/s results=0
+lease: t=291 salts=161059 rate=554.33/s results=0
+lease: t=301 salts=166607 rate=554.31/s results=0
+lease summary: salts 166607 in 300.6 s = 554.31 salts/s; miner CPU ms per salt 2.589; results 0 verified 0; leases finished 16
