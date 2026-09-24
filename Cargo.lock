@@ -956,9 +956,12 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]
