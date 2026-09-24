@@ -165,6 +165,18 @@ async fn shutdown_during_a_lease_sends_its_summary_and_exits_cleanly() {
         .done(b"lease-shutdown")
         .expect("LeaseDone before close");
     assert!(done.salts_done >= 100 && done.salts_done < 1_000_000);
+    let summary = s
+        .log
+        .order
+        .iter()
+        .position(|e| e == "done:lease-shutdown")
+        .expect("summary in order log");
+    assert!(
+        !s.log.order[summary..]
+            .iter()
+            .any(|e| e == "result:lease-shutdown"),
+        "no result after the shut-down lease's summary"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
