@@ -8,9 +8,10 @@ use std::process::{Command, Stdio};
 mod support;
 
 use quip_solver_conformance::driver::CONFIGURED_SWEEPS;
+use quip_solver_core::quip_proto::v1::CoefficientEncoding;
 use quip_solver_core::quip_proto::v1::{
-    coord_msg, ising_problem, Cancel, Configure, EdgeList, GetCapabilities, IsingProblem, JobKind,
-    Ping, RejectReason, Shutdown, Topology, Welcome,
+    coord_msg, ising_problem, Algorithm, Backend, Cancel, Configure, EdgeList, GetCapabilities,
+    IsingProblem, JobKind, Ping, RejectReason, Shutdown, Topology, Welcome,
 };
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::quip_protocol::wire::encode_i32_le;
@@ -98,8 +99,11 @@ fn capabilities_json_matches_ane_msa_identity() {
     assert_eq!(value["maxNodes"], 16_384);
     assert_eq!(value["maxEdges"], 163_840);
     assert_eq!(value["streamWidth"], 1);
-    assert_eq!(value["protocolVersion"], 1);
-    assert_eq!(value["supportedKinds"], serde_json::json!(["ISING_SAMPLE"]));
+    assert_eq!(value["protocolVersion"], 2);
+    assert_eq!(
+        value["supportedKinds"],
+        serde_json::json!(["ISING_SAMPLE", "ISING_GENERATE"])
+    );
     let features = value["features"]
         .as_array()
         .expect("features must be an array");
@@ -110,13 +114,13 @@ fn capabilities_json_matches_ane_msa_identity() {
 }
 
 #[test]
-fn version_includes_protocol_one() {
+fn version_includes_protocol_two() {
     let out = run_args(&["--version"]);
     assert!(out.status.success(), "--version failed: {:?}", out.status);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("protocol 1"),
-        "--version must name protocol 1: {text}"
+        text.contains("protocol 2"),
+        "--version must name protocol 2: {text}"
     );
 }
 
@@ -252,11 +256,14 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
             u: vec![0],
             v: vec![1],
         })),
-        h_milli_le32: encode_i32_le(&[1000, -1000]),
-        j_milli_le32: encode_i32_le(&[1000]),
+        encoding: CoefficientEncoding::I32 as i32,
+        scale: 1000,
+        h: encode_i32_le(&[1000, -1000]),
+        j: encode_i32_le(&[1000]),
         num_reads: 1,
         num_sweeps: 0,
         anneal_time_us: 0,
+        ..Default::default()
     };
     let dense_hash = vec![0x11; 32];
     let sparse_hash = vec![0x22; 32];
@@ -265,7 +272,7 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
     assert!(session.report.handshake_ok);
     session
         .send(coord_msg::Msg::Welcome(Welcome {
-            protocol_version: 1,
+            protocol_version: 2,
         }))
         .await;
     session
@@ -286,6 +293,7 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
                 v: vec![1],
             }),
             allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
         }))
         .await;
     session
@@ -319,9 +327,9 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
     // These valid wire jobs are outside the approved coefficient domain.
     // Each rejection must refund its credit before supported work resumes.
     let mut fractional_h = inline.clone();
-    fractional_h.h_milli_le32 = encode_i32_le(&[500, -1000]);
+    fractional_h.h = encode_i32_le(&[500, -1000]);
     let mut fractional_j = inline.clone();
-    fractional_j.j_milli_le32 = encode_i32_le(&[500]);
+    fractional_j.j = encode_i32_le(&[500]);
     for (id, problem) in [
         (&b"job-fractional-h"[..], fractional_h),
         (&b"job-fractional-j"[..], fractional_j),
@@ -370,12 +378,15 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
                 v: vec![12, 2400],
             }),
             allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
         }))
         .await;
     let sparse = IsingProblem {
         graph: Some(ising_problem::Graph::TopologyHash(sparse_hash)),
-        h_milli_le32: encode_i32_le(&[1000, -1000, 0]),
-        j_milli_le32: encode_i32_le(&[1000, -1000]),
+        encoding: CoefficientEncoding::I32 as i32,
+        scale: 1000,
+        h: encode_i32_le(&[1000, -1000, 0]),
+        j: encode_i32_le(&[1000, -1000]),
         ..inline.clone()
     };
     session
@@ -391,9 +402,9 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
     session.refunded("sparse topology job").await;
 
     let mut malformed_h = inline.clone();
-    malformed_h.h_milli_le32 = vec![1, 2, 3];
+    malformed_h.h = vec![1, 2, 3];
     let mut malformed_j = inline.clone();
-    malformed_j.j_milli_le32 = vec![1, 2, 3];
+    malformed_j.j = vec![1, 2, 3];
     for (id, problem, kind, expired) in [
         (&b"job-bad-h"[..], malformed_h, JobKind::IsingSample, false),
         (&b"job-bad-j"[..], malformed_j, JobKind::IsingSample, false),
@@ -454,8 +465,9 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
         "no Ready after Configure: {report:#?}"
     );
     let hello = report.hello.as_ref().expect("Hello");
-    assert_eq!(hello.backend, "ane");
-    assert_eq!(hello.algorithm, "msa");
+    let caps = hello.capabilities.as_ref().expect("Hello capabilities");
+    assert_eq!(caps.backend, Backend::Ane as i32);
+    assert_eq!(caps.algorithm, Algorithm::Msa as i32);
     let capabilities = report.capabilities_received.as_ref().expect("Capabilities");
     assert_eq!(capabilities.stream_width, 1);
     assert!(
