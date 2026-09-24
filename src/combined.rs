@@ -40,6 +40,7 @@ pub(crate) struct CombinedSampler {
     cascade: Mutex<crate::cascade::CascadeSettings>,
     metal: OnceLock<Result<MetalSampler, String>>,
     ane: Mutex<Option<Result<Arc<AneSampler>, String>>>,
+    edge_facts: Mutex<EdgeFactsCache>,
 }
 
 impl CombinedSampler {
@@ -57,6 +58,7 @@ impl CombinedSampler {
             metal: OnceLock::new(),
             cascade: Mutex::new(crate::cascade::CascadeSettings::default()),
             ane: Mutex::new(None),
+            edge_facts: Mutex::new(EdgeFactsCache::default()),
         }
     }
 
@@ -132,7 +134,16 @@ impl Sampler for CombinedSampler {
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
         let cfg = settings(&self.settings);
-        let eligible = eligibility(self.kernel, graph, params, cfg);
+        let eligible = eligibility(
+            self.kernel,
+            graph,
+            params,
+            cfg,
+            &mut self
+                .edge_facts
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
         if eligible[0] {
             self.metal()?.sample(graph, params)
         } else if eligible[1] {
@@ -252,12 +263,74 @@ fn unavailable(kernel: Kernel, cfg: Settings) {
         "no enabled engine supports this job; ANE supports MSA only, with unit coefficients and at most 128 reads");
 }
 
+/// Facts about an edge list that do not depend on `h` or `J`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EdgeFacts {
+    /// Every endpoint is below the node count.
+    in_bounds: bool,
+    /// No self-loop and no repeated undirected edge. Only meaningful in bounds.
+    simple: bool,
+    /// No node has more than 20 in-bounds incident edges; a self-loop counts once.
+    degree_ok: bool,
+}
+
+impl EdgeFacts {
+    fn of(n: usize, edges: &[(usize, usize)]) -> Self {
+        let mut degree = vec![0u32; n];
+        let mut seen = HashSet::with_capacity(edges.len());
+        let mut facts = Self {
+            in_bounds: true,
+            simple: true,
+            degree_ok: true,
+        };
+        for &(u, v) in edges {
+            if u >= n || v >= n {
+                facts.in_bounds = false;
+                continue;
+            }
+            degree[u] += 1;
+            if u != v {
+                degree[v] += 1;
+            }
+            facts.degree_ok &= degree[u] <= 20 && degree[v] <= 20;
+            facts.simple &= u != v && seen.insert((u.min(v), u.max(v)));
+        }
+        facts
+    }
+}
+
+/// Holds the facts for the most recent edge list. A session keeps one
+/// topology, so every job after the first reuses them.
+#[derive(Default)]
+struct EdgeFactsCache {
+    n: usize,
+    edges: Vec<(usize, usize)>,
+    facts: Option<EdgeFacts>,
+}
+
+impl EdgeFactsCache {
+    fn get(&mut self, n: usize, edges: &[(usize, usize)]) -> EdgeFacts {
+        match self.facts {
+            Some(facts) if self.n == n && self.edges == edges => facts,
+            _ => {
+                let facts = EdgeFacts::of(n, edges);
+                self.n = n;
+                self.edges = edges.to_vec();
+                self.facts = Some(facts);
+                facts
+            }
+        }
+    }
+}
+
 /// Linear input scan only. Dense ANE tile preparation belongs to its worker.
+/// Structural edge checks come from `edge_facts`; value checks run per job.
 fn eligibility(
     kernel: Kernel,
     graph: &IsingGraph,
     params: &SampleParams,
     cfg: Settings,
+    edge_facts: &mut EdgeFactsCache,
 ) -> [bool; 2] {
     if configuration_error(kernel, cfg).is_some() {
         return [false, false];
@@ -285,32 +358,28 @@ fn eligibility(
         .h
         .iter()
         .all(|&value| value == -1.0 || value == 0.0 || value == 1.0);
-    let mut degree = vec![0u32; n];
-    let mut ane_degree = vec![0u32; n];
-    let mut seen = HashSet::new();
-    for (index, &(u, v)) in graph.edges.iter().enumerate() {
-        if u >= n || v >= n {
-            ane = false;
-            continue;
-        }
-        if kernel == Kernel::Msa {
-            degree[u] += 1;
-            if u != v {
-                degree[v] += 1;
-            }
-            metal &= degree[u] <= 20 && degree[v] <= 20;
-        }
-        if ane {
-            let coupling = graph.j[index];
-            if u == v
-                || !seen.insert((u.min(v), u.max(v)))
-                || !(coupling == -1.0 || coupling == 0.0 || coupling == 1.0)
-            {
+    if kernel != Kernel::Msa {
+        return [metal, false];
+    }
+    let facts = edge_facts.get(n, &graph.edges);
+    if kernel == Kernel::Msa {
+        metal &= facts.degree_ok;
+    }
+    ane &= facts.in_bounds && facts.simple;
+    if ane {
+        let mut ane_degree = vec![0u32; n];
+        for (&(u, v), &coupling) in graph.edges.iter().zip(&graph.j) {
+            if !(coupling == -1.0 || coupling == 0.0 || coupling == 1.0) {
                 ane = false;
-            } else if coupling != 0.0 {
+                break;
+            }
+            if coupling != 0.0 {
                 ane_degree[u] += 1;
                 ane_degree[v] += 1;
-                ane &= ane_degree[u] <= 20 && ane_degree[v] <= 20;
+                if ane_degree[u] > 20 || ane_degree[v] > 20 {
+                    ane = false;
+                    break;
+                }
             }
         }
     }
@@ -446,6 +515,7 @@ impl Router<'_> {
             let limits = [self.metal_width.max(1), 1];
             let mut dead = [false; 2];
             let mut pending = VecDeque::<QueuedJob>::new();
+            let mut edge_facts = EdgeFactsCache::default();
             // Queue plus engine reservations never exceeds advertised credits.
             let capacity = self.metal_width.max(1) + usize::from(self.kernel == Kernel::Msa);
             let mut eof = false;
@@ -548,7 +618,13 @@ impl Router<'_> {
                     let eligible = match queued.eligibility {
                         Some((previous, eligible)) if previous == cfg => eligible,
                         _ => {
-                            let eligible = eligibility(self.kernel, &job.graph, &job.params, cfg);
+                            let eligible = eligibility(
+                                self.kernel,
+                                &job.graph,
+                                &job.params,
+                                cfg,
+                                &mut edge_facts,
+                            );
                             queued.eligibility = Some((cfg, eligible));
                             eligible
                         }
@@ -1092,7 +1168,8 @@ mod tests {
                 Kernel::Msa,
                 &j.graph,
                 &j.params,
-                settings(&sampler.settings)
+                settings(&sampler.settings),
+                &mut EdgeFactsCache::default()
             ),
             [false, false]
         );
@@ -1104,7 +1181,8 @@ mod tests {
                 Kernel::Msa,
                 &j.graph,
                 &j.params,
-                settings(&sampler.settings)
+                settings(&sampler.settings),
+                &mut EdgeFactsCache::default()
             ),
             [true, false]
         );
@@ -1178,30 +1256,31 @@ mod tests {
     fn admission_checks_each_engines_limits_without_dense_preparation() {
         let mut j = job(0);
         let cfg = config(true, true);
+        let mut facts = EdgeFactsCache::default();
         assert_eq!(
-            eligibility(Kernel::Msa, &j.graph, &j.params, cfg),
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, true]
         );
         j.graph.j[0] = 0.5;
         assert_eq!(
-            eligibility(Kernel::Msa, &j.graph, &j.params, cfg),
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
         j.graph.j[0] = 1.0;
         j.params.num_reads = 129;
         assert_eq!(
-            eligibility(Kernel::Msa, &j.graph, &j.params, cfg),
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
         j.params.num_reads = 128;
         j.graph = IsingGraph::new(vec![0.0; crate::sampler::MSA_MAX_NODES + 1], vec![], vec![]);
         assert_eq!(
-            eligibility(Kernel::Msa, &j.graph, &j.params, cfg),
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [false, true]
         );
         j.graph = IsingGraph::new(vec![0.0; 16_385], vec![], vec![]);
         assert_eq!(
-            eligibility(Kernel::Msa, &j.graph, &j.params, cfg),
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [false, false]
         );
         j.graph = IsingGraph::new(
@@ -1210,18 +1289,61 @@ mod tests {
             (1..22).map(|v| (0, v)).collect(),
         );
         assert_eq!(
-            eligibility(Kernel::Msa, &j.graph, &j.params, cfg),
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [false, false]
         );
         j.graph.j.fill(0.0);
         assert_eq!(
-            eligibility(Kernel::Msa, &j.graph, &j.params, cfg),
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [false, true]
         );
         j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 2)]);
         assert_eq!(
-            eligibility(Kernel::Msa, &j.graph, &j.params, cfg),
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
+    }
+
+    #[test]
+    fn edge_facts_reject_duplicates_and_self_loops_and_follow_edge_changes() {
+        let mut j = job(0);
+        let cfg = config(true, true);
+        let mut facts = EdgeFactsCache::default();
+        assert_eq!(
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [true, true]
+        );
+        let (u, v) = j.graph.edges[0];
+        j.graph.edges.push((v, u));
+        j.graph.j.push(1.0);
+        assert_eq!(
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [true, false]
+        );
+        j.graph.edges.pop();
+        j.graph.j.pop();
+        j.graph.edges.push((u, u));
+        j.graph.j.push(0.0);
+        assert_eq!(
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [true, false]
+        );
+        j.graph.edges.pop();
+        j.graph.j.pop();
+        assert_eq!(
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn edge_facts_cache_reuses_facts_for_the_same_edges() {
+        let edges = vec![(0, 1), (1, 2)];
+        let mut facts = EdgeFactsCache::default();
+        let first = facts.get(3, &edges);
+        assert!(first.in_bounds && first.simple && first.degree_ok);
+        assert_eq!(facts.get(3, &edges.clone()), first);
+        assert!(!facts.get(2, &edges).in_bounds);
+        assert_eq!(facts.get(3, &edges), first);
     }
 }
