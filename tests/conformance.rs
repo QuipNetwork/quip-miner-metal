@@ -9,9 +9,16 @@ use quip_solver_conformance::driver::{
 use quip_solver_core::quip_proto::v1::RejectReason;
 use std::process::Command;
 
-/// The four jobs the driver expects a `Result` for, and the only four a
-/// conformant miner may answer with one.
-const SOLVABLE_JOBS: [&[u8]; 4] = [b"job-1", b"job-2", b"job-hash", b"job-sparse"];
+/// The jobs the driver expects a `Result` for, and the only ones a
+/// conformant miner may answer with one. `job-seeded` carries warm-start
+/// states, which this miner ignores and answers cold.
+const SOLVABLE_JOBS: [&[u8]; 5] = [
+    b"job-1",
+    b"job-2",
+    b"job-hash",
+    b"job-sparse",
+    b"job-seeded",
+];
 
 /// Grade one driven session against every axis of the miner protocol.
 ///
@@ -95,6 +102,17 @@ fn assert_conformant(bin: &str, report: &DriverReport, expected_meta_sweeps: u32
             report.rejects
         );
     }
+
+    // Salt leases (SPEC.md "Generated jobs"). The session advertises
+    // ISING_GENERATE, so the driver runs its lease scenario and grades it.
+    let lease = report
+        .lease
+        .as_ref()
+        .unwrap_or_else(|| panic!("{bin}: the driver ran no lease scenario"));
+    assert!(
+        report.lease_conformant(),
+        "{bin}: lease not conformant: {lease:?}"
+    );
 
     // Cancel and Ping are each acknowledged with a Status ("Control-plane
     // pushes"); live cancellation is honoured (no Result/Reject for the
@@ -245,10 +263,16 @@ fn capabilities_and_version_and_check() {
             s.contains(&format!("\"algorithm\":\"{algo}\"")),
             "{bin}: {s}"
         );
+        assert!(s.contains("\"protocolVersion\":2"), "{bin}: {s}");
+        assert!(s.contains("\"ISING_GENERATE\""), "{bin}: {s}");
 
         let out = Command::new(&path).arg("--version").output().unwrap();
         assert!(out.status.success());
-        assert!(String::from_utf8(out.stdout).unwrap().contains("protocol"));
+        let version = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            version.trim_end().ends_with("protocol 2"),
+            "{bin}: --version must end with protocol 2: {version}"
+        );
 
         // --check opens the GPU and compiles kernels.
         let status = Command::new(&path)
