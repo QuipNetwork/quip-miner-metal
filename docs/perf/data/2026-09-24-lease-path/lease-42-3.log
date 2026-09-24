@@ -1,0 +1,41 @@
+    Finished `release` profile [optimized] target(s) in 0.17s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/lease.rs (target/release/deps/lease-46a2f48e6a900157)
+    Finished `release` profile [optimized] target(s) in 0.15s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+lease: 82 credits, 4000 salts per lease, 14336 sweeps, target -14625068, backend_toml=""
+lease: t=10 salts=3563 rate=355.00/s results=0
+lease: t=20 salts=8419 rate=419.80/s results=0
+lease: t=30 salts=12944 rate=430.41/s results=0
+lease: t=40 salts=17552 rate=437.81/s results=0
+lease: t=50 salts=22185 rate=442.74/s results=0
+lease: t=60 salts=26842 rate=446.43/s results=0
+lease: t=70 salts=31549 rate=449.76/s results=0
+lease: t=80 salts=36050 rate=449.71/s results=0
+lease: t=90 salts=40431 rate=448.33/s results=0
+lease: t=100 salts=44862 rate=447.73/s results=0
+lease: t=110 salts=49463 rate=448.77/s results=0
+lease: t=120 salts=55074 rate=458.06/s results=0
+lease: t=130 salts=60721 rate=466.17/s results=0
+lease: t=140 salts=66356 rate=473.06/s results=0
+lease: t=150 salts=71993 rate=479.04/s results=0
+lease: t=160 salts=77651 rate=484.40/s results=0
+lease: t=170 salts=83287 rate=489.01/s results=0
+2026-09-24T12:53:30.162285Z  WARN quip_miner_metal::cascade: cascade model check stage=0 check=Audit action=Loosen { raise_audit: true } observed=[21.0] expected=[20.54059924926995] denominator=31.622776601683793 audit_denominator=50
+lease: t=180 salts=88912 rate=493.04/s results=0
+lease: t=190 salts=94523 rate=496.56/s results=0
+2026-09-24T12:53:48.042724Z  WARN quip_miner_metal::cascade: cascade model check stage=0 check=Audit action=Restore observed=[9.0] expected=[14.130272678869705] denominator=35.012883509082755 audit_denominator=200
+lease: t=200 salts=100101 rate=499.57/s results=0
+lease: t=210 salts=105580 rate=502.39/s results=0
+lease: t=220 salts=111160 rate=504.87/s results=0
+lease: t=230 salts=116820 rate=507.48/s results=0
+lease: t=240 salts=122454 rate=509.77/s results=0
+lease: t=250 salts=128062 rate=511.77/s results=0
+lease: t=260 salts=133694 rate=513.70/s results=0
+lease: t=270 salts=139303 rate=515.39/s results=0
+lease: t=280 salts=144985 rate=517.22/s results=0
+lease: t=290 salts=150666 rate=518.93/s results=0
+lease: t=300 salts=156335 rate=520.48/s results=0
+lease summary: salts 156335 in 300.4 s = 520.48 salts/s; miner CPU ms per salt 2.758; results 0 verified 0; leases finished 11
