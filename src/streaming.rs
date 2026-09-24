@@ -182,6 +182,8 @@ pub(crate) fn scale_budget(nominal: usize, scale: f64) -> usize {
 /// A pure function of the kernel — the device does not participate in the
 /// Metal width — split out so `Sampler::declared_stream_width` can advertise
 /// the same number without opening a device (`--capabilities` must not).
+/// For the multi-spin kernel the width also covers the resident runner's
+/// preparation queue, `resident::PREP_BOUND`.
 ///
 /// # Examples
 ///
@@ -192,7 +194,15 @@ pub(crate) fn scale_budget(nominal: usize, scale: f64) -> usize {
 /// ```
 #[must_use]
 pub fn declared_stream_width(kernel: Kernel) -> usize {
-    (batch_size_for_reads(kernel, nominal_reads(kernel)) * 2).max(1)
+    let batches = batch_size_for_reads(kernel, nominal_reads(kernel)) * 2;
+    if kernel == Kernel::Msa {
+        // Two live slot pools plus the resident preparation queue. The
+        // session's lease expander and the coordinator's credits both stop at
+        // this width, and each salt needs a host draw before it can prepare.
+        batches + crate::resident::PREP_BOUND
+    } else {
+        batches.max(1)
+    }
 }
 
 /// `Sampler::stream_width`: how many models the backend keeps in flight.
@@ -1124,8 +1134,26 @@ mod tests {
         assert_eq!(nominal_reads(Kernel::Msa), 64);
         assert_eq!(
             declared_stream_width(Kernel::Msa),
-            (batch_size_for_reads(Kernel::Msa, 64) * 2).max(1)
+            batch_size_for_reads(Kernel::Msa, 64) * 2 + crate::resident::PREP_BOUND
         );
+    }
+
+    /// The session keeps at most `stream_width` salts in flight. The resident
+    /// runner holds two live slot pools plus `PREP_BOUND` jobs in preparation,
+    /// so a narrower window leaves slots idle between salts.
+    #[test]
+    fn msa_width_covers_live_slots_and_preparation() {
+        let batch = batch_size_for_reads(Kernel::Msa, nominal_reads(Kernel::Msa));
+        assert_eq!(
+            declared_stream_width(Kernel::Msa),
+            2 * batch + crate::resident::PREP_BOUND
+        );
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            assert_eq!(
+                declared_stream_width(kernel),
+                (batch_size_for_reads(kernel, nominal_reads(kernel)) * 2).max(1)
+            );
+        }
     }
 
     #[test]
