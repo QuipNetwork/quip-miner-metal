@@ -6,6 +6,8 @@ L1 missed: lease-wide reached 0.186 of the direct rate. The gate was 0.95. The m
 
 Each run lasted 300 s as one process. The direct arm reports jobs/s and CPU ms per job. Lease arms report salts/s and CPU ms per salt. The load values are the 1-, 5-, and 15-minute averages, in that order.
 
+Both arms used the default adaptive configuration as whole-system runs. There was no deliberate warm-up interval. The direct timer starts before stream setup and producer dispatch. The lease timer starts after the coordinator sends the initial leases. Direct logs report per-window rates. Direct-1 began at 3416.6 jobs/s and reported 2269.4 jobs/s at 120 s. Lease logs report cumulative rates. Lease-wide-1 stayed near 550 salts/s from 10 s through 301 s.
+
 | run | rate | CPU ms per salt or job | results | verified winners | leases finished | load at start | load at end | used |
 |---|---:|---:|---:|---:|---:|---|---|---|
 | direct-1 | 2962.29 jobs/s | 1.063 | - | - | - | 16.30 11.07 7.46 | 7.42 9.66 7.97 | yes |

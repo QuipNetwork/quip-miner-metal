@@ -121,6 +121,8 @@ async fn cancel_ends_a_live_lease_with_partial_progress() {
     let done = s.log.done(b"lease-cancel").expect("LeaseDone");
     assert!(done.salts_done >= 100 && done.salts_done < 1_000_000);
     assert_eq!(s.shutdown(2_000).await, 0);
+    assert_eq!(s.log.done_count(b"lease-cancel"), 1);
+    assert_eq!(s.log.refunds(), 1);
     let summary = s
         .log
         .order
@@ -156,12 +158,13 @@ async fn shutdown_during_a_lease_sends_its_summary_and_exits_cleanly() {
     s.wait_for_salts(100, LONG).await;
 
     assert_eq!(s.shutdown(3_000).await, 0);
+    assert_eq!(s.log.done_count(b"lease-shutdown"), 1);
+    assert_eq!(s.log.refunds(), 1, "the lease refunds its credit");
     let done = s
         .log
         .done(b"lease-shutdown")
         .expect("LeaseDone before close");
     assert!(done.salts_done >= 100 && done.salts_done < 1_000_000);
-    assert!(s.log.refunds() >= 1, "the lease refunds its credit");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -281,11 +284,13 @@ async fn invalid_leases_are_rejected_with_refunds() {
         reason(b"wrong-hash"),
         Some(RejectReason::TopologyMismatch as i32)
     );
+    assert_eq!(s.shutdown(2_000).await, 0);
+    assert_eq!(s.log.rejects.len(), 2);
+    assert_eq!(s.log.refunds(), 2);
     assert!(
         s.log.lease_done.is_empty(),
         "a rejected lease sends no summary"
     );
-    assert_eq!(s.shutdown(2_000).await, 0);
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -342,6 +347,12 @@ async fn lease_throughput_aglais() {
     while start.elapsed() < Duration::from_secs(seconds) {
         s.poll(Duration::from_secs(1)).await;
         assert!(!s.log.closed, "miner closed the stream: {:?}", s.log.fatal);
+        assert!(
+            s.log.rejects.is_empty(),
+            "unexpected rejects: {:?}",
+            s.log.rejects
+        );
+        assert!(s.log.fatal.is_none(), "unexpected fatal: {:?}", s.log.fatal);
         while s.log.lease_done.len() > summaries {
             summaries += 1;
             let job = issue(next);
@@ -370,10 +381,17 @@ async fn lease_throughput_aglais() {
         verified += 1;
     }
     eprintln!(
-        "lease summary: salts {salts} in {elapsed:.1} s = {:.2} salts/s; miner CPU ms per salt {:.3}; results {} verified {verified}; leases finished {summaries}",
+        "lease summary: salts {salts} in {elapsed:.1} s = {:.2} salts/s; miner CPU ms per salt {:.3}; results {} verified {verified}; leases finished {summaries}; rejects {}",
         salts as f64 / elapsed,
         cpu * 1000.0 / salts.max(1) as f64,
-        s.log.results.len()
+        s.log.results.len(),
+        s.log.rejects.len()
     );
     assert_eq!(s.shutdown(5_000).await, 0);
+    assert!(
+        s.log.rejects.is_empty(),
+        "unexpected rejects: {:?}",
+        s.log.rejects
+    );
+    assert!(s.log.fatal.is_none(), "unexpected fatal: {:?}", s.log.fatal);
 }

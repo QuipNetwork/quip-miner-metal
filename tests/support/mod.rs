@@ -76,6 +76,10 @@ impl Log {
         self.lease_done.iter().find(|d| d.job_id == job)
     }
 
+    pub(crate) fn done_count(&self, job: &[u8]) -> usize {
+        self.lease_done.iter().filter(|d| d.job_id == job).count()
+    }
+
     pub(crate) fn results_for(&self, job: &[u8]) -> Vec<&quip_solver_core::quip_proto::v1::Result> {
         self.results.iter().filter(|r| r.job_id == job).collect()
     }
@@ -221,6 +225,7 @@ impl Session {
 
     /// Send `Shutdown`, read to the end of the stream, and return the exit code.
     pub(crate) async fn shutdown(&mut self, grace_ms: u32) -> i32 {
+        let started = Instant::now();
         self.send(coord_msg::Msg::Shutdown(Shutdown { grace_ms }))
             .await;
         let limit = Duration::from_millis(u64::from(grace_ms)) + Duration::from_secs(10);
@@ -229,6 +234,13 @@ impl Session {
             .await
             .expect("miner exits after shutdown")
             .expect("wait for miner");
+        // Allow two seconds for transport and scheduler delays beyond grace.
+        let tolerance = Duration::from_millis(2_000);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= Duration::from_millis(u64::from(grace_ms)) + tolerance,
+            "shutdown took {elapsed:?}, exceeding grace {grace_ms} ms plus {tolerance:?}"
+        );
         status.code().unwrap_or(-1)
     }
 
