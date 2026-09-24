@@ -4,25 +4,25 @@ L1 missed: lease-wide reached 0.186 of the direct rate. The gate was 0.95. The m
 
 ## Runs
 
-Each run lasted 300 s as one process. The direct arm reports jobs/s. Lease arms report salts/s. The load values are the 1-, 5-, and 15-minute averages, in that order.
+Each run lasted 300 s as one process. The direct arm reports jobs/s and CPU ms per job. Lease arms report salts/s and CPU ms per salt. The load values are the 1-, 5-, and 15-minute averages, in that order.
 
-| run | rate | CPU ms per salt | results | verified winners | leases finished | load at start | load at end | used |
+| run | rate | CPU ms per salt or job | results | verified winners | leases finished | load at start | load at end | used |
 |---|---:|---:|---:|---:|---:|---|---|---|
-| direct-1 | 2962.29 jobs/s | - | - | - | - | 16.30 11.07 7.46 | 7.42 9.66 7.97 | yes |
+| direct-1 | 2962.29 jobs/s | 1.063 | - | - | - | 16.30 11.07 7.46 | 7.42 9.66 7.97 | yes |
 | lease-42-1 | 521.74 salts/s | 2.750 | 0 | 0 | 16 | 7.42 9.66 7.97 | 6.05 7.75 7.63 | yes |
 | lease-wide-1 | 550.48 salts/s | 2.625 | 0 | 0 | 15 | 6.05 7.75 7.63 | 6.00 6.89 7.30 | yes |
 | lease-42-2 | 554.31 salts/s | 2.589 | 0 | 0 | 16 | 6.00 6.89 7.30 | 5.43 6.30 6.89 | yes |
 | lease-wide-2 | 548.27 salts/s | 2.625 | 0 | 0 | 16 | 5.43 6.30 6.89 | 4.56 5.48 6.35 | yes |
-| direct-2 | 2683.82 jobs/s | - | - | - | - | 4.56 5.48 6.35 | 38.65 15.96 10.16 | yes |
+| direct-2 | 2683.82 jobs/s | 1.076 | - | - | - | 4.56 5.48 6.35 | 38.65 15.96 10.16 | yes |
 | lease-wide-3 | 297.32 salts/s | 4.276 | 0 | 0 | 12 | 38.65 15.96 10.16 | 52.64 37.79 22.10 | no: external load |
-| direct-3 | 1700.26 jobs/s | - | - | - | - | 52.64 37.79 22.10 | 23.29 41.04 29.52 | no: external load |
+| direct-3 | 1700.26 jobs/s | 1.110 | - | - | - | 52.64 37.79 22.10 | 23.29 41.04 29.52 | no: external load |
 | lease-42-3 | 520.48 salts/s | 2.758 | 0 | 0 | 11 | 23.29 41.04 29.52 | 5.77 18.81 22.62 | yes |
 | lease-wide-3r | 573.76 salts/s | 2.537 | 0 | 0 | 16 | 4.07 16.76 21.70 | 5.54 9.49 16.76 | yes |
-| direct-3r | 3309.27 jobs/s | - | - | - | - | 5.54 9.49 16.76 | 7.62 8.78 14.27 | yes |
+| direct-3r | 3309.27 jobs/s | 1.060 | - | - | - | 5.54 9.49 16.76 | 7.62 8.78 14.27 | yes |
 
 The external load spike began near the end of direct-2 and continued through lease-wide-3 and direct-3. The medians exclude lease-wide-3 and direct-3 because of that spike. Direct-2 ended at a 1-minute load of 38.65. Lease-42-3 started at 23.29 while the spike decayed. Both runs remain included because their rates fall within the clean-run ranges. Excluding direct-2 would move the direct median from 2962.29 to 3135.78 and would not change any verdict.
 
-Lease runs returned 0 results and 0 of 0 verified winners. Every direct `errors:` line reads `errors: 0`. Lease runs logged no errors.
+The timed lease runs returned 0 results and 0 of 0 verified winners. Every direct `errors:` line reads `errors: 0`. Lease runs logged no errors.
 
 ## Medians and gates
 
@@ -36,11 +36,11 @@ L1 is 550.48 / 2962.29 = 0.186, below the required 0.95.
 
 L2 is 550.48 / 521.74 = 1.055. The projection threshold was greater than 1.1, so L2 is informational. The ratio is between 1.05 and 1.1. The wider window adds about 5.5 percent, so width is not the main limit.
 
-L3 holds: no run logged errors. This pass is vacuous: no lease result occurred at this target in 300 s, so no winner needed verification. All 7 Task 3 device tests pass and cover winner verification with `verify_lease_result`.
+L3 holds: no run logged errors. The nine timed runs found no winner at this target. The 120 s profile run found 1 winner, and it verified. All 7 Task 3 device tests pass and cover winner verification with `verify_lease_result`.
 
 ## Profile
 
-The plan called for the `sample <pid> 30` command on the miner during a 120 s lease-wide run. The first try sampled the Apple Neural Engine (ANE) worker child, `quip-metal-msa --ane-worker`, instead of the session process. The saved `profile-lease-wide.ane-child.sample.txt.gz` was not used. The second try sampled both processes. The session process, pid 50892, used 144.2 percent CPU. The ANE worker, pid 51063, used 44.7 percent CPU. The profile run rate was 555.48 salts/s.
+The plan called for the `sample <pid> 30` command on the miner during a 120 s lease-wide run. The first try sampled the Apple Neural Engine (ANE) worker child, `quip-metal-msa --ane-worker`, instead of the session process. The saved `profile-lease-wide.ane-child.sample.txt.gz` was not used. The second try sampled both processes. The session process, pid 50892, used 144.2 percent CPU. The ANE worker, pid 51063, used 44.7 percent CPU. The sampled run reached 547.18 salts/s at 2.567 CPU ms per salt and found 1 winner, which verified.
 
 In pid 50892, thread `quip-sampler` runs `combined::CombinedSampler::sample_stream` through `combined::Router::run`. Of its 22232 thread samples, 22002 fell inside `combined::eligibility` at `src/combined.rs:256`. This function inserts every job edge into a `HashSet<(usize, usize)>`. Each job has about 41k edges on Advantage2. The function also recomputes node degrees for every job when the miner runs the ANE engine and every coefficient is a unit value. One thread performs this work, which serializes every job handled by the router.
 
