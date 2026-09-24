@@ -14,7 +14,7 @@ use quip_solver_core::quip_proto::v1::{
     IsingProblem, JobKind, Ping, RejectReason, Shutdown, Topology, Welcome,
 };
 use quip_solver_core::quip_protocol::scoring::energy_milli;
-use quip_solver_core::quip_protocol::wire::encode_i32_le;
+use quip_solver_core::quip_protocol::wire::{encode_i32_le, encode_spins_packed};
 
 fn miner() -> &'static str {
     env!("CARGO_BIN_EXE_quip-ane-msa")
@@ -22,7 +22,13 @@ fn miner() -> &'static str {
 
 const SOLVE_INPUT: &str = r#"{"h":[0.0,0.0],"j":[1.0],"edges":[[0,1]],"num_reads":33,"num_sweeps":5,"sweeps_per_beta":2,"beta_range":[0.25,4.0],"seed":123}"#;
 
-const SOLVABLE_JOBS: [&[u8]; 4] = [b"job-1", b"job-2", b"job-hash", b"job-sparse"];
+const SOLVABLE_JOBS: [&[u8]; 5] = [
+    b"job-1",
+    b"job-2",
+    b"job-hash",
+    b"job-sparse",
+    b"job-seeded",
+];
 
 fn run_args(args: &[&str]) -> std::process::Output {
     Command::new(miner())
@@ -367,6 +373,19 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
             false,
         )
         .await;
+
+    let mut seeded = inline.clone();
+    seeded.initial_spins = vec![encode_spins_packed(&[-1, 1])];
+    session
+        .job(
+            b"job-seeded",
+            2,
+            seeded,
+            &[(0, 1)],
+            JobKind::IsingSample,
+            false,
+        )
+        .await;
     session.refunded("inline and cached jobs").await;
 
     session
@@ -530,9 +549,9 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
         "stream did not end cleanly"
     );
     assert_eq!(report.exit_code, 0, "clean shutdown expected");
-    assert_eq!(report.jobs_dispatched, 12);
+    assert_eq!(report.jobs_dispatched, 13);
     assert_eq!(report.rejects.len(), 6, "no duplicate or unexpected Reject");
-    assert_eq!(report.job_request_credits.len(), 13);
+    assert_eq!(report.job_request_credits.len(), 14);
     assert!(report
         .job_request_credits
         .iter()
@@ -551,5 +570,21 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
             .count()
             <= 1
     );
-    assert!(report.is_conformant(), "{report:#?}");
+    // rc3's is_conformant() also grades a salt lease whenever Hello
+    // advertises ISING_GENERATE. This hand-built coordinator sends no lease,
+    // so assert every other component of is_conformant() by name.
+    assert!(report.lease.is_none(), "this coordinator sends no lease");
+    assert!(report.ready_received, "no Ready");
+    assert!(report.results_conformant(), "{report:#?}");
+    assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
+    assert!(report.has_reject(b"job-bad-j", RejectReason::Malformed));
+    assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
+    assert!(report.has_reject(b"job-old", RejectReason::Expired));
+    assert!(report.warm_start_conformant(), "{report:#?}");
+    assert!(report.cancel_acked, "Cancel not acknowledged");
+    assert!(report.ping_acked, "Ping not acknowledged");
+    assert!(report.capabilities_conformant(), "{report:#?}");
+    assert!(report.live_cancel_conformant(), "{report:#?}");
+    assert!(report.credit_ledger_balanced(), "{report:#?}");
+    assert!(report.timed_out_phases.is_empty(), "{report:#?}");
 }
