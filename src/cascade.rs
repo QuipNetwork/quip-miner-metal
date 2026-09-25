@@ -75,7 +75,10 @@ pub(crate) struct CascadeSettings {
     pub(crate) stages: [usize; MAX_STAGES],
     /// Fixed best-energy gate per checkpoint. A gated stage keeps a job when
     /// its best is at or below the gate and bypasses the adaptive cutoff.
+    /// Only [`CascadeSettings::effective`] sets gates, for [`CHAIN_GATES`].
     pub(crate) gates: [Option<i64>; MAX_STAGES],
+    /// Keep every job at every checkpoint. For gate measurement only.
+    pub(crate) open_gates: bool,
     /// Overall probe-to-full denominator, factored across configured probes.
     pub(crate) keep: f64,
     pub(crate) keep_min: f64,
@@ -93,6 +96,7 @@ impl Default for CascadeSettings {
         Self {
             stages,
             gates: [None; MAX_STAGES],
+            open_gates: false,
             keep: 2_000.0,
             keep_min: 1_000.0,
             keep_max: 30_000.0,
@@ -104,10 +108,71 @@ impl Default for CascadeSettings {
     }
 }
 
+/// Zero-false-negative gates for the chain topology `cbec1eb4` (4,577 nodes,
+/// 41,514 edges, h = 0, J = ±1). Each gate is the shallowest checkpoint best
+/// over 30 seeds of the chain's 50 deepest winners on the resident schedule at
+/// 64 reads, one sweep per beta, and reheat 0.25 (`tests/gate_trace.rs`).
+/// Population keep, cumulative: 1 in 7, 1 in 28, then none of 30,000.
+pub(crate) struct ChainGates {
+    pub(crate) fingerprint: u64,
+    pub(crate) stages: [usize; MAX_STAGES],
+    pub(crate) gates: [i64; MAX_STAGES],
+    pub(crate) min_reads: usize,
+}
+
+pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
+    fingerprint: 0x38cd_e7d7_931d_f32f,
+    stages: [8, 16, 64, 256],
+    gates: [-13_244_000, -13_788_000, -14_272_000, -14_458_000],
+    min_reads: 64,
+};
+
+/// FNV-1a over the node count and the sorted, normalized edge list, so edge
+/// order and orientation do not change the result.
+pub(crate) fn topology_fingerprint(nodes: usize, edges: &[(usize, usize)]) -> u64 {
+    let mut sorted: Vec<(usize, usize)> =
+        edges.iter().map(|&(u, v)| (u.min(v), u.max(v))).collect();
+    sorted.sort_unstable();
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let words = std::iter::once(nodes).chain(sorted.into_iter().flat_map(|(u, v)| [u, v]));
+    for word in words {
+        for byte in (word as u64).to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+impl CascadeSettings {
+    /// True when a job on a chain-topology graph runs under the conditions
+    /// the chain gates were measured at.
+    pub(crate) fn chain_gated(&self, chain_topology: bool, params: &SampleParams) -> bool {
+        chain_topology
+            && self.reheat_beta.to_bits() == CALIBRATION.reheat_beta.to_bits()
+            && params.num_reads >= CHAIN_GATES.min_reads
+            && params.sweeps_per_beta == 1
+            && params.beta_range.is_none()
+    }
+
+    /// The configured settings, or the chain-gated plan when `gated`.
+    pub(crate) fn effective(self, gated: bool) -> Self {
+        if gated {
+            Self {
+                stages: CHAIN_GATES.stages,
+                gates: CHAIN_GATES.gates.map(Some),
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(serde::Deserialize, Default, Clone)]
 pub(crate) struct CascadeToml {
     pub(crate) cascade_stages: Option<Vec<usize>>,
-    pub(crate) cascade_gates_milli: Option<Vec<i64>>,
+    pub(crate) cascade_open_gates: Option<bool>,
     pub(crate) cascade_keep: Option<u32>,
     pub(crate) cascade_keep_min: Option<u32>,
     pub(crate) cascade_keep_max: Option<u32>,
@@ -135,18 +200,8 @@ impl CascadeSettings {
                 );
             }
         }
-        if let Some(gates) = &cfg.cascade_gates_milli {
-            if gates.len() <= MAX_STAGES {
-                self.gates = [None; MAX_STAGES];
-                for (slot, &gate) in self.gates.iter_mut().zip(gates) {
-                    *slot = Some(gate);
-                }
-            } else {
-                tracing::warn!(
-                    ?gates,
-                    "invalid cascade_gates_milli; retaining previous gates"
-                );
-            }
+        if let Some(open) = cfg.cascade_open_gates {
+            self.open_gates = open;
         }
         let keep = cfg.cascade_keep.map_or(self.keep, f64::from);
         let min = cfg.cascade_keep_min.map_or(self.keep_min, f64::from);
@@ -384,7 +439,7 @@ impl Controller {
         self.settings = settings;
         let mut plan = self.plan.lock().unwrap_or_else(|p| p.into_inner());
         plan.settings.audit = settings.audit;
-        plan.settings.gates = settings.gates;
+        plan.settings.open_gates = settings.open_gates;
     }
 
     pub(crate) fn matches_topology(&self, graph: &IsingGraph) -> bool {
@@ -396,7 +451,10 @@ impl Controller {
     /// Reset gate state on a gated topology change. Return the job's schedule plan.
     #[cfg(test)]
     pub(crate) fn admit(&mut self, job: &StreamJob) -> (Ticket, Vec<f32>, Vec<usize>) {
-        let mut schedule = PreparedSchedule::new(job, self.settings);
+        let chain = topology_fingerprint(job.graph.num_nodes(), &job.graph.edges)
+            == CHAIN_GATES.fingerprint;
+        let gated = self.settings.chain_gated(chain, &job.params);
+        let mut schedule = PreparedSchedule::new(job, self.settings, gated);
         let ticket = self.admit_prepared(job, &mut schedule).unwrap();
         (ticket, schedule.betas, schedule.checkpoints)
     }
@@ -411,15 +469,24 @@ impl Controller {
         if schedule.settings.stages != self.settings.stages
             || schedule.settings.reheat_beta.to_bits() != self.settings.reheat_beta.to_bits()
         {
-            let rebuilt = PreparedSchedule::new(job, self.settings);
+            let rebuilt = PreparedSchedule::new(job, self.settings, schedule.gated);
             crate::slots::validate_schedule(&rebuilt.betas, &rebuilt.checkpoints)?;
             *schedule = rebuilt;
         }
         if schedule.checkpoints.len() > 1 {
+            let wanted = self.settings.effective(schedule.gated);
             if !self.matches_topology(&job.graph) {
-                self.plan = Arc::new(Mutex::new(StagePlan::new(self.settings)));
+                self.plan = Arc::new(Mutex::new(StagePlan::new(wanted)));
                 self.topology = Some((job.graph.num_nodes(), job.graph.edges.clone()));
                 self.topology_epoch = self.topology_epoch.wrapping_add(1);
+            } else {
+                let plan = self.plan.lock().unwrap_or_else(|p| p.into_inner());
+                let stale =
+                    plan.settings.stages != wanted.stages || plan.settings.gates != wanted.gates;
+                drop(plan);
+                if stale {
+                    self.plan = Arc::new(Mutex::new(StagePlan::new(wanted)));
+                }
             }
             self.plan
                 .lock()
@@ -449,6 +516,10 @@ impl Controller {
         let mut plan = ticket.plan.lock().unwrap_or_else(|p| p.into_inner());
         Self::observe_transition(&mut plan, ticket, best);
         let stage = ticket.stage;
+        if plan.settings.open_gates {
+            ticket.stage += 1;
+            return true;
+        }
         if let Some(gate) = plan.settings.gates[stage] {
             let keep = best <= gate;
             ticket.audited = false;
@@ -551,20 +622,23 @@ impl Controller {
 
 pub(crate) struct PreparedSchedule {
     settings: CascadeSettings,
+    gated: bool,
     pub(crate) betas: Vec<f32>,
     pub(crate) checkpoints: Vec<usize>,
 }
 
 impl PreparedSchedule {
-    pub(crate) fn new(job: &StreamJob, settings: CascadeSettings) -> Self {
+    /// `settings` are the configured settings. `gated` selects the chain plan.
+    pub(crate) fn new(job: &StreamJob, settings: CascadeSettings, gated: bool) -> Self {
         let (betas, checkpoints) = segment_schedule(
             &job.graph,
             &job.params,
-            &settings.stages,
+            &settings.effective(gated).stages,
             settings.reheat_beta,
         );
         Self {
             settings,
+            gated,
             betas,
             checkpoints,
         }
@@ -728,7 +802,7 @@ mod tests {
             params,
             watermark: None,
         };
-        let mut schedule = PreparedSchedule::new(&job, old);
+        let mut schedule = PreparedSchedule::new(&job, old, false);
         crate::slots::validate_schedule(&schedule.betas, &schedule.checkpoints).unwrap();
         let mut controller = Controller::new(old);
         controller.refresh(CascadeSettings {
@@ -809,7 +883,7 @@ mod tests {
                 ..old
             },
         ] {
-            let mut prepared = PreparedSchedule::new(&job, old);
+            let mut prepared = PreparedSchedule::new(&job, old, false);
             let mut controller = Controller::new(old);
             controller.refresh(new);
             let ticket = controller.admit_prepared(&job, &mut prepared).unwrap();
@@ -1058,22 +1132,84 @@ mod tests {
         }
     }
 
+    fn fixture_edges() -> Vec<(usize, usize)> {
+        include_str!("../tests/fixtures/advantage2-system1.edges")
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let mut nodes = line.split_whitespace();
+                (
+                    nodes.next().unwrap().parse().unwrap(),
+                    nodes.next().unwrap().parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn merge_sets_gates_rejects_too_many_and_refresh_applies_them() {
+    fn chain_fingerprint_is_the_fixture_without_its_removed_edge() {
+        let mut edges = fixture_edges();
+        assert_ne!(topology_fingerprint(4577, &edges), CHAIN_GATES.fingerprint);
+        edges.retain(|&(u, v)| (u.min(v), u.max(v)) != (880, 2695));
+        assert_eq!(edges.len(), 41_514);
+        assert_eq!(topology_fingerprint(4577, &edges), CHAIN_GATES.fingerprint);
+        // Order and orientation do not matter; the node count does.
+        edges.reverse();
+        edges[0] = (edges[0].1, edges[0].0);
+        assert_eq!(topology_fingerprint(4577, &edges), CHAIN_GATES.fingerprint);
+        assert_ne!(topology_fingerprint(4578, &edges), CHAIN_GATES.fingerprint);
+    }
+
+    #[test]
+    fn chain_gates_need_the_measured_conditions() {
+        let settings = CascadeSettings::default();
+        let measured = SampleParams {
+            num_reads: CHAIN_GATES.min_reads,
+            ..params(14_336, 1)
+        };
+        assert!(settings.chain_gated(true, &measured));
+        assert!(!settings.chain_gated(false, &measured));
+        let fewer = SampleParams {
+            num_reads: 32,
+            ..measured
+        };
+        let slower = SampleParams {
+            sweeps_per_beta: 2,
+            ..measured
+        };
+        let ranged = SampleParams {
+            beta_range: Some((0.1, 4.0)),
+            ..measured
+        };
+        for other in [fewer, slower, ranged] {
+            assert!(!settings.chain_gated(true, &other));
+        }
+        let reheated = CascadeSettings {
+            reheat_beta: 0.3,
+            ..settings
+        };
+        assert!(!reheated.chain_gated(true, &measured));
+        let gated = settings.effective(true);
+        assert_eq!(gated.stages, CHAIN_GATES.stages);
+        assert_eq!(gated.gates, CHAIN_GATES.gates.map(Some));
+        assert_eq!(settings.effective(false), settings);
+    }
+
+    #[test]
+    fn open_gates_keep_every_job_to_the_full_budget() {
         let mut settings = CascadeSettings::default();
         settings.merge(&CascadeToml {
-            cascade_gates_milli: Some(vec![-5, -6]),
+            cascade_open_gates: Some(true),
             ..CascadeToml::default()
         });
-        assert_eq!(settings.gates, [Some(-5), Some(-6), None, None]);
-        settings.merge(&CascadeToml {
-            cascade_gates_milli: Some(vec![0; MAX_STAGES + 1]),
-            ..CascadeToml::default()
+        let mut c = Controller::new(CascadeSettings {
+            gates: [Some(-10), None, None, None],
+            ..settings
         });
-        assert_eq!(settings.gates, [Some(-5), Some(-6), None, None]);
-        let mut c = Controller::new(CascadeSettings::default());
-        c.refresh(settings);
-        assert_eq!(c.plan.lock().unwrap().settings.gates, settings.gates);
+        let (mut ticket, _, _) = c.admit(&job(0, 1000));
+        assert!(c.checkpoint(&mut ticket, 0));
+        assert!(c.checkpoint(&mut ticket, 0));
+        assert_eq!(ticket.stage, ticket.gates);
     }
 
     #[test]
@@ -1141,6 +1277,7 @@ mod tests {
             CascadeSettings {
                 stages: [16, 64, 0, 0],
                 gates: [None; MAX_STAGES],
+                open_gates: false,
                 keep: 20.0,
                 keep_min: 2.0,
                 keep_max: 100.0,

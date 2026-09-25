@@ -3,7 +3,10 @@
 
 //! Two alternating pools keep cascade jobs resident between checkpoints.
 
-use crate::cascade::{CascadeSettings, Controller, PreparedSchedule, Ticket, MAX_STAGES};
+use crate::cascade::{
+    topology_fingerprint, CascadeSettings, Controller, PreparedSchedule, Ticket, CHAIN_GATES,
+    MAX_STAGES,
+};
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, Kernel, SampleError};
 use crate::slots::{validate_schedule, PreparedInputs, SlotPool};
@@ -152,6 +155,8 @@ pub(crate) struct PreparedData {
 #[derive(Default)]
 struct Preparer {
     topology: Option<(SelfFeedingTopology, Vec<(usize, usize)>)>,
+    /// Whether the cached topology is the chain topology.
+    chain: bool,
 }
 
 impl Preparer {
@@ -185,11 +190,21 @@ impl Preparer {
                 let topology = SelfFeedingTopology::build(&job.graph);
                 let inputs = PreparedInputs::new(&job.graph, &topology, &job.graph.edges)
                     .ok_or_else(|| SampleError::Driver("preparation topology mismatch".into()))?;
+                self.chain = topology_fingerprint(job.graph.num_nodes(), &job.graph.edges)
+                    == CHAIN_GATES.fingerprint;
+                tracing::info!(
+                    chain = self.chain,
+                    gated = settings.chain_gated(self.chain, &job.params),
+                    nodes = job.graph.num_nodes(),
+                    edges = job.graph.edges.len(),
+                    "cascade topology prepared"
+                );
                 self.topology = Some((topology, job.graph.edges.clone()));
                 inputs
             }
         };
-        let schedule = PreparedSchedule::new(job, settings);
+        let schedule =
+            PreparedSchedule::new(job, settings, settings.chain_gated(self.chain, &job.params));
         validate_schedule(&schedule.betas, &schedule.checkpoints)?;
         Ok(Some(PreparedData { schedule, inputs }))
     }

@@ -4,15 +4,18 @@
 //! Per-checkpoint best energies on the resident cascade schedule.
 //!
 //! Ignored: needs a Metal device and a problem directory written by
-//! `scripts/testnet/regen` or `scripts/testnet/make_fresh.py`. Every gate is
-//! open, so each job reports its best at every checkpoint and at the end.
+//! `scripts/testnet/regen` or `scripts/testnet/make_fresh.py`. By default every
+//! gate is open, so each job reports its best at every checkpoint and at the
+//! end. `QUIP_TRACE_OPEN=0` runs the gates, and a screened job's later cells
+//! stay empty. On the chain topology the miner uses its compiled chain stages.
 //!
 //! ```text
 //! QUIP_TRACE_PROBLEMS=dir QUIP_TRACE_OUT=trace.csv \
 //!   cargo test --release --test gate_trace -- --ignored --nocapture
 //! ```
 //!
-//! Knobs: `QUIP_TRACE_STAGES` (default `8,16,64,256`), `QUIP_TRACE_SWEEPS`
+//! Knobs: `QUIP_TRACE_STAGES` (default `8,16,64,256`, the stages for other
+//! topologies and the column labels), `QUIP_TRACE_SWEEPS`
 //! (final budget, default 512), `QUIP_TRACE_SEEDS` per problem (default 30),
 //! `QUIP_TRACE_READS` (default 64).
 
@@ -126,8 +129,8 @@ fn checkpoint_trace() {
         }
     }
     let count = jobs.len();
-    let gates = vec!["0"; stages.split(',').count()].join(", ");
-    let config = format!("cascade_stages = [{stages}]\ncascade_gates_milli = [{gates}]");
+    let open = env("QUIP_TRACE_OPEN", 1u8) != 0;
+    let config = format!("cascade_stages = [{stages}]\ncascade_open_gates = {open}");
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let (out, mut results) = tokio::sync::mpsc::channel(count.max(1));
