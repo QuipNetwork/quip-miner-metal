@@ -80,6 +80,13 @@ impl Pool {
                 continue;
             };
             debug_assert_eq!(checkpoint.index, live.ticket.stage);
+            tracing::debug!(
+                target: "quip_miner_metal::cascade_trace",
+                job = %String::from_utf8_lossy(&live.job.job_id),
+                stage = checkpoint.index,
+                best = checkpoint.best,
+                "checkpoint"
+            );
             if checkpoint.last || !controller.checkpoint(&mut live.ticket, checkpoint.best) {
                 done.push(checkpoint.slot);
             }
@@ -1326,7 +1333,7 @@ mod tests {
         }
         let device = MetalDevice::open(0).unwrap();
         let settings = CascadeSettings {
-            stages: [8, 0, 0],
+            stages: [8, 0, 0, 0],
             keep: 1.0,
             keep_min: 1.0,
             keep_max: 1.0,

@@ -1451,7 +1451,7 @@ mod tests {
             SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
         ];
         let settings = CascadeSettings {
-            stages: [SWEEPS, 0, 0],
+            stages: [SWEEPS, 0, 0, 0],
             ..Default::default()
         };
         let mut controller = Controller::new(settings);
