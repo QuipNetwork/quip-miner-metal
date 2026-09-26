@@ -696,6 +696,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cascade::stage_array;
     use crate::slots::SlotJob;
     use crate::{IsingGraph, MetalSampler, SampleParams};
     use quip_solver_core::Sampler;
@@ -1402,7 +1403,7 @@ mod tests {
         }
         let device = MetalDevice::open(0).unwrap();
         let settings = CascadeSettings {
-            stages: [8, 0, 0, 0],
+            stages: stage_array(&[8]),
             keep: 1.0,
             keep_min: 1.0,
             keep_max: 1.0,

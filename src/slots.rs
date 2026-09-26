@@ -697,6 +697,7 @@ pub(crate) fn slot_seed(seed: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cascade::stage_array;
 
     #[test]
     #[expect(
@@ -1498,7 +1499,7 @@ mod tests {
             SlotPool::new(&device, &templates[0], READS, capacity, SWEEPS).unwrap(),
         ];
         let settings = CascadeSettings {
-            stages: [SWEEPS, 0, 0, 0],
+            stages: stage_array(&[SWEEPS]),
             ..Default::default()
         };
         let mut controller = Controller::new(settings);

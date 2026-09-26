@@ -7,7 +7,8 @@
 //! `scripts/testnet/regen` or `scripts/testnet/make_fresh.py`. By default every
 //! gate is open, so each job reports its best at every checkpoint and at the
 //! end. `QUIP_TRACE_OPEN=0` runs the gates, and a screened job's later cells
-//! stay empty. On the chain topology the miner uses its compiled chain stages.
+//! stay empty. Open gates use `QUIP_TRACE_STAGES` on every topology. With the gates
+//! closed, the chain topology uses its compiled stages.
 //!
 //! ```text
 //! QUIP_TRACE_PROBLEMS=dir QUIP_TRACE_OUT=trace.csv \

@@ -15,7 +15,14 @@ use quip_solver_core::StreamJob;
 use crate::cutoff::{Cutoff, CutoffConfig};
 use crate::model_checks::{Action, AuditLane, Drift, Yield};
 
-pub(crate) const MAX_STAGES: usize = 4;
+pub(crate) const MAX_STAGES: usize = 16;
+
+/// Stage budgets padded with zeros to `MAX_STAGES`.
+pub(crate) fn stage_array(stages: &[usize]) -> [usize; MAX_STAGES] {
+    let mut out = [0; MAX_STAGES];
+    out[..stages.len()].copy_from_slice(stages);
+    out
+}
 
 /// Arm D constants from docs/perf/2026-09-23-seeded-segments.md.
 /// Times describe a 64-read job: a + b * sweeps (unchanged from G4).
@@ -91,10 +98,8 @@ pub(crate) struct CascadeSettings {
 
 impl Default for CascadeSettings {
     fn default() -> Self {
-        let mut stages = [0; MAX_STAGES];
-        stages[..CALIBRATION.stages.len()].copy_from_slice(CALIBRATION.stages);
         Self {
-            stages,
+            stages: stage_array(CALIBRATION.stages),
             gates: [None; MAX_STAGES],
             open_gates: false,
             keep: 2_000.0,
@@ -115,8 +120,8 @@ impl Default for CascadeSettings {
 /// plus 10. Winners shallower than about -14,700 can fall outside the gates.
 pub(crate) struct ChainGates {
     pub(crate) fingerprint: u64,
-    pub(crate) stages: [usize; MAX_STAGES],
-    pub(crate) gates: [i64; MAX_STAGES],
+    pub(crate) stages: &'static [usize],
+    pub(crate) gates: &'static [i64],
     pub(crate) min_reads: usize,
     /// Final budget for a gated job, whatever the job asked for. Few models
     /// survive the last gate, so a deep final stage costs little.
@@ -125,8 +130,8 @@ pub(crate) struct ChainGates {
 
 pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
     fingerprint: 0x38cd_e7d7_931d_f32f,
-    stages: [8, 16, 64, 256],
-    gates: [-13_252_000, -13_836_000, -14_276_000, -14_466_000],
+    stages: &[8, 16, 64, 256],
+    gates: &[-13_252_000, -13_836_000, -14_276_000, -14_466_000],
     min_reads: 64,
     full_sweeps: 1_048_576,
 };
@@ -159,12 +164,17 @@ impl CascadeSettings {
             && params.beta_range.is_none()
     }
 
-    /// The configured settings, or the chain-gated plan when `gated`.
+    /// The configured settings, or the chain-gated plan when `gated`. Open
+    /// gates keep the configured stages, so a study can place checkpoints.
     pub(crate) fn effective(self, gated: bool) -> Self {
-        if gated {
+        if gated && !self.open_gates {
+            let mut gates = [None; MAX_STAGES];
+            for (gate, &value) in gates.iter_mut().zip(CHAIN_GATES.gates) {
+                *gate = Some(value);
+            }
             Self {
-                stages: CHAIN_GATES.stages,
-                gates: CHAIN_GATES.gates.map(Some),
+                stages: stage_array(CHAIN_GATES.stages),
+                gates,
                 ..self
             }
         } else {
@@ -195,8 +205,7 @@ impl CascadeSettings {
                 && stages[0] >= 1
                 && stages.windows(2).all(|pair| pair[0] < pair[1])
             {
-                self.stages = [0; MAX_STAGES];
-                self.stages[..stages.len()].copy_from_slice(stages);
+                self.stages = stage_array(stages);
             } else {
                 tracing::warn!(
                     ?stages,
@@ -903,6 +912,12 @@ pub(crate) fn segment_schedule(
 mod tests {
     use super::*;
 
+    fn gate_array(gates: &[Option<i64>]) -> [Option<i64>; MAX_STAGES] {
+        let mut out = [None; MAX_STAGES];
+        out[..gates.len()].copy_from_slice(gates);
+        out
+    }
+
     #[test]
     fn resident_beta_range_matches_library_bits_on_draws() {
         let edges: Vec<(usize, usize)> = include_str!("../tests/fixtures/advantage2-system1.edges")
@@ -963,7 +978,7 @@ mod tests {
     #[test]
     fn settings_change_rejects_invalid_rebuilt_schedule() {
         let old = CascadeSettings {
-            stages: [2, 0, 0, 0],
+            stages: stage_array(&[2]),
             reheat_beta: -1.5,
             ..Default::default()
         };
@@ -979,7 +994,7 @@ mod tests {
         crate::slots::validate_schedule(&schedule.betas, &schedule.checkpoints).unwrap();
         let mut controller = Controller::new(old);
         controller.refresh(CascadeSettings {
-            stages: [1, 0, 0, 0],
+            stages: stage_array(&[1]),
             ..old
         });
         assert!(matches!(
@@ -1043,12 +1058,12 @@ mod tests {
             watermark: None,
         };
         let old = CascadeSettings {
-            stages: [32, 256, 0, 0],
+            stages: stage_array(&[32, 256]),
             ..Default::default()
         };
         for new in [
             CascadeSettings {
-                stages: [16, 128, 512, 0],
+                stages: stage_array(&[16, 128, 512]),
                 ..old
             },
             CascadeSettings {
@@ -1250,7 +1265,7 @@ mod tests {
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 1);
         assert_eq!(c.plan.lock().unwrap().settings.audit, 50);
         c.refresh(CascadeSettings {
-            stages: [16, 128, 0, 0],
+            stages: stage_array(&[16, 128]),
             ..CascadeSettings::default()
         });
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
@@ -1275,7 +1290,12 @@ mod tests {
             ..CascadeToml::default()
         });
         assert_eq!(settings, previous);
-        for stages in [vec![], vec![0], vec![32, 32], vec![1, 2, 3, 4, 5]] {
+        for stages in [
+            vec![],
+            vec![0],
+            vec![32, 32],
+            (1..=MAX_STAGES + 1).collect(),
+        ] {
             settings.merge(&CascadeToml {
                 cascade_stages: Some(stages),
                 ..CascadeToml::default()
@@ -1287,8 +1307,8 @@ mod tests {
     #[test]
     fn fixed_gates_keep_at_or_below_the_gate_and_skip_audits() {
         let mut c = Controller::new(CascadeSettings {
-            stages: [8, 16, 0, 0],
-            gates: [Some(-10), Some(-20), None, None],
+            stages: stage_array(&[8, 16]),
+            gates: gate_array(&[Some(-10), Some(-20)]),
             audit: 2,
             ..CascadeSettings::default()
         });
@@ -1363,8 +1383,15 @@ mod tests {
         };
         assert!(!reheated.chain_gated(true, &measured));
         let gated = settings.effective(true);
-        assert_eq!(gated.stages, CHAIN_GATES.stages);
-        assert_eq!(gated.gates, CHAIN_GATES.gates.map(Some));
+        assert_eq!(gated.stages, stage_array(CHAIN_GATES.stages));
+        let expected: Vec<_> = CHAIN_GATES.gates.iter().copied().map(Some).collect();
+        assert_eq!(gated.gates, gate_array(&expected));
+        let study = CascadeSettings {
+            open_gates: true,
+            stages: stage_array(&[8, 512, 4096]),
+            ..settings
+        };
+        assert_eq!(study.effective(true), study);
         assert_eq!(settings.effective(false), settings);
     }
 
@@ -1442,7 +1469,7 @@ mod tests {
             ..CascadeToml::default()
         });
         let mut c = Controller::new(CascadeSettings {
-            gates: [Some(-10), None, None, None],
+            gates: gate_array(&[Some(-10)]),
             ..settings
         });
         let (mut ticket, _, _) = c.admit(&job(0, 1000));
@@ -1514,7 +1541,7 @@ mod tests {
         assert_eq!(
             settings,
             CascadeSettings {
-                stages: [16, 64, 0, 0],
+                stages: stage_array(&[16, 64]),
                 gates: [None; MAX_STAGES],
                 open_gates: false,
                 keep: 20.0,
@@ -1551,7 +1578,7 @@ mod tests {
         }
         let old = Arc::downgrade(&c.plan);
         c.refresh(CascadeSettings {
-            stages: [64, 0, 0, 0],
+            stages: stage_array(&[64]),
             ..CascadeSettings::default()
         });
         assert!(!Arc::ptr_eq(&t.plan, &c.plan));
@@ -1604,9 +1631,9 @@ mod tests {
     fn live_settings_change_stages_on_one_stream() {
         let mut c = Controller::new(CascadeSettings::default());
         for (stages, expected) in [
-            ([32, 256, 0, 0], vec![32, 256, 1000]),
-            ([64, 0, 0, 0], vec![64, 1000]),
-            ([16, 64, 0, 0], vec![16, 64, 1000]),
+            (stage_array(&[32, 256]), vec![32, 256, 1000]),
+            (stage_array(&[64]), vec![64, 1000]),
+            (stage_array(&[16, 64]), vec![16, 64, 1000]),
         ] {
             c.refresh(CascadeSettings {
                 stages,
@@ -1622,7 +1649,7 @@ mod tests {
     fn custom_stages_use_transition_calibration_and_skip_32_sweep_drift() {
         let ((probe, full), rate) = CALIBRATION.false_negative[1];
         let mut c = Controller::new(CascadeSettings {
-            stages: [probe, 0, 0, 0],
+            stages: stage_array(&[probe]),
             ..CascadeSettings::default()
         });
         let (mut t, _, _) = c.admit(&job(0, full));
@@ -1738,7 +1765,7 @@ mod tests {
     #[test]
     fn injected_false_negative_burst_loosens_the_stage() {
         let mut c = Controller::new(CascadeSettings {
-            stages: [32, 0, 0, 0],
+            stages: stage_array(&[32]),
             keep: 100.0,
             keep_min: 2.0,
             keep_max: 1000.0,
@@ -1783,7 +1810,7 @@ mod tests {
     #[test]
     fn configured_stage_roots_and_effective_budgets_preserve_the_original_job() {
         let settings = CascadeSettings {
-            stages: [32, 128, 256, 0],
+            stages: stage_array(&[32, 128, 256]),
             reheat_beta: 1.0,
             ..CascadeSettings::default()
         };
@@ -1840,7 +1867,7 @@ mod tests {
     #[test]
     fn final_audit_and_cancel_accounting() {
         let mut c = Controller::new(CascadeSettings {
-            stages: [32, 0, 0, 0],
+            stages: stage_array(&[32]),
             ..CascadeSettings::default()
         });
         let (mut t, _, _) = c.admit(&job(0, 256));
