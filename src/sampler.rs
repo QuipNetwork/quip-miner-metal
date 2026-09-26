@@ -191,14 +191,12 @@ pub(crate) const MSA_MAX_DEG: usize = 20;
 /// `f64`s, so `u32::MAX` sweeps is a ~34 GB allocation — and then drives that
 /// many kernel sweeps, i.e. both an OOM and a GPU-watchdog denial of service.
 ///
-/// 65536 is 32x the `max_sweeps: 2048` in `METAL_ADAPT` (`lib.rs`).
-/// `quip-solver-core` doubles the resolved sweeps for Gibbs
-/// (`GIBBS_SWEEP_MULTIPLIER`), so the largest legitimate adapt-driven job
-/// reaching here is 4096 — 16x of headroom — while bounding the schedule to
-/// 64Ki `f64` + 64Ki `f32` (~768 KiB). Raise this only together with
-/// `METAL_ADAPT.max_sweeps`; it must stay >= `2 * METAL_ADAPT.max_sweeps`,
-/// which a `const _: () = assert!(..)` in `lib.rs` enforces at compile time.
-pub(crate) const MAX_SWEEPS: usize = 65_536;
+/// 262,144 admits the deep final stage of the chain-gated cascade, where the
+/// catch rate on recent winners still rises past 65,536 sweeps. It bounds the
+/// schedule to 256Ki `f64` + 256Ki `f32` (~3 MiB). It must stay
+/// >= `2 * METAL_ADAPT.max_sweeps`, which a `const _: () = assert!(..)` in
+/// `lib.rs` enforces at compile time.
+pub(crate) const MAX_SWEEPS: usize = 262_144;
 
 /// Target GPU time for one command buffer, in milliseconds.
 ///

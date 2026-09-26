@@ -118,6 +118,9 @@ pub(crate) struct ChainGates {
     pub(crate) stages: [usize; MAX_STAGES],
     pub(crate) gates: [i64; MAX_STAGES],
     pub(crate) min_reads: usize,
+    /// Final budget for a gated job, whatever the job asked for. Few models
+    /// survive the last gate, so a deep final stage costs little.
+    pub(crate) full_sweeps: usize,
 }
 
 pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
@@ -125,6 +128,7 @@ pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
     stages: [8, 16, 64, 256],
     gates: [-13_244_000, -13_788_000, -14_272_000, -14_458_000],
     min_reads: 64,
+    full_sweeps: 65_536,
 };
 
 /// FNV-1a over the node count and the sorted, normalized edge list, so edge
