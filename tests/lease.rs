@@ -326,12 +326,15 @@ async fn lease_throughput_aglais() {
 
     let mut s = Session::start(&msa(), 64, &backend_toml).await;
     let granted = s.log.credits[0];
+    let in_flight = env_u64("QUIP_LEASE_INFLIGHT", u64::from(granted));
+    assert!(in_flight > 0, "QUIP_LEASE_INFLIGHT must be positive");
+    let in_flight = in_flight.min(u64::from(granted));
     let (topology, view) = aglais();
     let t = target(target_milli, sweeps);
     s.send(coord_msg::Msg::Topology(topology)).await;
     s.send(coord_msg::Msg::SetTarget(t)).await;
     eprintln!(
-        "lease: {granted} credits, {per_lease} salts per lease, {sweeps} sweeps, target {target_milli}, backend_toml={backend_toml:?}"
+        "lease: {granted} credits, {in_flight} leases in flight, {per_lease} salts per lease, {sweeps} sweeps, target {target_milli}, backend_toml={backend_toml:?}"
     );
 
     let mut specs: HashMap<Vec<u8>, IsingProblemGenerator> = HashMap::new();
@@ -345,7 +348,7 @@ async fn lease_throughput_aglais() {
             per_lease,
         )
     };
-    for _ in 0..granted {
+    for _ in 0..in_flight {
         let job = issue(next);
         specs.insert(job.job_id.clone(), generator(&job));
         s.send(coord_msg::Msg::Job(job)).await;
