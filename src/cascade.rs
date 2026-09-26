@@ -294,6 +294,62 @@ pub(crate) struct Controller {
     topology: Option<(usize, Vec<(usize, usize)>)>,
     topology_epoch: u64,
     yield_epoch: u64,
+    stats: Stats,
+}
+
+/// Best energies seen at one sweep level during a report window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LevelStats {
+    pub(crate) sweeps: usize,
+    pub(crate) checked: u64,
+    pub(crate) kept: u64,
+    pub(crate) best: i64,
+    pub(crate) worst: i64,
+}
+
+/// Per-window counts for the periodic cascade report. Level `k < MAX_STAGES`
+/// is checkpoint `k`; the last level is the full budget.
+pub(crate) struct Stats {
+    started: Instant,
+    pub(crate) models: u64,
+    pub(crate) cancelled: u64,
+    pub(crate) levels: [Option<LevelStats>; MAX_STAGES + 1],
+}
+
+impl Stats {
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            models: 0,
+            cancelled: 0,
+            levels: [None; MAX_STAGES + 1],
+        }
+    }
+
+    fn record(&mut self, level: usize, sweeps: usize, best: i64, kept: bool) {
+        let entry = self.levels[level].get_or_insert(LevelStats {
+            sweeps,
+            checked: 0,
+            kept: 0,
+            best,
+            worst: best,
+        });
+        // A settings change mid-window can move a level's budget.
+        entry.sweeps = sweeps;
+        entry.checked += 1;
+        entry.kept += u64::from(kept);
+        entry.best = entry.best.min(best);
+        entry.worst = entry.worst.max(best);
+    }
+}
+
+/// Milli energy as a whole-unit string; chain energies are unit integers.
+fn energy(milli: i64) -> String {
+    if milli % 1000 == 0 {
+        (milli / 1000).to_string()
+    } else {
+        format!("{:.3}", milli as f64 / 1000.0)
+    }
 }
 
 impl StagePlan {
@@ -415,7 +471,42 @@ impl Controller {
             topology: None,
             topology_epoch: 0,
             yield_epoch: 0,
+            stats: Stats::new(Instant::now()),
         }
+    }
+
+    /// Log the window's counts and energy ranges when `period` has passed,
+    /// then start a new window.
+    pub(crate) fn report(&mut self, now: Instant, period: Duration) {
+        let elapsed = now.saturating_duration_since(self.stats.started);
+        if elapsed < period {
+            return;
+        }
+        let stats = std::mem::replace(&mut self.stats, Stats::new(now));
+        let secs = elapsed.as_secs_f64().max(f64::EPSILON);
+        let levels: Vec<String> = stats
+            .levels
+            .iter()
+            .flatten()
+            .map(|l| {
+                format!(
+                    "{}sw checked={} kept={} best={} worst={}",
+                    l.sweeps,
+                    l.checked,
+                    l.kept,
+                    energy(l.best),
+                    energy(l.worst)
+                )
+            })
+            .collect();
+        tracing::info!(
+            window_s = secs.round() as u64,
+            models = stats.models,
+            models_per_s = (stats.models as f64 / secs).round() as u64,
+            cancelled = stats.cancelled,
+            levels = %levels.join(" | "),
+            "cascade report"
+        );
     }
 
     /// Rebuild on a stages/keep change, update audit and yield independently.
@@ -516,12 +607,15 @@ impl Controller {
         let mut plan = ticket.plan.lock().unwrap_or_else(|p| p.into_inner());
         Self::observe_transition(&mut plan, ticket, best);
         let stage = ticket.stage;
+        let sweeps = plan.settings.stages[stage];
         if plan.settings.open_gates {
+            self.stats.record(stage, sweeps, best, true);
             ticket.stage += 1;
             return true;
         }
         if let Some(gate) = plan.settings.gates[stage] {
             let keep = best <= gate;
+            self.stats.record(stage, sweeps, best, keep);
             ticket.audited = false;
             ticket.stage += usize::from(keep);
             return keep;
@@ -540,6 +634,8 @@ impl Controller {
                 &[CALIBRATION.skew[0], CALIBRATION.excess_kurtosis[0]],
             );
         }
+        self.stats
+            .record(stage, sweeps, best, keep || ticket.audited);
         if keep || ticket.audited {
             ticket.stage += 1;
             true
@@ -571,6 +667,16 @@ impl Controller {
 
     /// Called once per job with its final best (None for error or cancel).
     pub(crate) fn finish(&mut self, ticket: &Ticket, best: Option<i64>, delivered: bool) {
+        match best {
+            Some(best) => {
+                self.stats.models += 1;
+                if ticket.stage == ticket.gates {
+                    self.stats
+                        .record(MAX_STAGES, ticket.final_sweeps, best, true);
+                }
+            }
+            None => self.stats.cancelled += 1,
+        }
         if let Some(best) = best {
             if ticket.topology_epoch == self.topology_epoch
                 && ticket.stage == ticket.gates
@@ -1193,6 +1299,55 @@ mod tests {
         assert_eq!(gated.stages, CHAIN_GATES.stages);
         assert_eq!(gated.gates, CHAIN_GATES.gates.map(Some));
         assert_eq!(settings.effective(false), settings);
+    }
+
+    #[test]
+    fn report_counts_each_level_and_resets_the_window() {
+        let mut c = Controller::new(CascadeSettings::default().effective(true));
+        let start = c.stats.started;
+        let (mut kept, _, _) = c.admit(&job(0, 1000));
+        for best in [-13_300_000, -13_800_000, -14_300_000, -14_500_000] {
+            assert!(c.checkpoint(&mut kept, best));
+        }
+        c.finish(&kept, Some(-14_600_000), true);
+        let (mut screened, _, _) = c.admit(&job(0, 1000));
+        assert!(!c.checkpoint(&mut screened, -13_000_000));
+        c.finish(&screened, Some(-13_000_000), true);
+        let (cancelled, _, _) = c.admit(&job(0, 1000));
+        c.finish(&cancelled, None, false);
+
+        assert_eq!((c.stats.models, c.stats.cancelled), (2, 1));
+        let first = c.stats.levels[0].unwrap();
+        assert_eq!(
+            first,
+            LevelStats {
+                sweeps: 8,
+                checked: 2,
+                kept: 1,
+                best: -13_300_000,
+                worst: -13_000_000,
+            }
+        );
+        assert_eq!(c.stats.levels[1].unwrap().checked, 1);
+        let full = c.stats.levels[MAX_STAGES].unwrap();
+        assert_eq!(
+            (full.sweeps, full.checked, full.best),
+            (1000, 1, -14_600_000)
+        );
+
+        c.report(start + Duration::from_secs(59), Duration::from_secs(60));
+        assert_eq!(c.stats.models, 2);
+        c.report(start + Duration::from_secs(60), Duration::from_secs(60));
+        assert_eq!(c.stats.models, 0);
+        assert!(c.stats.levels.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn energy_prints_whole_units_and_fractions() {
+        assert_eq!(energy(-14_272_000), "-14272");
+        assert_eq!(energy(-1_500), "-1.500");
+        assert_eq!(energy(250), "0.250");
+        assert_eq!(energy(0), "0");
     }
 
     #[test]

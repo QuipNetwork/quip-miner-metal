@@ -226,6 +226,8 @@ struct Work {
 // At most 40 jobs (two nominal 20-slot batches) are queued, preparing, or ready
 // in total. Per-worker request queues remove shared-receiver contention;
 // one bounded reply per job preserves admission order.
+/// How often the runner logs the cascade report.
+const REPORT_PERIOD: Duration = Duration::from_secs(60);
 pub(crate) const PREP_WORKERS: usize = 4;
 pub(crate) const PREP_BOUND: usize = 40;
 
@@ -503,6 +505,7 @@ pub(crate) fn run(
                 );
                 config = *settings.lock().unwrap_or_else(|p| p.into_inner());
                 controller.refresh(config);
+                controller.report(Instant::now(), REPORT_PERIOD);
                 window = Instant::now();
                 busy_us = 0;
             }

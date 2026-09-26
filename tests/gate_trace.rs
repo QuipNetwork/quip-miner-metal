@@ -99,7 +99,7 @@ fn checkpoint_trace() {
     let buffer = Buffer::default();
     let writer = buffer.clone();
     tracing_subscriber::fmt()
-        .with_env_filter("quip_miner_metal::cascade_trace=debug")
+        .with_env_filter("quip_miner_metal::cascade_trace=debug,quip_miner_metal::cascade=info")
         .with_ansi(false)
         .without_time()
         .with_writer(move || writer.clone())
@@ -166,6 +166,9 @@ fn checkpoint_trace() {
     let wall = started.elapsed().as_secs_f64();
 
     let text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+    for line in text.lines().filter(|line| line.contains("cascade report")) {
+        eprintln!("{line}");
+    }
     let mut rows: BTreeMap<String, Vec<Option<i64>>> = BTreeMap::new();
     let width = stages.split(',').count();
     for (job, stage, best) in text.lines().filter_map(parse) {
