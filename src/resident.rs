@@ -162,7 +162,7 @@ struct Preparer {
 impl Preparer {
     fn prepare(
         &mut self,
-        job: &StreamJob,
+        job: &mut StreamJob,
         settings: CascadeSettings,
     ) -> Result<Option<PreparedData>, SampleError> {
         if job.graph.num_nodes() == 0 {
@@ -203,8 +203,12 @@ impl Preparer {
                 inputs
             }
         };
-        let schedule =
-            PreparedSchedule::new(job, settings, settings.chain_gated(self.chain, &job.params));
+        let gated = settings.chain_gated(self.chain, &job.params);
+        // Open gates measure the budget the job asked for.
+        if gated && !settings.open_gates {
+            job.params.num_sweeps = CHAIN_GATES.full_sweeps;
+        }
+        let schedule = PreparedSchedule::new(job, settings, gated);
         validate_schedule(&schedule.betas, &schedule.checkpoints)?;
         Ok(Some(PreparedData { schedule, inputs }))
     }
@@ -257,7 +261,7 @@ impl Preparation {
                     loop {
                         let request = rx.recv();
                         let Ok(Work {
-                            job,
+                            mut job,
                             settings,
                             reply,
                         }) = request
@@ -267,7 +271,7 @@ impl Preparation {
                         // Keep ownership of the job outside unwinding so a failed
                         // worker still returns it to the runner exactly once.
                         let data = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            preparer.prepare(&job, settings)
+                            preparer.prepare(&mut job, settings)
                         }))
                         .unwrap_or_else(|_| {
                             Err(SampleError::Driver("job preparation panicked".into()))
@@ -732,6 +736,53 @@ mod tests {
     }
 
     #[test]
+    fn chain_jobs_get_the_deep_final_budget_unless_gates_are_open() {
+        let edges: Vec<(usize, usize)> = include_str!("../tests/fixtures/advantage2-system1.edges")
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let mut words = line.split_whitespace();
+                (
+                    words.next().unwrap().parse().unwrap(),
+                    words.next().unwrap().parse().unwrap(),
+                )
+            })
+            .filter(|&(u, v): &(usize, usize)| (u.min(v), u.max(v)) != (880, 2695))
+            .collect();
+        let mut chain = job(0, 14_336);
+        chain.graph = IsingGraph::new(
+            vec![0.0; 4577],
+            (0..edges.len())
+                .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 })
+                .collect(),
+            edges,
+        );
+        chain.params.num_reads = 64;
+        let mut preparer = Preparer::default();
+        let data = preparer
+            .prepare(&mut chain, CascadeSettings::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(chain.params.num_sweeps, CHAIN_GATES.full_sweeps);
+        assert_eq!(
+            data.schedule.checkpoints.last(),
+            Some(&CHAIN_GATES.full_sweeps)
+        );
+        let open = CascadeSettings {
+            open_gates: true,
+            ..CascadeSettings::default()
+        };
+        chain.params.num_sweeps = 14_336;
+        preparer.prepare(&mut chain, open).unwrap().unwrap();
+        assert_eq!(chain.params.num_sweeps, 14_336);
+        let mut other = job(1, 14_336);
+        preparer
+            .prepare(&mut other, CascadeSettings::default())
+            .unwrap();
+        assert_eq!(other.params.num_sweeps, 14_336);
+    }
+
+    #[test]
     #[expect(
         clippy::print_stderr,
         reason = "host preparation cost informs the fixed worker budget"
@@ -768,12 +819,12 @@ mod tests {
         job.params.num_reads = 64;
         let mut preparer = Preparer::default();
         let settings = CascadeSettings::default();
-        preparer.prepare(&job, settings).unwrap();
+        preparer.prepare(&mut job, settings).unwrap();
         let start = Instant::now();
         for _ in 0..1000 {
             std::hint::black_box(
                 preparer
-                    .prepare(std::hint::black_box(&job), settings)
+                    .prepare(std::hint::black_box(&mut job), settings)
                     .unwrap(),
             );
         }
@@ -814,21 +865,21 @@ mod tests {
         let mut preparer = Preparer::default();
         let settings = CascadeSettings::default();
         let mut input = job(0, 32);
-        preparer.prepare(&input, settings).unwrap();
+        preparer.prepare(&mut input, settings).unwrap();
         input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
         input.graph.j = vec![1.0; input.graph.edges.len()];
         assert!(matches!(
-            preparer.prepare(&input, settings),
+            preparer.prepare(&mut input, settings),
             Err(SampleError::TooLarge(_))
         ));
         let mut input = job(1, sampler::MAX_SWEEPS + 1);
         assert!(matches!(
-            preparer.prepare(&input, settings),
+            preparer.prepare(&mut input, settings),
             Err(SampleError::TooLarge(_))
         ));
         input.params.num_sweeps = 32;
         input.graph.j[0] = 0.5;
-        assert!(preparer.prepare(&input, settings).unwrap().is_none());
+        assert!(preparer.prepare(&mut input, settings).unwrap().is_none());
     }
 
     fn job(id: usize, sweeps: usize) -> StreamJob {
@@ -1161,24 +1212,24 @@ mod tests {
         input.graph.j[0] = 0.5;
         let mut preparer = Preparer::default();
         assert!(preparer
-            .prepare(&input, CascadeSettings::default())
+            .prepare(&mut input, CascadeSettings::default())
             .unwrap()
             .is_none());
         input.params.num_sweeps = sampler::MAX_SWEEPS + 1;
         assert!(matches!(
-            preparer.prepare(&input, CascadeSettings::default()),
+            preparer.prepare(&mut input, CascadeSettings::default()),
             Err(SampleError::TooLarge(_))
         ));
         input.params.num_sweeps = 0;
         assert!(preparer
-            .prepare(&input, CascadeSettings::default())
+            .prepare(&mut input, CascadeSettings::default())
             .unwrap()
             .is_none());
         input.params.num_sweeps = 64;
         input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
         input.graph.j = vec![0.5; input.graph.edges.len()];
         assert!(matches!(
-            preparer.prepare(&input, CascadeSettings::default()),
+            preparer.prepare(&mut input, CascadeSettings::default()),
             Err(SampleError::TooLarge(_))
         ));
         input
@@ -1186,7 +1237,7 @@ mod tests {
             .h
             .resize(sampler::kernel_max_nodes(Kernel::Msa) + 1, 0.0);
         assert!(matches!(
-            preparer.prepare(&input, CascadeSettings::default()),
+            preparer.prepare(&mut input, CascadeSettings::default()),
             Err(SampleError::TooLarge(_))
         ));
     }
@@ -1198,7 +1249,7 @@ mod tests {
             let mut input = job(0, 0);
             input.graph.j[0] = coefficient;
             assert!(preparer
-                .prepare(&input, CascadeSettings::default())
+                .prepare(&mut input, CascadeSettings::default())
                 .unwrap()
                 .is_none());
         }

@@ -193,8 +193,8 @@ pub(crate) const MSA_MAX_DEG: usize = 20;
 ///
 /// 262,144 admits the deep final stage of the chain-gated cascade, where the
 /// catch rate on recent winners still rises past 65,536 sweeps. It bounds the
-/// schedule to 256Ki `f64` + 256Ki `f32` (~3 MiB). It must stay
-/// >= `2 * METAL_ADAPT.max_sweeps`, which a `const _: () = assert!(..)` in
+/// schedule to 256Ki `f64` + 256Ki `f32` (~3 MiB). It must stay at least
+/// `2 * METAL_ADAPT.max_sweeps`, which a `const _: () = assert!(..)` in
 /// `lib.rs` enforces at compile time.
 pub(crate) const MAX_SWEEPS: usize = 262_144;
 

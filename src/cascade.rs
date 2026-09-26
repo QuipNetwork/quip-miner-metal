@@ -108,11 +108,13 @@ impl Default for CascadeSettings {
     }
 }
 
-/// Zero-false-negative gates for the chain topology `cbec1eb4` (4,577 nodes,
-/// 41,514 edges, h = 0, J = ±1). Each gate is the shallowest checkpoint best
-/// over 30 seeds of the chain's 50 deepest winners on the resident schedule at
-/// 64 reads, one sweep per beta, and reheat 0.25 (`tests/gate_trace.rs`).
-/// Population keep, cumulative: 1 in 7, 1 in 28, then none of 30,000.
+/// Gates for the chain topology `cbec1eb4` (4,577 nodes, 41,514 edges, h = 0,
+/// J = ±1) on the resident schedule at 64 reads, one sweep per beta, and
+/// reheat 0.25 (`tests/gate_trace.rs`). The 8 and 16 gates are the shallowest
+/// checkpoint best over 30 seeds of the chain's 50 deepest winners. The 64 and
+/// 256 gates are the shallowest over those runs and 30 seeds of 100 later
+/// winners, plus 10. Population keep, cumulative: 1 in 7, 1 in 28, then about
+/// none of 30,000.
 pub(crate) struct ChainGates {
     pub(crate) fingerprint: u64,
     pub(crate) stages: [usize; MAX_STAGES],
@@ -126,9 +128,9 @@ pub(crate) struct ChainGates {
 pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
     fingerprint: 0x38cd_e7d7_931d_f32f,
     stages: [8, 16, 64, 256],
-    gates: [-13_244_000, -13_788_000, -14_272_000, -14_458_000],
+    gates: [-13_244_000, -13_788_000, -14_254_000, -14_444_000],
     min_reads: 64,
-    full_sweeps: 65_536,
+    full_sweeps: 131_072,
 };
 
 /// FNV-1a over the node count and the sorted, normalized edge list, so edge
