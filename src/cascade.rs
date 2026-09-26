@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::sampler::build_beta_schedule;
+use crate::slots::Edges;
 use crate::{IsingGraph, SampleParams};
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 use quip_solver_core::StreamJob;
@@ -326,7 +327,7 @@ pub(crate) struct Controller {
     settings: CascadeSettings,
     plan: Arc<Mutex<StagePlan>>,
     yield_check: Option<Yield>,
-    topology: Option<(usize, Vec<(usize, usize)>)>,
+    topology: Option<(usize, Edges)>,
     topology_epoch: u64,
     yield_epoch: u64,
     stats: Stats,
@@ -568,10 +569,30 @@ impl Controller {
         plan.settings.open_gates = settings.open_gates;
     }
 
+    #[cfg(test)]
     pub(crate) fn matches_topology(&self, graph: &IsingGraph) -> bool {
         self.topology
             .as_ref()
-            .is_some_and(|(n, edges)| *n == graph.num_nodes() && *edges == graph.edges)
+            .is_some_and(|(n, edges)| *n == graph.num_nodes() && edges[..] == graph.edges[..])
+    }
+
+    /// Whether `edges` is the current topology. Storage already seen skips the
+    /// edge compare. Equal edges in new storage replace the stored copy.
+    fn same_topology(&mut self, nodes: usize, edges: &Edges) -> bool {
+        let Some((n, current)) = &mut self.topology else {
+            return false;
+        };
+        if *n != nodes {
+            return false;
+        }
+        if Arc::ptr_eq(current, edges) {
+            return true;
+        }
+        let same = current[..] == edges[..];
+        if same {
+            *current = Arc::clone(edges);
+        }
+        same
     }
 
     /// Reset gate state on a gated topology change. Return the job's schedule plan.
@@ -581,14 +602,17 @@ impl Controller {
             == CHAIN_GATES.fingerprint;
         let gated = self.settings.chain_gated(chain, &job.params);
         let mut schedule = PreparedSchedule::new(job, self.settings, gated);
-        let ticket = self.admit_prepared(job, &mut schedule).unwrap();
+        let edges = Edges::from(job.graph.edges.as_slice());
+        let ticket = self.admit_prepared(job, &mut schedule, &edges).unwrap();
         (ticket, schedule.betas.to_vec(), schedule.checkpoints)
     }
 
+    /// `edges` must equal the job's edges; preparation verified them.
     pub(crate) fn admit_prepared(
         &mut self,
         job: &StreamJob,
         schedule: &mut PreparedSchedule,
+        edges: &Edges,
     ) -> Result<Ticket, crate::sampler::SampleError> {
         // Only settings changes rebuild on the runner. Queued jobs must use
         // the current gate plan.
@@ -601,9 +625,9 @@ impl Controller {
         }
         if schedule.checkpoints.len() > 1 {
             let wanted = self.settings.effective(schedule.gated);
-            if !self.matches_topology(&job.graph) {
+            if !self.same_topology(job.graph.num_nodes(), edges) {
                 self.plan = Arc::new(Mutex::new(StagePlan::new(wanted)));
-                self.topology = Some((job.graph.num_nodes(), job.graph.edges.clone()));
+                self.topology = Some((job.graph.num_nodes(), Arc::clone(edges)));
                 self.topology_epoch = self.topology_epoch.wrapping_add(1);
             } else {
                 let plan = self.plan.lock().unwrap_or_else(|p| p.into_inner());
@@ -1030,8 +1054,9 @@ mod tests {
             stages: stage_array(&[1]),
             ..old
         });
+        let edges = Edges::from(job.graph.edges.as_slice());
         assert!(matches!(
-            controller.admit_prepared(&job, &mut schedule),
+            controller.admit_prepared(&job, &mut schedule, &edges),
             Err(crate::sampler::SampleError::Driver(_))
         ));
         assert!(
@@ -1107,7 +1132,10 @@ mod tests {
             let mut prepared = PreparedSchedule::new(&job, old, false);
             let mut controller = Controller::new(old);
             controller.refresh(new);
-            let ticket = controller.admit_prepared(&job, &mut prepared).unwrap();
+            let edges = Edges::from(job.graph.edges.as_slice());
+            let ticket = controller
+                .admit_prepared(&job, &mut prepared, &edges)
+                .unwrap();
             let mut expected = Controller::new(new);
             let (expected_ticket, betas, checkpoints) = expected.admit(&job);
             assert_eq!(&prepared.betas[..], &betas[..]);

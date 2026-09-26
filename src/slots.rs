@@ -97,9 +97,15 @@ pub(crate) fn validate_schedule(
     Ok(())
 }
 
+/// A shared edge list. Equal storage identifies a topology without comparing
+/// its edges.
+pub(crate) type Edges = Arc<[(usize, usize)]>;
+
 /// Host allocations only. Construction binds coefficients to the exact graph.
 pub(crate) struct PreparedInputs {
     graph: IsingGraph,
+    /// The edge list construction verified `graph` against, edge by edge.
+    edges: Edges,
     couplings: Vec<i8>,
     fields: Vec<i8>,
 }
@@ -108,14 +114,19 @@ impl PreparedInputs {
     pub(crate) fn new(
         graph: &IsingGraph,
         topology: &SelfFeedingTopology,
-        edges: &[(usize, usize)],
+        edges: &Edges,
     ) -> Option<Self> {
         let (couplings, fields) = fill_h_j_matching(topology, edges, graph)?;
         Some(Self {
             graph: graph.clone(),
+            edges: Arc::clone(edges),
             couplings,
             fields,
         })
+    }
+
+    pub(crate) fn edges(&self) -> &Edges {
+        &self.edges
     }
 }
 
@@ -168,6 +179,8 @@ pub(crate) struct SlotPool {
     slots: Vec<Option<ResidentJob>>,
     /// The schedule each slot's region of buffer 9 holds.
     held: Vec<Option<Arc<[f32]>>>,
+    /// Edge storage already found equal to this pool's topology.
+    verified: Option<Edges>,
     steps: Vec<SlotStep>,
     command: Option<metal::CommandBuffer>,
     faulted: bool,
@@ -243,6 +256,7 @@ impl SlotPool {
             buffers,
             slots: (0..capacity).map(|_| None).collect(),
             held: (0..capacity).map(|_| None).collect(),
+            verified: None,
             steps: Vec::with_capacity(capacity),
             command: None,
             faulted: false,
@@ -253,12 +267,31 @@ impl SlotPool {
         })
     }
 
-    /// Optional routing query. Admission checks topology itself, so callers
-    /// targeting this pool need not call matches first.
-    pub(crate) fn matches(&self, graph: &IsingGraph, num_reads: usize) -> bool {
-        self.cached.n == graph.num_nodes()
-            && self.num_reads == num_reads
-            && self.cached.edges == graph.edges
+    /// Whether inputs prepared against `edges` fit this pool. Admission checks
+    /// this itself, so callers targeting this pool need not call it first.
+    /// Storage already verified skips the edge compare, which reads the whole
+    /// edge list and costs more than the rest of admission.
+    pub(crate) fn matches_prepared(
+        &mut self,
+        edges: &Edges,
+        nodes: usize,
+        num_reads: usize,
+    ) -> bool {
+        if self.cached.n != nodes || self.num_reads != num_reads {
+            return false;
+        }
+        if self
+            .verified
+            .as_ref()
+            .is_some_and(|v| Arc::ptr_eq(v, edges))
+        {
+            return true;
+        }
+        let same = self.cached.edges[..] == edges[..];
+        if same {
+            self.verified = Some(Arc::clone(edges));
+        }
+        same
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -347,7 +380,8 @@ impl SlotPool {
         if schedule.len() > self.sched_stride {
             return Err(SampleError::TooLarge("schedule exceeds slot stride".into()));
         }
-        if !self.matches(&inputs.graph, self.num_reads) {
+        let nodes = inputs.graph.num_nodes();
+        if !self.matches_prepared(&inputs.edges, nodes, self.num_reads) {
             return Err(SampleError::Driver(
                 "job topology differs from slot pool".into(),
             ));
@@ -748,13 +782,14 @@ mod tests {
         let graph = advantage2_system1(7);
         let topology = SelfFeedingTopology::build_with_advantage2_coloring(&graph);
         let host_topology = SelfFeedingTopology::build(&graph);
-        let inputs = PreparedInputs::new(&graph, &host_topology, &graph.edges).unwrap();
+        let edges = Edges::from(graph.edges.as_slice());
+        let inputs = PreparedInputs::new(&graph, &host_topology, &edges).unwrap();
         let (couplings, fields) = fill_h_j_matching(&topology, &graph.edges, &graph).unwrap();
         assert_eq!(inputs.couplings, couplings);
         assert_eq!(inputs.fields, fields);
-        let mut other = graph.clone();
+        let mut other = graph;
         other.edges.swap(0, 1);
-        assert!(PreparedInputs::new(&other, &topology, &graph.edges).is_none());
+        assert!(PreparedInputs::new(&other, &topology, &edges).is_none());
     }
     use crate::metal_device::MetalDevice;
     use crate::sampler::{build_beta_schedule, energy_milli, unpack_spins, MSA_THREADS};
@@ -851,8 +886,15 @@ mod tests {
         let reference = dispatch_slots(&device, &graphs, &schedules, &steps);
         let mut pool = SlotPool::new(&device, &graphs[0], READS, 3, 64).unwrap();
         assert_eq!(pool.capacity(), 3);
-        assert!(pool.matches(&graphs[1], READS));
-        assert!(!pool.matches(&graphs[1], READS + 1));
+        let nodes = graphs[1].num_nodes();
+        let edges = Edges::from(graphs[1].edges.as_slice());
+        assert!(pool.matches_prepared(&edges, nodes, READS));
+        // The second query takes the verified-storage path.
+        assert!(pool.matches_prepared(&edges, nodes, READS));
+        assert!(!pool.matches_prepared(&edges, nodes, READS + 1));
+        let mut swapped = graphs[1].edges.clone();
+        swapped.swap(0, 1);
+        assert!(!pool.matches_prepared(&Edges::from(swapped.as_slice()), nodes, READS));
         for j in jobs {
             pool.admit(j).unwrap();
         }
@@ -1573,8 +1615,9 @@ mod tests {
                     });
                     let mut data = prepared.data.unwrap().unwrap();
                     timed(&mut pool_host[0], || {
+                        let edges = Arc::clone(data.inputs.edges());
                         let ticket = controller
-                            .admit_prepared(&prepared.job, &mut data.schedule)
+                            .admit_prepared(&prepared.job, &mut data.schedule, &edges)
                             .unwrap();
                         let slot = pool
                             .admit_prepared(

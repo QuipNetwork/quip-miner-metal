@@ -9,12 +9,12 @@ use crate::cascade::{
 };
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, Kernel, SampleError};
-use crate::slots::{PreparedInputs, SlotPool};
+use crate::slots::{Edges, PreparedInputs, SlotPool};
 use crate::streaming::{batch_size_for_reads, scale_budget, send_reject, GpuGovernor};
 use crate::topology::SelfFeedingTopology;
 use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
 use std::collections::VecDeque;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -43,9 +43,10 @@ impl Pool {
         })
     }
 
-    fn fits(&self, job: &StreamJob) -> bool {
-        self.slots.matches(
-            &job.graph,
+    fn fits(&mut self, job: &StreamJob, edges: &Edges) -> bool {
+        self.slots.matches_prepared(
+            edges,
+            job.graph.num_nodes(),
             job.params.num_reads.clamp(1, sampler::MAX_READS),
         ) && job.params.num_sweeps <= self.stride
     }
@@ -152,11 +153,20 @@ pub(crate) struct PreparedData {
     pub(crate) inputs: PreparedInputs,
 }
 
+/// The last prepared topology. Workers share it, so every job on one topology
+/// carries the same edge storage and the runner can skip its edge compares.
+struct PreparedTopology {
+    topology: SelfFeedingTopology,
+    edges: Edges,
+    /// Whether this is the chain topology.
+    chain: bool,
+}
+
+type SharedTopology = Arc<Mutex<Option<Arc<PreparedTopology>>>>;
+
 #[derive(Default)]
 struct Preparer {
-    topology: Option<(SelfFeedingTopology, Vec<(usize, usize)>)>,
-    /// Whether the cached topology is the chain topology.
-    chain: bool,
+    topology: SharedTopology,
     schedules: ScheduleCache,
 }
 
@@ -174,37 +184,59 @@ impl Preparer {
             sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
             return Ok(None);
         }
-        let inputs = self
+        let lookup = |cached: Option<&Arc<PreparedTopology>>| {
+            cached.and_then(|cached| {
+                PreparedInputs::new(&job.graph, &cached.topology, &cached.edges)
+                    .map(|inputs| (inputs, cached.chain))
+            })
+        };
+        let cached = self
             .topology
-            .as_ref()
-            .and_then(|(topology, edges)| PreparedInputs::new(&job.graph, topology, edges));
-        let inputs = match inputs {
-            Some(inputs) => inputs,
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let (inputs, chain) = match lookup(cached.as_ref()) {
+            Some(hit) => hit,
             None => {
-                // Degree depends only on nodes and ordered edges. The cache is
-                // established only after validate_batch, and coefficient filling
-                // checks exact topology equality on every hit. Recounting degree
-                // would allocate and walk the same 41,515 edges on every job.
-                sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
-                // This cache contains no Metal objects. Coloring does not
-                // change the CSR positions used for coefficient order.
-                let topology = SelfFeedingTopology::build(&job.graph);
-                let inputs = PreparedInputs::new(&job.graph, &topology, &job.graph.edges)
-                    .ok_or_else(|| SampleError::Driver("preparation topology mismatch".into()))?;
-                self.chain = topology_fingerprint(job.graph.num_nodes(), &job.graph.edges)
-                    == CHAIN_GATES.fingerprint;
-                tracing::info!(
-                    chain = self.chain,
-                    gated = settings.chain_gated(self.chain, &job.params),
-                    nodes = job.graph.num_nodes(),
-                    edges = job.graph.edges.len(),
-                    "cascade topology prepared"
-                );
-                self.topology = Some((topology, job.graph.edges.clone()));
-                inputs
+                // Build under the lock, so workers that miss together share
+                // one edge storage. A miss happens once per topology.
+                let mut shared = self.topology.lock().unwrap_or_else(|p| p.into_inner());
+                match lookup(shared.as_ref()) {
+                    Some(hit) => hit,
+                    None => {
+                        // Degree depends only on nodes and ordered edges. The cache is
+                        // established only after validate_batch, and coefficient filling
+                        // checks exact topology equality on every hit. Recounting degree
+                        // would allocate and walk the same 41,515 edges on every job.
+                        sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+                        // This cache contains no Metal objects. Coloring does not
+                        // change the CSR positions used for coefficient order.
+                        let topology = SelfFeedingTopology::build(&job.graph);
+                        let edges = Edges::from(job.graph.edges.as_slice());
+                        let inputs = PreparedInputs::new(&job.graph, &topology, &edges)
+                            .ok_or_else(|| {
+                                SampleError::Driver("preparation topology mismatch".into())
+                            })?;
+                        let chain = topology_fingerprint(job.graph.num_nodes(), &job.graph.edges)
+                            == CHAIN_GATES.fingerprint;
+                        tracing::info!(
+                            chain,
+                            gated = settings.chain_gated(chain, &job.params),
+                            nodes = job.graph.num_nodes(),
+                            edges = job.graph.edges.len(),
+                            "cascade topology prepared"
+                        );
+                        *shared = Some(Arc::new(PreparedTopology {
+                            topology,
+                            edges,
+                            chain,
+                        }));
+                        (inputs, chain)
+                    }
+                }
             }
         };
-        let gated = settings.chain_gated(self.chain, &job.params);
+        let gated = settings.chain_gated(chain, &job.params);
         // Open gates measure the budget the job asked for.
         if gated && !settings.open_gates {
             job.params.num_sweeps = CHAIN_GATES.full_sweeps;
@@ -251,17 +283,19 @@ impl Preparation {
             workers: Vec::new(),
         };
         let schedules = ScheduleCache::default();
+        let topology = SharedTopology::default();
         for index in 0..PREP_WORKERS {
             // Each receiver has one owner. No worker holds a shared lock while
             // waiting for work. PREP_BOUND still bounds all outstanding replies.
             let (tx, rx) = mpsc::sync_channel::<Work>(PREP_BOUND);
             let schedules = schedules.clone();
+            let topology = Arc::clone(&topology);
             let worker = std::thread::Builder::new()
                 .name(format!("resident-prepare-{index}"))
                 .spawn(move || {
                     let mut preparer = Preparer {
+                        topology,
                         schedules,
-                        ..Preparer::default()
                     };
                     loop {
                         let request = rx.recv();
@@ -584,7 +618,8 @@ pub(crate) fn run(
                     continue;
                 }
             };
-            if pools.as_ref().is_none_or(|ps| !ps[turn].fits(&job)) {
+            let edges = Arc::clone(data.inputs.edges());
+            if pools.as_mut().is_none_or(|ps| !ps[turn].fits(&job, &edges)) {
                 if !empty {
                     pending = Some(Prepared {
                         job,
@@ -611,7 +646,7 @@ pub(crate) fn run(
             }
             let Some(pools) = &mut pools else { continue };
             let pool = &mut pools[turn];
-            let ticket = match controller.admit_prepared(&job, &mut data.schedule) {
+            let ticket = match controller.admit_prepared(&job, &mut data.schedule, &edges) {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     send_reject(out, job, error.to_sample_error());
@@ -742,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn preparation_workers_share_equal_schedule_storage() {
+    fn preparation_workers_share_schedule_and_edge_storage() {
         let mut preparation = Preparation::new().unwrap();
         for index in 0..PREP_WORKERS {
             preparation.submit(job(index, 32), CascadeSettings::default());
@@ -754,6 +789,7 @@ mod tests {
                 &first.schedule.betas,
                 &next.schedule.betas
             ));
+            assert!(Arc::ptr_eq(first.inputs.edges(), next.inputs.edges()));
         }
     }
 
