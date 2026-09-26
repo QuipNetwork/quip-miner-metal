@@ -250,14 +250,19 @@ impl Preparation {
             ready: VecDeque::new(),
             workers: Vec::new(),
         };
+        let schedules = ScheduleCache::default();
         for index in 0..PREP_WORKERS {
             // Each receiver has one owner. No worker holds a shared lock while
             // waiting for work. PREP_BOUND still bounds all outstanding replies.
             let (tx, rx) = mpsc::sync_channel::<Work>(PREP_BOUND);
+            let schedules = schedules.clone();
             let worker = std::thread::Builder::new()
                 .name(format!("resident-prepare-{index}"))
                 .spawn(move || {
-                    let mut preparer = Preparer::default();
+                    let mut preparer = Preparer {
+                        schedules,
+                        ..Preparer::default()
+                    };
                     loop {
                         let request = rx.recv();
                         let Ok(Work {
@@ -734,6 +739,22 @@ mod tests {
         );
         assert!(results.blocking_recv().is_none());
         assert!(tx.is_closed());
+    }
+
+    #[test]
+    fn preparation_workers_share_equal_schedule_storage() {
+        let mut preparation = Preparation::new().unwrap();
+        for index in 0..PREP_WORKERS {
+            preparation.submit(job(index, 32), CascadeSettings::default());
+        }
+        let first = preparation.next().unwrap().data.unwrap().unwrap();
+        for _ in 1..PREP_WORKERS {
+            let next = preparation.next().unwrap().data.unwrap().unwrap();
+            assert!(std::sync::Arc::ptr_eq(
+                &first.schedule.betas,
+                &next.schedule.betas
+            ));
+        }
     }
 
     #[test]

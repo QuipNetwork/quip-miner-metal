@@ -780,12 +780,17 @@ struct ScheduleKey {
     reheat: u64,
 }
 
-/// The last validated schedule on one preparation worker. Jobs on one lease
-/// share it, so later jobs skip the build, the validation, and, through the
-/// shared `Arc`, the slot upload.
-#[derive(Default)]
+struct CachedSchedule {
+    key: ScheduleKey,
+    betas: Arc<[f32]>,
+    checkpoints: Vec<usize>,
+}
+
+/// The last validated schedule shared by preparation workers. Equal schedules
+/// retain one `Arc` identity so slots can skip uploads across worker changes.
+#[derive(Clone, Default)]
 pub(crate) struct ScheduleCache {
-    entry: Option<(ScheduleKey, Arc<[f32]>, Vec<usize>)>,
+    entry: Arc<Mutex<Option<CachedSchedule>>>,
 }
 
 impl ScheduleCache {
@@ -807,8 +812,11 @@ impl ScheduleCache {
             stages: settings.effective(gated).stages,
             reheat: settings.reheat_beta.to_bits(),
         };
-        let entry = match self.entry.take() {
-            Some(entry) if entry.0 == key => entry,
+        // Compute the graph-dependent range before locking. Cache hits only
+        // compare the key and clone shared storage under the lock.
+        let mut cached = self.entry.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = match cached.as_ref() {
+            Some(entry) if entry.key == key => entry,
             _ => {
                 let params = SampleParams {
                     beta_range: Some((hot, cold)),
@@ -817,16 +825,19 @@ impl ScheduleCache {
                 let (betas, checkpoints) =
                     segment_schedule(&job.graph, &params, &key.stages, settings.reheat_beta);
                 crate::slots::validate_schedule(&betas, &checkpoints)?;
-                (key, betas.into(), checkpoints)
+                cached.insert(CachedSchedule {
+                    key,
+                    betas: betas.into(),
+                    checkpoints,
+                })
             }
         };
         let schedule = PreparedSchedule {
             settings,
             gated,
-            betas: Arc::clone(&entry.1),
-            checkpoints: entry.2.clone(),
+            betas: Arc::clone(&entry.betas),
+            checkpoints: entry.checkpoints.clone(),
         };
-        self.entry = Some(entry);
         Ok(schedule)
     }
 }
@@ -1421,15 +1432,23 @@ mod tests {
     fn schedule_cache_shares_equal_schedules_and_rebuilds_on_change() {
         let settings = CascadeSettings::default();
         let mut cache = ScheduleCache::default();
+        let mut other_worker = cache.clone();
         let first = cache.prepare(&job(0, 1000), settings, false).unwrap();
-        let second = cache.prepare(&job(1, 1000), settings, false).unwrap();
+        let second = other_worker
+            .prepare(&job(1, 1000), settings, false)
+            .unwrap();
         assert!(Arc::ptr_eq(&first.betas, &second.betas));
         let reference = PreparedSchedule::new(&job(1, 1000), settings, false);
         assert_eq!(&second.betas[..], &reference.betas[..]);
         assert_eq!(second.checkpoints, reference.checkpoints);
-        let longer = cache.prepare(&job(2, 2000), settings, false).unwrap();
+        let longer = other_worker
+            .prepare(&job(2, 2000), settings, false)
+            .unwrap();
         assert!(!Arc::ptr_eq(&first.betas, &longer.betas));
         assert_eq!(longer.betas.len(), 2000);
+        let shared_longer = cache.prepare(&job(3, 2000), settings, false).unwrap();
+        assert!(Arc::ptr_eq(&longer.betas, &shared_longer.betas));
+        assert_eq!(&first.betas[..], &reference.betas[..]);
         let gated = cache.prepare(&job(2, 2000), settings, true).unwrap();
         assert_eq!(gated.checkpoints, vec![8, 16, 64, 256, 512, 1024, 2000]);
     }
