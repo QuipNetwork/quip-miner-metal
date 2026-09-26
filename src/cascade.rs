@@ -553,7 +553,7 @@ impl Controller {
         let gated = self.settings.chain_gated(chain, &job.params);
         let mut schedule = PreparedSchedule::new(job, self.settings, gated);
         let ticket = self.admit_prepared(job, &mut schedule).unwrap();
-        (ticket, schedule.betas, schedule.checkpoints)
+        (ticket, schedule.betas.to_vec(), schedule.checkpoints)
     }
 
     pub(crate) fn admit_prepared(
@@ -735,8 +735,71 @@ impl Controller {
 pub(crate) struct PreparedSchedule {
     settings: CascadeSettings,
     gated: bool,
-    pub(crate) betas: Vec<f32>,
+    pub(crate) betas: Arc<[f32]>,
     pub(crate) checkpoints: Vec<usize>,
+}
+
+/// Everything a segment schedule depends on. The graph enters only through
+/// its beta range.
+#[derive(Clone, Copy, PartialEq)]
+struct ScheduleKey {
+    hot: u64,
+    cold: u64,
+    sweeps: usize,
+    per_beta: usize,
+    stages: [usize; MAX_STAGES],
+    reheat: u64,
+}
+
+/// The last validated schedule on one preparation worker. Jobs on one lease
+/// share it, so later jobs skip the build, the validation, and, through the
+/// shared `Arc`, the slot upload.
+#[derive(Default)]
+pub(crate) struct ScheduleCache {
+    entry: Option<(ScheduleKey, Arc<[f32]>, Vec<usize>)>,
+}
+
+impl ScheduleCache {
+    pub(crate) fn prepare(
+        &mut self,
+        job: &StreamJob,
+        settings: CascadeSettings,
+        gated: bool,
+    ) -> Result<PreparedSchedule, crate::sampler::SampleError> {
+        let (hot, cold) = job
+            .params
+            .beta_range
+            .unwrap_or_else(|| resident_beta_range(&job.graph));
+        let key = ScheduleKey {
+            hot: hot.to_bits(),
+            cold: cold.to_bits(),
+            sweeps: job.params.num_sweeps,
+            per_beta: job.params.sweeps_per_beta,
+            stages: settings.effective(gated).stages,
+            reheat: settings.reheat_beta.to_bits(),
+        };
+        let entry = match self.entry.take() {
+            Some(entry) if entry.0 == key => entry,
+            _ => {
+                let params = SampleParams {
+                    beta_range: Some((hot, cold)),
+                    ..job.params.clone()
+                };
+                let (betas, checkpoints) =
+                    segment_schedule(&job.graph, &params, &key.stages, settings.reheat_beta);
+                crate::slots::validate_schedule(&betas, &checkpoints)?;
+                (key, betas.into(), checkpoints)
+            }
+        };
+        let schedule = PreparedSchedule {
+            settings,
+            gated,
+            betas: Arc::clone(&entry.1),
+            checkpoints: entry.2.clone(),
+        };
+        self.entry = Some(entry);
+        Ok(schedule)
+    }
 }
 
 impl PreparedSchedule {
@@ -751,7 +814,7 @@ impl PreparedSchedule {
         Self {
             settings,
             gated,
-            betas,
+            betas: betas.into(),
             checkpoints,
         }
     }
@@ -1001,7 +1064,7 @@ mod tests {
             let ticket = controller.admit_prepared(&job, &mut prepared).unwrap();
             let mut expected = Controller::new(new);
             let (expected_ticket, betas, checkpoints) = expected.admit(&job);
-            assert_eq!(prepared.betas, betas);
+            assert_eq!(&prepared.betas[..], &betas[..]);
             assert_eq!(prepared.checkpoints, checkpoints);
             assert_eq!(ticket.gates, expected_ticket.gates);
             assert_eq!(ticket.stage, expected_ticket.stage);
@@ -1305,6 +1368,23 @@ mod tests {
         assert_eq!(gated.stages, CHAIN_GATES.stages);
         assert_eq!(gated.gates, CHAIN_GATES.gates.map(Some));
         assert_eq!(settings.effective(false), settings);
+    }
+
+    #[test]
+    fn schedule_cache_shares_equal_schedules_and_rebuilds_on_change() {
+        let settings = CascadeSettings::default();
+        let mut cache = ScheduleCache::default();
+        let first = cache.prepare(&job(0, 1000), settings, false).unwrap();
+        let second = cache.prepare(&job(1, 1000), settings, false).unwrap();
+        assert!(Arc::ptr_eq(&first.betas, &second.betas));
+        let reference = PreparedSchedule::new(&job(1, 1000), settings, false);
+        assert_eq!(&second.betas[..], &reference.betas[..]);
+        assert_eq!(second.checkpoints, reference.checkpoints);
+        let longer = cache.prepare(&job(2, 2000), settings, false).unwrap();
+        assert!(!Arc::ptr_eq(&first.betas, &longer.betas));
+        assert_eq!(longer.betas.len(), 2000);
+        let gated = cache.prepare(&job(2, 2000), settings, true).unwrap();
+        assert_eq!(gated.checkpoints, vec![8, 16, 64, 256, 2000]);
     }
 
     #[test]

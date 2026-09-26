@@ -4,12 +4,12 @@
 //! Two alternating pools keep cascade jobs resident between checkpoints.
 
 use crate::cascade::{
-    topology_fingerprint, CascadeSettings, Controller, PreparedSchedule, Ticket, CHAIN_GATES,
-    MAX_STAGES,
+    topology_fingerprint, CascadeSettings, Controller, PreparedSchedule, ScheduleCache, Ticket,
+    CHAIN_GATES, MAX_STAGES,
 };
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, Kernel, SampleError};
-use crate::slots::{validate_schedule, PreparedInputs, SlotPool};
+use crate::slots::{PreparedInputs, SlotPool};
 use crate::streaming::{batch_size_for_reads, scale_budget, send_reject, GpuGovernor};
 use crate::topology::SelfFeedingTopology;
 use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
@@ -157,6 +157,7 @@ struct Preparer {
     topology: Option<(SelfFeedingTopology, Vec<(usize, usize)>)>,
     /// Whether the cached topology is the chain topology.
     chain: bool,
+    schedules: ScheduleCache,
 }
 
 impl Preparer {
@@ -208,8 +209,7 @@ impl Preparer {
         if gated && !settings.open_gates {
             job.params.num_sweeps = CHAIN_GATES.full_sweeps;
         }
-        let schedule = PreparedSchedule::new(job, settings, gated);
-        validate_schedule(&schedule.betas, &schedule.checkpoints)?;
+        let schedule = self.schedules.prepare(job, settings, gated)?;
         Ok(Some(PreparedData { schedule, inputs }))
     }
 }
@@ -1424,7 +1424,7 @@ mod tests {
             .slots
             .admit(SlotJob {
                 graph: live_job.graph.clone(),
-                schedule,
+                schedule: schedule.into(),
                 checkpoints,
                 seed: live_job.params.seed,
             })

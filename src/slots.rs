@@ -56,7 +56,9 @@ fn unpack_slot_spins(packed: &[i8], n: usize) -> Vec<i8> {
 
 pub(crate) struct SlotJob {
     pub(crate) graph: IsingGraph,
-    pub(crate) schedule: Vec<f32>,
+    /// Shared across jobs with the same schedule, so a slot that already
+    /// holds it skips the upload.
+    pub(crate) schedule: Arc<[f32]>,
     pub(crate) checkpoints: Vec<usize>,
     pub(crate) seed: u64,
 }
@@ -164,6 +166,8 @@ pub(crate) struct SlotPool {
     // Buffer indices match the slot kernel ABI. Storage is rented only in new.
     buffers: Vec<(u64, metal::Buffer)>,
     slots: Vec<Option<ResidentJob>>,
+    /// The schedule each slot's region of buffer 9 holds.
+    held: Vec<Option<Arc<[f32]>>>,
     steps: Vec<SlotStep>,
     command: Option<metal::CommandBuffer>,
     faulted: bool,
@@ -238,6 +242,7 @@ impl SlotPool {
             pipeline: device.msa_slots.clone(),
             buffers,
             slots: (0..capacity).map(|_| None).collect(),
+            held: (0..capacity).map(|_| None).collect(),
             steps: Vec::with_capacity(capacity),
             command: None,
             faulted: false,
@@ -334,7 +339,7 @@ impl SlotPool {
     pub(crate) fn admit_prepared(
         &mut self,
         inputs: PreparedInputs,
-        schedule: Vec<f32>,
+        schedule: Arc<[f32]>,
         checkpoints: Vec<usize>,
         seed: u64,
     ) -> Result<SlotId, SampleError> {
@@ -369,7 +374,13 @@ impl SlotPool {
             .ok_or_else(|| SampleError::TooLarge("slot pool is full".into()))?;
         self.write(2, slot * self.cached.topo.nnz, couplings)?;
         self.write(15, slot * self.cached.n, fields)?;
-        self.write(9, slot * self.sched_stride, &job.schedule)?;
+        let held = self.held[slot]
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, &job.schedule));
+        if !held {
+            self.write(9, slot * self.sched_stride, &job.schedule)?;
+            self.held[slot] = Some(Arc::clone(&job.schedule));
+        }
         self.slots[slot] = Some(ResidentJob {
             job,
             position: 0,
@@ -804,7 +815,7 @@ mod tests {
         let schedule = build_beta_schedule(&graph, sweeps, 1, None).0;
         SlotJob {
             graph,
-            schedule,
+            schedule: schedule.into(),
             checkpoints,
             seed,
         }
@@ -826,7 +837,7 @@ mod tests {
             .map(|s| job(s, 64, vec![64]))
             .collect();
         let graphs: Vec<_> = jobs.iter().map(|j| j.graph.clone()).collect();
-        let schedules: Vec<_> = jobs.iter().map(|j| j.schedule.clone()).collect();
+        let schedules: Vec<_> = jobs.iter().map(|j| j.schedule.to_vec()).collect();
         let steps: Vec<_> = [0, 32]
             .into_iter()
             .map(|start| {
@@ -922,6 +933,42 @@ mod tests {
     }
 
     #[test]
+    fn slot_keeps_a_held_schedule_and_rewrites_a_different_one() {
+        let Some(device) = device() else {
+            return;
+        };
+        let graph = advantage2_system1(7);
+        let shared: Arc<[f32]> = build_beta_schedule(&graph, 32, 1, None).0.into();
+        let halved: Arc<[f32]> = shared.iter().map(|b| b * 0.5).collect();
+        let with = |seed: u64, schedule: &Arc<[f32]>| SlotJob {
+            graph: graph.clone(),
+            schedule: Arc::clone(schedule),
+            checkpoints: vec![32],
+            seed,
+        };
+        let run = |pool: &mut SlotPool, job: SlotJob| {
+            assert_eq!(pool.admit(job).unwrap(), 0);
+            finish_step(pool, 32);
+            let reads = pool.reads(0, READS).unwrap();
+            pool.release(0).unwrap();
+            reads
+        };
+        let mut pool = SlotPool::new(&device, &graph, READS, 1, 32).unwrap();
+        run(&mut pool, with(7, &shared));
+        for schedule in [&shared, &halved] {
+            let reused = run(&mut pool, with(19, schedule));
+            assert!(Arc::ptr_eq(pool.held[0].as_ref().unwrap(), schedule));
+            let mut fresh = SlotPool::new(&device, &graph, READS, 1, 32).unwrap();
+            let copy: Arc<[f32]> = schedule.to_vec().into();
+            let expected = run(&mut fresh, with(19, &copy));
+            for (a, b) in reused.iter().zip(&expected) {
+                assert_eq!(a.spins, b.spins);
+                assert_eq!(a.energy_milli, b.energy_milli);
+            }
+        }
+    }
+
+    #[test]
     fn released_slot_starts_fresh() {
         let Some(device) = device() else {
             return;
@@ -1013,11 +1060,11 @@ mod tests {
             j.validate(64).unwrap_err();
         }
         j.checkpoints = vec![64];
-        j.schedule[0] = f32::NAN;
+        Arc::make_mut(&mut j.schedule)[0] = f32::NAN;
         j.validate(64).unwrap_err();
-        j.schedule[0] = -1.0;
+        Arc::make_mut(&mut j.schedule)[0] = -1.0;
         j.validate(64).unwrap_err();
-        j.schedule[0] = 0.1;
+        Arc::make_mut(&mut j.schedule)[0] = 0.1;
         j.graph.h[0] = 0.5;
         j.validate(64).unwrap_err();
     }
@@ -1317,7 +1364,7 @@ mod tests {
                         let slot = pool
                             .admit(SlotJob {
                                 graph,
-                                schedule,
+                                schedule: schedule.into(),
                                 checkpoints: checkpoints.clone(),
                                 seed: nonce as u64,
                             })
@@ -1911,7 +1958,7 @@ mod tests {
         let mut pool = SlotPool::new(&device, &graph, READS, 1, total).unwrap();
         pool.admit(SlotJob {
             graph: graph.clone(),
-            schedule: schedule.clone(),
+            schedule: schedule.clone().into(),
             checkpoints: vec![first, total],
             seed: 99,
         })
@@ -1969,7 +2016,10 @@ mod tests {
             }
         }
         assert!(commands > 2);
-        assert_eq!(pool.slots[0].as_ref().unwrap().job.schedule, schedule);
+        assert_eq!(
+            &pool.slots[0].as_ref().unwrap().job.schedule[..],
+            &schedule[..]
+        );
     }
 
     #[test]

@@ -191,12 +191,12 @@ pub(crate) const MSA_MAX_DEG: usize = 20;
 /// `f64`s, so `u32::MAX` sweeps is a ~34 GB allocation — and then drives that
 /// many kernel sweeps, i.e. both an OOM and a GPU-watchdog denial of service.
 ///
-/// 262,144 admits the deep final stage of the chain-gated cascade, where the
-/// catch rate on recent winners still rises past 65,536 sweeps. It bounds the
-/// schedule to 256Ki `f64` + 256Ki `f32` (~3 MiB). It must stay at least
+/// 1,048,576 admits the deep final stage of the chain-gated cascade, where the
+/// catch rate on recent winners still rises past 131,072 sweeps. It bounds the
+/// schedule to 1Mi `f64` + 1Mi `f32` (~12 MiB). It must stay at least
 /// `2 * METAL_ADAPT.max_sweeps`, which a `const _: () = assert!(..)` in
 /// `lib.rs` enforces at compile time.
-pub(crate) const MAX_SWEEPS: usize = 262_144;
+pub(crate) const MAX_SWEEPS: usize = 1_048_576;
 
 /// Target GPU time for one command buffer, in milliseconds.
 ///
