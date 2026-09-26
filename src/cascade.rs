@@ -115,9 +115,12 @@ impl Default for CascadeSettings {
 
 /// Gates for the chain topology `cbec1eb4` (4,577 nodes, 41,514 edges, h = 0,
 /// J = ±1) on the resident schedule at 64 reads, one sweep per beta, and
-/// reheat 0.25 (`tests/gate_trace.rs`). Each gate is the shallowest checkpoint
-/// best over 30 seeds of the chain's 100 deepest winners (-14,742 to -14,708),
-/// plus 10. Winners shallower than about -14,700 can fall outside the gates.
+/// reheat 0.25 (`tests/gate_trace.rs`). The four screening gates are the
+/// shallowest checkpoint best over 30 seeds of the chain's 100 deepest winners
+/// (-14,742 to -14,708), plus 10. The deep gates, one per doubling from 512 to
+/// 524,288, are the shallowest best among 10 seeds of the same winners that
+/// had not yet reached -14,710 but did later, plus 20. Winners shallower than
+/// about -14,700 can fall outside the gates.
 pub(crate) struct ChainGates {
     pub(crate) fingerprint: u64,
     pub(crate) stages: &'static [usize],
@@ -130,8 +133,27 @@ pub(crate) struct ChainGates {
 
 pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
     fingerprint: 0x38cd_e7d7_931d_f32f,
-    stages: &[8, 16, 64, 256],
-    gates: &[-13_252_000, -13_836_000, -14_276_000, -14_466_000],
+    stages: &[
+        8, 16, 64, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144,
+        524_288,
+    ],
+    gates: &[
+        -13_252_000,
+        -13_836_000,
+        -14_276_000,
+        -14_466_000,
+        -14_512_000,
+        -14_552_000,
+        -14_584_000,
+        -14_608_000,
+        -14_624_000,
+        -14_640_000,
+        -14_648_000,
+        -14_658_000,
+        -14_662_000,
+        -14_670_000,
+        -14_678_000,
+    ],
     min_reads: 64,
     full_sweeps: 1_048_576,
 };
@@ -1409,7 +1431,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.betas, &longer.betas));
         assert_eq!(longer.betas.len(), 2000);
         let gated = cache.prepare(&job(2, 2000), settings, true).unwrap();
-        assert_eq!(gated.checkpoints, vec![8, 16, 64, 256, 2000]);
+        assert_eq!(gated.checkpoints, vec![8, 16, 64, 256, 512, 1024, 2000]);
     }
 
     #[test]
@@ -1417,7 +1439,13 @@ mod tests {
         let mut c = Controller::new(CascadeSettings::default().effective(true));
         let start = c.stats.started;
         let (mut kept, _, _) = c.admit(&job(0, 1000));
-        for best in [-13_300_000, -13_900_000, -14_300_000, -14_500_000] {
+        for best in [
+            -13_300_000,
+            -13_900_000,
+            -14_300_000,
+            -14_500_000,
+            -14_550_000,
+        ] {
             assert!(c.checkpoint(&mut kept, best));
         }
         c.finish(&kept, Some(-14_600_000), true);

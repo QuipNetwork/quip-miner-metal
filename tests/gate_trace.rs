@@ -198,3 +198,143 @@ fn checkpoint_trace() {
         count as f64 / wall
     );
 }
+
+/// Line-buffered file writer shared by the tracing subscriber.
+#[derive(Clone)]
+struct FileLog(Arc<Mutex<std::io::BufWriter<std::fs::File>>>);
+
+impl Write for FileLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+/// A fresh population through the compiled chain gates.
+///
+/// Draws `QUIP_POP_COUNT` models on the topology of `QUIP_POP_EDGES` (a
+/// problem file) with h = 0 and J = +-1, from seeds derived from
+/// `QUIP_POP_SEED`. Every checkpoint line goes to `QUIP_POP_LOG`, and the
+/// final best of each job at or below `QUIP_POP_KEEP` (milli) goes to
+/// `QUIP_POP_OUT`.
+///
+/// ```text
+/// QUIP_POP_EDGES=problem.json QUIP_POP_LOG=pop.log QUIP_POP_OUT=pop.csv \
+///   cargo test --release --test gate_trace population_trace -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Metal device and QUIP_POP_EDGES"]
+fn population_trace() {
+    use quip_solver_core::quip_protocol::chacha8::draw_ising_milli;
+
+    let edges_path = std::env::var("QUIP_POP_EDGES").expect("QUIP_POP_EDGES");
+    let log_path = std::env::var("QUIP_POP_LOG").expect("QUIP_POP_LOG");
+    let out_path = std::env::var("QUIP_POP_OUT").expect("QUIP_POP_OUT");
+    let count: u64 = env("QUIP_POP_COUNT", 20_000);
+    let run_seed: u64 = env("QUIP_POP_SEED", 1);
+    let keep: i64 = env("QUIP_POP_KEEP", -14_400_000);
+    let feeders: u64 = env("QUIP_POP_FEEDERS", 8);
+
+    let mut log = FileLog(Arc::new(Mutex::new(std::io::BufWriter::new(
+        std::fs::File::create(&log_path).unwrap(),
+    ))));
+    let writer = log.clone();
+    tracing_subscriber::fmt()
+        .with_env_filter("quip_miner_metal::cascade_trace=debug,quip_miner_metal::cascade=info")
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .init();
+
+    let p: Problem = serde_json::from_str(&std::fs::read_to_string(&edges_path).unwrap()).unwrap();
+    let edges = Arc::new(p.edges);
+    let nodes = p.h.len();
+
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    let (out, mut results) = tokio::sync::mpsc::channel(1024);
+    let runner = std::thread::spawn(move || {
+        let device = MetalDevice::open(0).expect("Metal device 0");
+        let sampler = MetalSampler::new(device, UtilGovernor::start(0, 100, false), Kernel::Msa);
+        sampler.apply_config("cascade_open_gates = false");
+        sampler.sample_stream(rx, out, CancelToken::default());
+    });
+    let feeders: Vec<_> = (0..feeders)
+        .map(|f| {
+            let tx = tx.clone();
+            let edges = Arc::clone(&edges);
+            std::thread::spawn(move || {
+                for i in (f..count).step_by(feeders as usize) {
+                    let mut draw = [0u8; 32];
+                    for (w, word) in draw.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                        *word = seed(run_seed, i * 4 + w as u64).to_le_bytes();
+                    }
+                    let (h, j) = draw_ising_milli(draw, nodes, edges.len(), &[0], &[-1000, 1000])
+                        .expect("draw");
+                    let milli = |v: &i32| f64::from(*v) / 1000.0;
+                    let graph = IsingGraph::new(
+                        h.iter().map(milli).collect(),
+                        j.iter().map(milli).collect(),
+                        edges.to_vec(),
+                    );
+                    let job = StreamJob {
+                        job_id: format!("{run_seed}:{i}").into_bytes(),
+                        graph,
+                        params: SampleParams {
+                            num_reads: 64,
+                            num_sweeps: 256,
+                            sweeps_per_beta: 1,
+                            beta_range: None,
+                            seed: seed(run_seed ^ 0x5eed, i),
+                        },
+                        watermark: None,
+                    };
+                    if tx.blocking_send(job).is_err() {
+                        return;
+                    }
+                }
+            })
+        })
+        .collect();
+    drop(tx);
+
+    let started = std::time::Instant::now();
+    let mut file = std::fs::File::create(&out_path).unwrap();
+    writeln!(file, "job,best").unwrap();
+    let mut done = 0u64;
+    while let Some(result) = results.blocking_recv() {
+        let StreamOutcome::Completed(Ok(reads)) = result.outcome else {
+            panic!(
+                "job {} did not complete",
+                String::from_utf8_lossy(&result.job_id)
+            );
+        };
+        let best = reads.iter().map(|r| r.energy_milli).min().unwrap();
+        if best <= keep {
+            let job = String::from_utf8_lossy(&result.job_id);
+            writeln!(file, "{job},{best}").unwrap();
+        }
+        done += 1;
+        if done.is_multiple_of(100_000) {
+            eprintln!(
+                "{done} jobs, {:.0} jobs/s",
+                done as f64 / started.elapsed().as_secs_f64()
+            );
+        }
+        if done == count {
+            break;
+        }
+    }
+    for feeder in feeders {
+        feeder.join().unwrap();
+    }
+    drop(results);
+    runner.join().unwrap();
+    log.flush().unwrap();
+    let wall = started.elapsed().as_secs_f64();
+    eprintln!(
+        "{count} jobs in {wall:.1} s, {:.0} jobs/s",
+        count as f64 / wall
+    );
+}
