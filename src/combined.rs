@@ -366,7 +366,14 @@ fn eligibility(
         metal &= facts.degree_ok;
     }
     ane &= facts.in_bounds && facts.simple;
-    if ane {
+    if ane && facts.degree_ok {
+        // Nonzero couplings are a subset of the edges, so a topology within
+        // the degree limit needs only the coupling values checked.
+        ane = graph
+            .j
+            .iter()
+            .all(|&coupling| coupling == -1.0 || coupling == 0.0 || coupling == 1.0);
+    } else if ane {
         let mut ane_degree = vec![0u32; n];
         for (&(u, v), &coupling) in graph.edges.iter().zip(&graph.j) {
             if !(coupling == -1.0 || coupling == 0.0 || coupling == 1.0) {

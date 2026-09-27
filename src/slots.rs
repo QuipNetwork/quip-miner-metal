@@ -601,23 +601,7 @@ impl SlotPool {
         slots: &[SlotId],
         num_reads: usize,
     ) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
-        self.idle()?;
-        if num_reads > self.num_reads {
-            return Err(SampleError::TooLarge(
-                "read count exceeds slot capacity".into(),
-            ));
-        }
-        let graphs: Vec<_> = slots
-            .iter()
-            .map(|&slot| {
-                self.slots
-                    .get(slot)
-                    .and_then(Option::as_ref)
-                    .filter(|r| r.has_output)
-                    .map(|r| &r.job.graph)
-                    .ok_or_else(|| SampleError::Driver("slot has no checkpoint output".into()))
-            })
-            .collect::<Result<_, _>>()?;
+        let graphs = self.output_graphs(slots, num_reads)?;
         if slots.is_empty() {
             return Ok(Vec::new());
         }
@@ -692,6 +676,79 @@ impl SlotPool {
             .collect();
         sampler::audit_device_energies(&reads, &graphs)?;
         Ok(reads)
+    }
+
+    /// The lowest-energy read of each slot, one result per slot, decoding
+    /// only that read. A screened-out job needs no other read, and unpacking
+    /// all of them costs more host time than the probe costs GPU time.
+    pub(crate) fn best_reads(
+        &self,
+        slots: &[SlotId],
+        num_reads: usize,
+    ) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
+        let graphs = self.output_graphs(slots, num_reads)?;
+        if slots.is_empty() || num_reads == 0 {
+            return Ok(vec![Vec::new(); slots.len()]);
+        }
+        let packed_size = self.cached.n.div_ceil(8);
+        let sample_ptr =
+            self.read_pointer::<i8>(10, self.capacity() * self.num_reads * packed_size)?;
+        let energy_ptr = self.read_pointer::<i32>(11, self.capacity() * self.num_reads)?;
+        let reads = slots
+            .iter()
+            .map(|&slot| {
+                let offset = slot * self.num_reads;
+                // SAFETY: as in `reads_many`. The slot has completed checkpoint
+                // output, idle() excludes GPU writes, and the read range lies
+                // inside the checked buffer lengths.
+                let energies =
+                    unsafe { std::slice::from_raw_parts(energy_ptr.add(offset), num_reads) };
+                let (index, energy) = energies
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(index, &energy)| (energy, index))
+                    .map_or((0, 0), |(index, &energy)| (index, energy));
+                // SAFETY: same slot region as above, one read of packed spins.
+                let packed = unsafe {
+                    std::slice::from_raw_parts(
+                        sample_ptr.add((offset + index) * packed_size),
+                        packed_size,
+                    )
+                };
+                vec![SamplerResult {
+                    spins: unpack_slot_spins(packed, self.cached.n),
+                    energy_milli: i64::from(energy),
+                }]
+            })
+            .collect::<Vec<_>>();
+        sampler::audit_device_energies(&reads, &graphs)?;
+        Ok(reads)
+    }
+
+    /// The graph of each slot, checking that every slot holds checkpoint
+    /// output and that `num_reads` fits the slot capacity.
+    fn output_graphs(
+        &self,
+        slots: &[SlotId],
+        num_reads: usize,
+    ) -> Result<Vec<&IsingGraph>, SampleError> {
+        self.idle()?;
+        if num_reads > self.num_reads {
+            return Err(SampleError::TooLarge(
+                "read count exceeds slot capacity".into(),
+            ));
+        }
+        slots
+            .iter()
+            .map(|&slot| {
+                self.slots
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .filter(|r| r.has_output)
+                    .map(|r| &r.job.graph)
+                    .ok_or_else(|| SampleError::Driver("slot has no checkpoint output".into()))
+            })
+            .collect()
     }
 
     pub(crate) fn device_us(&self, slot: SlotId) -> u64 {
@@ -1168,6 +1225,18 @@ mod tests {
                 assert_eq!(a.energy_milli, b.energy_milli);
             }
         }
+        let best = pool.best_reads(&[2, 0], 33).unwrap();
+        for (reads, slot) in best.iter().zip([2, 0]) {
+            let lowest = dense[slot].iter().map(|r| r.energy_milli).min().unwrap();
+            let first = dense[slot]
+                .iter()
+                .find(|r| r.energy_milli == lowest)
+                .unwrap();
+            assert_eq!(reads.len(), 1);
+            assert_eq!(reads[0].energy_milli, lowest);
+            assert_eq!(reads[0].spins, first.spins);
+        }
+        pool.best_reads(&[1], 33).unwrap_err();
         assert!(pool.reads_many(&[], 33).unwrap().is_empty());
         assert!(pool.reads_many(&[0], 0).unwrap()[0].is_empty());
         pool.reads_many(&[0], 34).unwrap_err();

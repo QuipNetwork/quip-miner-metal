@@ -79,6 +79,7 @@ impl Pool {
         }
         gov.record_gpu_busy_us(busy_us);
         let mut done = Vec::with_capacity(checkpoints.len());
+        let mut screened = Vec::with_capacity(checkpoints.len());
         for checkpoint in checkpoints {
             let Some(live) = self.live[checkpoint.slot].as_mut() else {
                 continue;
@@ -91,13 +92,21 @@ impl Pool {
                 best = checkpoint.best,
                 "checkpoint"
             );
-            if checkpoint.last || !controller.checkpoint(&mut live.ticket, checkpoint.best) {
+            if checkpoint.last {
                 done.push(checkpoint.slot);
+            } else if !controller.checkpoint(&mut live.ticket, checkpoint.best) {
+                screened.push(checkpoint.slot);
             }
         }
-        // One decode across every completed/screened slot in this round.
+        // One decode across every completed slot in this round. A screened-out
+        // job is no longer a candidate, so it returns only its best read.
         let reads = self.slots.reads_many(&done, self.reads)?;
-        for (slot, reads) in done.into_iter().zip(reads) {
+        let best_reads = self.slots.best_reads(&screened, self.reads)?;
+        for (slot, reads) in done
+            .into_iter()
+            .zip(reads)
+            .chain(screened.into_iter().zip(best_reads))
+        {
             self.slots.release(slot)?;
             let Some(live) = self.live[slot].take() else {
                 continue;
@@ -1540,7 +1549,8 @@ mod tests {
             let mut received = 0;
             while let Some(result) = results.blocking_recv() {
                 match result.outcome {
-                    StreamOutcome::Completed(Ok(reads)) => assert_eq!(reads.len(), 4),
+                    // A screened-out job returns its best read, a kept one all four.
+                    StreamOutcome::Completed(Ok(reads)) => assert!(matches!(reads.len(), 1 | 4)),
                     StreamOutcome::Completed(Err(error)) => panic!("{error}"),
                     StreamOutcome::Cancelled => panic!("uncancelled stream"),
                 }

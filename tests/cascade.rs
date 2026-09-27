@@ -228,13 +228,28 @@ fn completed_reads(result: &StreamResult) -> &[quip_miner_metal::SamplerResult] 
     }
 }
 
+/// Whether `reads` is the screened-out answer for a job whose probe returned
+/// `probe`: the probe's lowest-energy read, first among ties.
+fn is_probe_best(
+    reads: &[quip_miner_metal::SamplerResult],
+    probe: &[quip_miner_metal::SamplerResult],
+) -> bool {
+    let best = probe
+        .iter()
+        .enumerate()
+        .min_by_key(|&(index, read)| (read.energy_milli, index))
+        .map(|(_, read)| read);
+    reads.len() == 1 && best == reads.first()
+}
+
+/// A kept job returns every read. A screened-out job returns only its best.
 fn assert_reads(result: &StreamResult, num_reads: usize, nodes: usize) {
     let reads = completed_reads(result);
-    assert_eq!(
-        reads.len(),
-        num_reads,
-        "job {} read count",
-        String::from_utf8_lossy(&result.job_id)
+    assert!(
+        reads.len() == num_reads || reads.len() == 1,
+        "job {} read count {} is neither {num_reads} nor 1",
+        String::from_utf8_lossy(&result.job_id),
+        reads.len()
     );
     for (index, sample) in reads.iter().enumerate() {
         assert_eq!(
@@ -592,7 +607,7 @@ fn screened_out_results_carry_probe_reads_and_kept_results_carry_full_reads() {
             assert_consensus(&graph, result);
             let probe = completed_reads(probes[&result.job_id]);
             let reads = completed_reads(result);
-            if reads == probe {
+            if is_probe_best(reads, probe) {
                 screened += 1;
             } else {
                 continued += 1;
@@ -681,7 +696,10 @@ fn default_and_removed_cascade_key_return_screened_reads() {
             let mut screened = 0;
             for result in results {
                 assert_consensus(&graph, &result);
-                if completed_reads(&result) == completed_reads(probes[&result.job_id]) {
+                if is_probe_best(
+                    completed_reads(&result),
+                    completed_reads(probes[&result.job_id]),
+                ) {
                     screened += 1;
                 }
             }
