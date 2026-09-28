@@ -542,10 +542,6 @@ impl Controller {
     }
 
     /// The session target for admitted lease units. A change resets the yield check.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "lease generation supplies the session target")
-    )]
     pub(crate) fn set_target(&mut self, target_milli: Option<i64>) {
         if target_milli == self.target_milli {
             return;

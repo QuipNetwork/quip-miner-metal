@@ -240,6 +240,8 @@ pub struct MetalSampler {
     kernel: Kernel,
     cascade: std::sync::Mutex<cascade::CascadeSettings>,
     controller: std::sync::Mutex<Option<cascade::Controller>>,
+    salts_tx: std::sync::mpsc::SyncSender<resident::Salt>,
+    salts_rx: std::sync::Mutex<std::sync::mpsc::Receiver<resident::Salt>>,
 }
 
 impl std::fmt::Debug for MetalSampler {
@@ -295,12 +297,17 @@ impl MetalSampler {
         gov: crate::iokit_gov::UtilGovernor,
         kernel: Kernel,
     ) -> Self {
+        let (salts_tx, salts_rx) = std::sync::mpsc::sync_channel(resident::PREP_BOUND);
+        let intake: resident::Intake = (salts_tx, std::sync::Mutex::new(salts_rx));
+        let (salts_tx, salts_rx) = intake;
         Self {
             device,
             gov,
             kernel,
             cascade: std::sync::Mutex::new(cascade::CascadeSettings::default()),
             controller: std::sync::Mutex::new(None),
+            salts_tx,
+            salts_rx,
         }
     }
 
@@ -313,6 +320,71 @@ impl MetalSampler {
 }
 
 impl quip_solver_core::Sampler for MetalSampler {
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        topology: &quip_solver_core::quip_protocol::lease::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), quip_solver_core::SampleError> {
+        if self.kernel != Kernel::Msa {
+            return Err(quip_solver_core::SampleError::DeviceFault(
+                "local lease generation needs the MSA kernel".into(),
+            ));
+        }
+        let topology = std::sync::Arc::new(topology.clone());
+        let (reply, outcomes) = std::sync::mpsc::channel();
+        let window = resident::PREP_BOUND as u64;
+        let (mut next, mut open) = (0u64, 0u64);
+        while !sink.is_stopped() && (next < lease.salt_count() || open > 0) {
+            while open < window && next < lease.salt_count() {
+                let mut salt = resident::Salt {
+                    topology: std::sync::Arc::clone(&topology),
+                    nonce: lease.nonce(next),
+                    index: next,
+                    params: params.clone(),
+                    watermark: None,
+                    target_milli: sink.target_energy_milli(),
+                    reply: reply.clone(),
+                };
+                loop {
+                    if sink.is_stopped() {
+                        return Ok(());
+                    }
+                    match self.salts_tx.try_send(salt) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Ok(()),
+                        Err(std::sync::mpsc::TrySendError::Full(waiting)) => {
+                            salt = waiting;
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                }
+                next += 1;
+                open += 1;
+            }
+            let Ok(outcome) = outcomes.recv_timeout(std::time::Duration::from_millis(5)) else {
+                continue;
+            };
+            open -= 1;
+            let reported = match outcome {
+                resident::SaltOutcome::Screened {
+                    index,
+                    energy_milli,
+                } => sink.screen(index, energy_milli),
+                resident::SaltOutcome::Survived { index, reads } => sink.push(index, reads),
+                resident::SaltOutcome::Dropped { index } => {
+                    tracing::debug!(index, "lease salt dropped before reporting");
+                    Ok(())
+                }
+            };
+            if reported.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn sample(
         &self,
         graph: &IsingGraph,
@@ -343,6 +415,10 @@ impl quip_solver_core::Sampler for MetalSampler {
                 &self.cascade,
                 &self.controller,
                 jobs,
+                &self
+                    .salts_rx
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()),
                 &out,
                 &self.gov,
                 &cancel,
@@ -453,6 +529,20 @@ pub struct TaggedSampler<A: KernelTag> {
 }
 
 impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
+    fn generates_locally() -> bool {
+        A::KERNEL == Kernel::Msa
+    }
+
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        topology: &quip_solver_core::quip_protocol::lease::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), quip_solver_core::SampleError> {
+        self.inner.sample_lease(lease, topology, params, sink)
+    }
+
     fn sample(
         &self,
         graph: &IsingGraph,

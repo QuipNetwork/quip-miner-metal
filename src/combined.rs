@@ -41,6 +41,7 @@ pub(crate) struct CombinedSampler {
     metal: OnceLock<Result<MetalSampler, String>>,
     ane: Mutex<Option<Result<Arc<AneSampler>, String>>>,
     edge_facts: Mutex<EdgeFactsCache>,
+    salts_waiting: AtomicBool,
 }
 
 impl CombinedSampler {
@@ -59,6 +60,7 @@ impl CombinedSampler {
             cascade: Mutex::new(crate::cascade::CascadeSettings::default()),
             ane: Mutex::new(None),
             edge_facts: Mutex::new(EdgeFactsCache::default()),
+            salts_waiting: AtomicBool::new(false),
         }
     }
 
@@ -128,6 +130,17 @@ impl CombinedSampler {
 }
 
 impl Sampler for CombinedSampler {
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        topology: &quip_solver_core::quip_protocol::lease::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), SampleError> {
+        self.salts_waiting.store(true, Ordering::Release);
+        self.metal()?.sample_lease(lease, topology, params, sink)
+    }
+
     fn sample(
         &self,
         graph: &IsingGraph,
@@ -413,7 +426,7 @@ impl StreamEngine for MetalEngine<'_> {
         stop: &AtomicBool,
     ) {
         // Wait without consuming the seed: the existing batching loop owns it.
-        while jobs.is_empty() {
+        while jobs.is_empty() && !self.0.salts_waiting.load(Ordering::Acquire) {
             if jobs.is_closed() || stop.load(Ordering::Acquire) {
                 return;
             }

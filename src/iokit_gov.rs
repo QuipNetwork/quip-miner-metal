@@ -202,6 +202,7 @@ impl UtilGovernor {
     pub fn stop(&mut self) {
         self.knobs.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
+            h.thread().unpark();
             // A panicking poll thread is not fatal: the governor's whole
             // contract is to degrade to util 0 (see the module docs), which is
             // what a dead thread produces anyway — `last_util` simply stops
@@ -270,7 +271,8 @@ fn poll_loop(_device_index: u32, knobs: &Knobs) {
         } else {
             REPORTING_POLL
         };
-        thread::sleep(interval);
+        // stop() leaves a wake token even if it races with entering this wait.
+        thread::park_timeout(interval);
     }
 }
 
@@ -548,6 +550,21 @@ mod tests {
         let mut gov = UtilGovernor::start(0, 100, false);
         assert!(!gov.should_throttle());
         gov.stop();
+    }
+
+    #[test]
+    fn stop_wakes_the_reporting_poller() {
+        let mut gov = UtilGovernor::start(0, 100, false);
+        gov.record_gpu_busy_us(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // A drained report proves the poller has entered its sampling loop.
+        while gov.knobs.busy_us.load(Ordering::Relaxed) != 0 {
+            assert!(Instant::now() < deadline, "poller did not sample");
+            thread::yield_now();
+        }
+        let started = Instant::now();
+        gov.stop();
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// Utilization reporting must not depend on `yielding`: `Status.utilization`

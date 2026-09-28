@@ -10,9 +10,11 @@ use crate::cascade::{
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, Kernel, SampleError};
 use crate::slots::{Edges, PreparedInputs, SlotPool};
-use crate::streaming::{batch_size_for_reads, scale_budget, send_reject, GpuGovernor};
+use crate::streaming::{batch_size_for_reads, scale_budget, GpuGovernor};
 use crate::topology::SelfFeedingTopology;
-use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
+use quip_solver_core::{
+    CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
+};
 use std::collections::VecDeque;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,8 +23,123 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 struct Live {
     job: StreamJob,
+    origin: Origin,
     ticket: Ticket,
     accounted_us: u64,
+}
+
+pub(crate) enum SaltOutcome {
+    Screened {
+        index: u64,
+        energy_milli: i64,
+    },
+    Survived {
+        index: u64,
+        reads: Vec<SamplerResult>,
+    },
+    Dropped {
+        index: u64,
+    },
+}
+
+pub(crate) struct Salt {
+    pub(crate) topology: Arc<quip_solver_core::quip_protocol::lease::TopologyView>,
+    pub(crate) nonce: [u8; 32],
+    pub(crate) index: u64,
+    pub(crate) params: SampleParams,
+    pub(crate) watermark: Option<u64>,
+    pub(crate) target_milli: Option<i64>,
+    pub(crate) reply: mpsc::Sender<SaltOutcome>,
+}
+
+pub(crate) type Intake = (mpsc::SyncSender<Salt>, Mutex<mpsc::Receiver<Salt>>);
+
+pub(crate) enum Source {
+    Job(StreamJob),
+    Salt(Salt),
+}
+
+enum Origin {
+    Stream,
+    Salt {
+        index: u64,
+        target_milli: Option<i64>,
+        reply: mpsc::Sender<SaltOutcome>,
+    },
+}
+
+enum Answer {
+    Reads(Vec<SamplerResult>),
+    Screened(i64),
+    Cancelled,
+    Failed(quip_solver_core::SampleError),
+}
+
+fn answer(
+    out: &Sender<StreamResult>,
+    origin: Origin,
+    job: StreamJob,
+    outcome: Answer,
+    device_access_time_us: u64,
+) -> bool {
+    match origin {
+        Origin::Stream => {
+            let outcome = match outcome {
+                Answer::Reads(reads) => StreamOutcome::Completed(Ok(reads)),
+                Answer::Screened(_) => {
+                    debug_assert!(false, "stream jobs cannot be screened");
+                    StreamOutcome::Completed(Ok(Vec::new()))
+                }
+                Answer::Cancelled => StreamOutcome::Cancelled,
+                Answer::Failed(error) => StreamOutcome::Completed(Err(error)),
+            };
+            out.blocking_send(StreamResult {
+                job_id: job.job_id,
+                outcome,
+                device_access_time_us,
+            })
+            .is_ok()
+        }
+        Origin::Salt { index, reply, .. } => {
+            let outcome = match outcome {
+                Answer::Reads(reads) => SaltOutcome::Survived { index, reads },
+                Answer::Screened(energy_milli) => SaltOutcome::Screened {
+                    index,
+                    energy_milli,
+                },
+                Answer::Cancelled | Answer::Failed(_) => SaltOutcome::Dropped { index },
+            };
+            reply.send(outcome).is_ok()
+        }
+    }
+}
+
+fn salt_job(salt: &Salt) -> Result<StreamJob, SampleError> {
+    let (h, j) = salt
+        .topology
+        .draw(salt.nonce)
+        .map_err(|error| SampleError::Driver(format!("lease draw: {error}")))?;
+    let to_units = |values: Vec<i32>| {
+        values
+            .into_iter()
+            .map(|value| f64::from(value) / 1000.0)
+            .collect()
+    };
+    let mut params = salt.params.clone();
+    params.seed = salt_seed(salt.index);
+    Ok(StreamJob {
+        job_id: salt.index.to_le_bytes().to_vec(),
+        graph: IsingGraph::new(to_units(h), to_units(j), salt.topology.edges.clone()),
+        params,
+        watermark: salt.watermark,
+    })
+}
+
+fn salt_seed(index: u64) -> u64 {
+    use std::hash::BuildHasher;
+    static KEYS: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default).hash_one(index).max(1)
 }
 
 struct Pool {
@@ -68,13 +185,9 @@ impl Pool {
             live.accounted_us = us;
             if cancel.is_cancelled(live.job.watermark) {
                 self.slots.release(slot)?;
-                let _ = out.blocking_send(StreamResult {
-                    job_id: live.job.job_id.clone(),
-                    outcome: StreamOutcome::Cancelled,
-                    device_access_time_us: us,
-                });
+                let Some(live) = entry.take() else { continue };
+                let _ = answer(out, live.origin, live.job, Answer::Cancelled, us);
                 controller.finish(&live.ticket, None, false);
-                *entry = None;
             }
         }
         gov.record_gpu_busy_us(busy_us);
@@ -91,11 +204,29 @@ impl Pool {
                 best = checkpoint.best,
                 "checkpoint"
             );
-            if checkpoint.last || !controller.checkpoint(&mut live.ticket, checkpoint.best) {
+            let target_milli = match &live.origin {
+                Origin::Stream => None,
+                Origin::Salt { target_milli, .. } => *target_milli,
+            };
+            controller.set_target(target_milli);
+            if checkpoint.last {
                 done.push(checkpoint.slot);
+            } else if !controller.checkpoint(&mut live.ticket, checkpoint.best) {
+                let Some(live) = self.live[checkpoint.slot].take() else {
+                    continue;
+                };
+                self.slots.release(checkpoint.slot)?;
+                let delivered = answer(
+                    out,
+                    live.origin,
+                    live.job,
+                    Answer::Screened(checkpoint.best),
+                    live.accounted_us,
+                );
+                controller.finish(&live.ticket, Some(checkpoint.best), delivered);
             }
         }
-        // One decode across every completed/screened slot in this round.
+        // Decode only completed slots; screened slots are released above.
         let reads = self.slots.reads_many(&done, self.reads)?;
         for (slot, reads) in done.into_iter().zip(reads) {
             self.slots.release(slot)?;
@@ -109,17 +240,17 @@ impl Pool {
                 reads.iter().map(|r| r.energy_milli).min()
             };
             // bh1.3.7: StreamResult needs sweeps_done to report the actual checkpoint position.
-            let delivered = out
-                .blocking_send(StreamResult {
-                    job_id: live.job.job_id,
-                    outcome: if cancelled {
-                        StreamOutcome::Cancelled
-                    } else {
-                        StreamOutcome::Completed(Ok(reads))
-                    },
-                    device_access_time_us: live.accounted_us,
-                })
-                .is_ok();
+            let delivered = answer(
+                out,
+                live.origin,
+                live.job,
+                if cancelled {
+                    Answer::Cancelled
+                } else {
+                    Answer::Reads(reads)
+                },
+                live.accounted_us,
+            );
             controller.finish(&live.ticket, best, delivered && !cancelled);
         }
         Ok(busy_us)
@@ -144,6 +275,7 @@ fn validate(job: &StreamJob) -> Result<(), SampleError> {
 
 pub(crate) struct Prepared {
     pub(crate) job: StreamJob,
+    origin: Origin,
     /// None selects the non-slot path, including direct empty-graph answers.
     pub(crate) data: Result<Option<PreparedData>, SampleError>,
 }
@@ -248,7 +380,7 @@ impl Preparer {
 }
 
 struct Work {
-    job: StreamJob,
+    source: Source,
     settings: CascadeSettings,
     screen: bool,
     reply: mpsc::SyncSender<Prepared>,
@@ -302,9 +434,9 @@ impl Preparation {
                     loop {
                         let request = rx.recv();
                         let Ok(Work {
-                            mut job,
+                            source,
                             settings,
-                            screen,
+                            screen: work_screen,
                             reply,
                         }) = request
                         else {
@@ -312,13 +444,43 @@ impl Preparation {
                         };
                         // Keep ownership of the job outside unwinding so a failed
                         // worker still returns it to the runner exactly once.
-                        let data = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            preparer.prepare(&mut job, settings, screen)
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err(SampleError::Driver("job preparation panicked".into()))
+                        let (mut job, origin, screen, initial_data) = match source {
+                            Source::Job(job) => (job, Origin::Stream, work_screen, None),
+                            Source::Salt(salt) => {
+                                let origin = Origin::Salt {
+                                    index: salt.index,
+                                    target_milli: salt.target_milli,
+                                    reply: salt.reply.clone(),
+                                };
+                                match salt_job(&salt) {
+                                    Ok(job) => (job, origin, work_screen, None),
+                                    Err(error) => (
+                                        StreamJob {
+                                            job_id: salt.index.to_le_bytes().to_vec(),
+                                            graph: IsingGraph::new(
+                                                Vec::new(),
+                                                Vec::new(),
+                                                Vec::new(),
+                                            ),
+                                            params: salt.params,
+                                            watermark: salt.watermark,
+                                        },
+                                        origin,
+                                        work_screen,
+                                        Some(Err(error)),
+                                    ),
+                                }
+                            }
+                        };
+                        let data = initial_data.unwrap_or_else(|| {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                preparer.prepare(&mut job, settings, screen)
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(SampleError::Driver("job preparation panicked".into()))
+                            })
                         });
-                        let _ = reply.send(Prepared { job, data });
+                        let _ = reply.send(Prepared { job, origin, data });
                     }
                 })
                 .map_err(|error| {
@@ -334,20 +496,60 @@ impl Preparation {
         self.ready.len()
     }
 
-    fn fill(&mut self, jobs: &mut Receiver<StreamJob>, settings: CascadeSettings, eof: &mut bool) {
-        while self.len() < PREP_BOUND && !*eof {
-            match jobs.try_recv() {
-                Ok(job) => self.submit(job, settings, false),
-                Err(TryRecvError::Disconnected) => *eof = true,
-                Err(TryRecvError::Empty) => break,
-            }
+    fn fill(
+        &mut self,
+        jobs: &mut Receiver<StreamJob>,
+        salts: &mpsc::Receiver<Salt>,
+        settings: CascadeSettings,
+        eof: &mut bool,
+        prefer_salt: &mut bool,
+    ) {
+        while self.len() < PREP_BOUND {
+            let source = if *prefer_salt {
+                salts.try_recv().ok().map(Source::Salt).or_else(|| {
+                    if *eof {
+                        None
+                    } else {
+                        match jobs.try_recv() {
+                            Ok(job) => Some(Source::Job(job)),
+                            Err(TryRecvError::Disconnected) => {
+                                *eof = true;
+                                None
+                            }
+                            Err(TryRecvError::Empty) => None,
+                        }
+                    }
+                })
+            } else if !*eof {
+                match jobs.try_recv() {
+                    Ok(job) => Some(Source::Job(job)),
+                    Err(TryRecvError::Disconnected) => {
+                        *eof = true;
+                        salts.try_recv().ok().map(Source::Salt)
+                    }
+                    Err(TryRecvError::Empty) => salts.try_recv().ok().map(Source::Salt),
+                }
+            } else {
+                salts.try_recv().ok().map(Source::Salt)
+            };
+            let Some(source) = source else { break };
+            *prefer_salt = match source {
+                Source::Job(_) => true,
+                Source::Salt(_) => false,
+            };
+            self.submit(source, settings);
         }
     }
 
-    pub(crate) fn submit(&mut self, job: StreamJob, settings: CascadeSettings, screen: bool) {
+    pub(crate) fn submit(&mut self, source: Source, settings: CascadeSettings) {
+        let screen = match &source {
+            Source::Job(_) => false,
+            Source::Salt(_) => true,
+        };
+
         let (reply, result) = mpsc::sync_channel(1);
         let work = Work {
-            job,
+            source,
             settings,
             screen,
             reply,
@@ -357,10 +559,18 @@ impl Preparation {
         let tx = &self.requests[self.next_worker];
         self.next_worker = (self.next_worker + 1) % self.requests.len();
         if let Err(mpsc::SendError(work)) = tx.send(work) {
-            let _ = work.reply.send(Prepared {
-                job: work.job,
-                data: Err(SampleError::Driver("preparation workers stopped".into())),
-            });
+            match work.source {
+                Source::Job(job) => {
+                    let _ = work.reply.send(Prepared {
+                        job,
+                        origin: Origin::Stream,
+                        data: Err(SampleError::Driver("preparation workers stopped".into())),
+                    });
+                }
+                Source::Salt(salt) => {
+                    let _ = salt.reply.send(SaltOutcome::Dropped { index: salt.index });
+                }
+            }
         }
         self.ready.push_back(result);
     }
@@ -383,36 +593,38 @@ impl Drop for Preparation {
 
 fn reject_or_cancel(
     out: &Sender<StreamResult>,
+    origin: Origin,
     job: StreamJob,
     error: &SampleError,
     cancel: &CancelToken,
 ) {
-    let _ = out.blocking_send(StreamResult {
-        job_id: job.job_id,
-        outcome: if cancel.is_cancelled(job.watermark) {
-            StreamOutcome::Cancelled
-        } else {
-            StreamOutcome::Completed(Err(error.to_sample_error()))
-        },
-        device_access_time_us: 0,
-    });
+    let outcome = if cancel.is_cancelled(job.watermark) {
+        Answer::Cancelled
+    } else {
+        Answer::Failed(error.to_sample_error())
+    };
+    let _ = answer(out, origin, job, outcome, 0);
 }
 
 fn reject_tail(
-    pending: Option<StreamJob>,
+    pending: Option<Prepared>,
     jobs: &mut Receiver<StreamJob>,
+    salts: &mpsc::Receiver<Salt>,
     out: &Sender<StreamResult>,
     error: &SampleError,
     cancel: &CancelToken,
 ) {
     jobs.close();
-    if let Some(job) = pending {
-        reject_or_cancel(out, job, error, cancel);
+    if let Some(prepared) = pending {
+        reject_or_cancel(out, prepared.origin, prepared.job, error, cancel);
     }
     // close() revokes new reservations, but existing permits may still send.
     // None means both buffered jobs and outstanding permits have drained.
     while let Some(job) = jobs.blocking_recv() {
-        reject_or_cancel(out, job, error, cancel);
+        reject_or_cancel(out, Origin::Stream, job, error, cancel);
+    }
+    while let Ok(salt) = salts.try_recv() {
+        let _ = salt.reply.send(SaltOutcome::Dropped { index: salt.index });
     }
 }
 
@@ -420,26 +632,22 @@ fn reject_preparation(
     preparation: &mut Preparation,
     pending: Option<Prepared>,
     jobs: &mut Receiver<StreamJob>,
+    salts: &mpsc::Receiver<Salt>,
     out: &Sender<StreamResult>,
     error: &SampleError,
     cancel: &CancelToken,
 ) {
     jobs.close();
     while let Some(prepared) = preparation.next() {
-        reject_or_cancel(out, prepared.job, error, cancel);
+        reject_or_cancel(out, prepared.origin, prepared.job, error, cancel);
     }
-    reject_tail(
-        pending.map(|prepared| prepared.job),
-        jobs,
-        out,
-        error,
-        cancel,
-    );
+    reject_tail(pending, jobs, salts, out, error, cancel);
 }
 
 fn run_fallback(
     device: &MetalDevice,
     job: StreamJob,
+    origin: Origin,
     out: &Sender<StreamResult>,
     gov: &dyn GpuGovernor,
     cancel: &CancelToken,
@@ -476,15 +684,15 @@ fn run_fallback(
         Err(SampleError::Driver(message)) => Some(SampleError::Driver(message.clone())),
         Err(SampleError::Metal(error)) => Some(SampleError::Driver(error.to_string())),
     };
-    let _ = out.blocking_send(StreamResult {
-        job_id: job.job_id,
-        outcome: if out.is_closed() || cancel.is_cancelled(job.watermark) {
-            StreamOutcome::Cancelled
-        } else {
-            StreamOutcome::Completed(result.map_err(|error| error.to_sample_error()))
-        },
-        device_access_time_us,
-    });
+    let outcome = if out.is_closed() || cancel.is_cancelled(job.watermark) {
+        Answer::Cancelled
+    } else {
+        match result {
+            Ok(reads) => Answer::Reads(reads),
+            Err(error) => Answer::Failed(error.to_sample_error()),
+        }
+    };
+    let _ = answer(out, origin, job, outcome, device_access_time_us);
     match fault {
         Some(error) => Err(error),
         None => Ok(()),
@@ -492,11 +700,16 @@ fn run_fallback(
 }
 
 /// Run on the sampler's blocking thread; no Metal object leaves this thread.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner receives independent channels and device services"
+)]
 pub(crate) fn run(
     device: &MetalDevice,
     settings: &Mutex<CascadeSettings>,
     store: &Mutex<Option<Controller>>,
     mut jobs: Receiver<StreamJob>,
+    salts: &mpsc::Receiver<Salt>,
     out: &Sender<StreamResult>,
     gov: &dyn GpuGovernor,
     cancel: &CancelToken,
@@ -512,7 +725,7 @@ pub(crate) fn run(
         Ok(preparation) => preparation,
         Err(error) => {
             jobs.close();
-            reject_tail(None, &mut jobs, out, &error, cancel);
+            reject_tail(None, &mut jobs, salts, out, &error, cancel);
             *store.lock().unwrap_or_else(|p| p.into_inner()) = Some(controller);
             return;
         }
@@ -520,6 +733,7 @@ pub(crate) fn run(
     let mut pools: Option<[Pool; 2]> = None;
     let mut pending = None;
     let mut eof = false;
+    let mut prefer_salt = true;
     let mut turn = 0;
     let mut window = Instant::now();
     let mut busy_us = 0u64;
@@ -529,7 +743,7 @@ pub(crate) fn run(
         if out.is_closed() {
             break;
         }
-        preparation.fill(&mut jobs, config, &mut eof);
+        preparation.fill(&mut jobs, salts, config, &mut eof, &mut prefer_salt);
         if let Some(pools) = &mut pools {
             match pools[turn].harvest(&mut controller, out, cancel, gov) {
                 Ok(us) => busy_us = busy_us.saturating_add(us),
@@ -569,7 +783,7 @@ pub(crate) fn run(
                 // Refill as admissions consume replies. The preparation bound
                 // must not cap slot occupancy for small read counts or a larger
                 // configured threadgroup budget.
-                preparation.fill(&mut jobs, config, &mut eof);
+                preparation.fill(&mut jobs, salts, config, &mut eof, &mut prefer_salt);
                 let full = pools.as_ref().is_some_and(|ps| {
                     let pool = &ps[turn];
                     pool.slots.live() >= scale_budget(pool.slots.capacity(), gov.budget_scale())
@@ -582,20 +796,22 @@ pub(crate) fn run(
             let Some(prepared) = pending.take() else {
                 break;
             };
-            let Prepared { job, data } = prepared;
+            let Prepared { job, origin, data } = prepared;
             if cancel.is_cancelled(job.watermark) {
-                let _ = out.blocking_send(StreamResult {
-                    job_id: job.job_id,
-                    outcome: StreamOutcome::Cancelled,
-                    device_access_time_us: 0,
-                });
+                let _ = answer(out, origin, job, Answer::Cancelled, 0);
                 continue;
             }
             let mut data = match data {
                 Ok(Some(data)) => data,
                 Ok(None) => {
                     if job.graph.num_nodes() == 0 {
-                        crate::streaming::answer_empty(out, job);
+                        let reads = (0..job.params.num_reads.max(1))
+                            .map(|_| SamplerResult {
+                                spins: Vec::new(),
+                                energy_milli: 0,
+                            })
+                            .collect();
+                        let _ = answer(out, origin, job, Answer::Reads(reads), 0);
                         continue;
                     }
                     // Run on the Metal-owning runner only after live slots drain,
@@ -603,12 +819,13 @@ pub(crate) fn run(
                     if !empty {
                         pending = Some(Prepared {
                             job,
+                            origin,
                             data: Ok(None),
                         });
                         break;
                     }
                     let started = Instant::now();
-                    let result = run_fallback(device, job, out, gov, cancel);
+                    let result = run_fallback(device, job, origin, out, gov, cancel);
                     // Fallback time belongs to the governor, not cascade load.
                     window += started.elapsed();
                     if let Err(error) = result {
@@ -618,7 +835,7 @@ pub(crate) fn run(
                     continue;
                 }
                 Err(error) => {
-                    send_reject(out, job, error.to_sample_error());
+                    reject_or_cancel(out, origin, job, &error, cancel);
                     continue;
                 }
             };
@@ -627,6 +844,7 @@ pub(crate) fn run(
                 if !empty {
                     pending = Some(Prepared {
                         job,
+                        origin,
                         data: Ok(Some(data)),
                     });
                     break;
@@ -643,17 +861,22 @@ pub(crate) fn run(
                         pools = Some(rebuilt);
                     }
                     Err(error) => {
-                        send_reject(out, job, error.to_sample_error());
+                        reject_or_cancel(out, origin, job, &error, cancel);
                         continue;
                     }
                 }
             }
             let Some(pools) = &mut pools else { continue };
             let pool = &mut pools[turn];
+            let target_milli = match &origin {
+                Origin::Stream => None,
+                Origin::Salt { target_milli, .. } => *target_milli,
+            };
+            controller.set_target(target_milli);
             let ticket = match controller.admit_prepared(&job, &mut data.schedule, &edges) {
                 Ok(ticket) => ticket,
                 Err(error) => {
-                    send_reject(out, job, error.to_sample_error());
+                    reject_or_cancel(out, origin, job, &error, cancel);
                     continue;
                 }
             };
@@ -667,13 +890,14 @@ pub(crate) fn run(
                 Ok(slot) => {
                     pool.live[slot] = Some(Live {
                         job,
+                        origin,
                         ticket,
                         accounted_us: 0,
                     })
                 }
                 Err(error) => {
                     controller.finish(&ticket, None, false);
-                    send_reject(out, job, error.to_sample_error());
+                    reject_or_cancel(out, origin, job, &error, cancel);
                 }
             }
         }
@@ -714,13 +938,15 @@ pub(crate) fn run(
             for live in pool.live.iter_mut().filter_map(Option::take) {
                 controller.finish(&live.ticket, None, false);
                 if let Some(error) = &fault {
-                    send_reject(out, live.job, error.to_sample_error());
+                    reject_or_cancel(out, live.origin, live.job, error, cancel);
                 } else {
-                    let _ = out.blocking_send(StreamResult {
-                        job_id: live.job.job_id,
-                        outcome: StreamOutcome::Cancelled,
-                        device_access_time_us: live.accounted_us,
-                    });
+                    let _ = answer(
+                        out,
+                        live.origin,
+                        live.job,
+                        Answer::Cancelled,
+                        live.accounted_us,
+                    );
                 }
             }
         }
@@ -733,7 +959,15 @@ pub(crate) fn run(
     // one terminal send attempt, and workers never send stream results.
     let error =
         fault.unwrap_or_else(|| SampleError::Driver("resident result receiver closed".into()));
-    reject_preparation(&mut preparation, pending, &mut jobs, out, &error, cancel);
+    reject_preparation(
+        &mut preparation,
+        pending,
+        &mut jobs,
+        salts,
+        out,
+        &error,
+        cancel,
+    );
     *store.lock().unwrap_or_else(|p| p.into_inner()) = Some(controller);
 }
 
@@ -746,6 +980,104 @@ mod tests {
     use quip_solver_core::Sampler;
 
     #[test]
+    fn mixed_intake_screens_salts_preserves_survivors_and_drops_draw_errors() {
+        let device = MetalDevice::open(0).unwrap();
+        let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
+        let topology = Arc::new(quip_solver_core::quip_protocol::lease::TopologyView {
+            num_nodes: 2,
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![-1000],
+        });
+        let (reply, outcomes) = mpsc::channel();
+        let (salts_tx, salts) = mpsc::sync_channel(PREP_BOUND);
+        for index in 0..3 {
+            let topology = if index == 2 {
+                let mut invalid = (*topology).clone();
+                invalid.allowed_h_milli.clear();
+                Arc::new(invalid)
+            } else {
+                Arc::clone(&topology)
+            };
+            salts_tx
+                .send(Salt {
+                    topology,
+                    nonce: [0; 32],
+                    index,
+                    params: SampleParams {
+                        num_reads: 4,
+                        num_sweeps: 16,
+                        ..Default::default()
+                    },
+                    watermark: None,
+                    target_milli: Some(if index == 1 { i64::MAX } else { -1_000_000 }),
+                    reply: reply.clone(),
+                })
+                .unwrap();
+        }
+        let (tx, jobs) = tokio::sync::mpsc::channel(1);
+        tx.try_send(job(100, 16)).unwrap();
+        drop(tx);
+        let (out, mut results) = tokio::sync::mpsc::channel(1);
+        let mut settings = CascadeSettings {
+            stages: stage_array(&[8]),
+            ..Default::default()
+        };
+        settings.gates[0] = Some(-1_000_000);
+        run(
+            &device,
+            &Mutex::new(settings),
+            &Mutex::new(None),
+            jobs,
+            &salts,
+            &out,
+            &gov,
+            &CancelToken::default(),
+        );
+        let mut seen = [false; 3];
+        for _ in 0..3 {
+            let index = match outcomes.try_recv().unwrap() {
+                SaltOutcome::Screened {
+                    index,
+                    energy_milli,
+                } => {
+                    assert_eq!(index, 0);
+                    assert!((-1000..=1000).contains(&energy_milli));
+                    index
+                }
+                SaltOutcome::Survived { index, reads } => {
+                    assert_eq!(index, 1);
+                    assert_eq!(reads.len(), 4);
+                    for read in reads {
+                        assert_eq!(read.spins.len(), 2);
+                        assert_eq!(
+                            read.energy_milli,
+                            -1000 * i64::from(read.spins[0]) * i64::from(read.spins[1])
+                        );
+                    }
+                    index
+                }
+                SaltOutcome::Dropped { index } => {
+                    assert_eq!(index, 2);
+                    index
+                }
+            };
+            assert!(!seen[index as usize]);
+            seen[index as usize] = true;
+        }
+        assert_eq!(seen, [true; 3]);
+        assert!(outcomes.try_recv().is_err());
+        let result = results.try_recv().unwrap();
+        assert_eq!(result.job_id, 100usize.to_le_bytes());
+        match result.outcome {
+            StreamOutcome::Completed(Ok(reads)) => assert_eq!(reads.len(), 4),
+            StreamOutcome::Completed(Err(error)) => panic!("{error}"),
+            StreamOutcome::Cancelled => panic!("plain job was cancelled"),
+        }
+        assert!(results.try_recv().is_err());
+    }
+
+    #[test]
     fn shutdown_drains_a_permit_held_across_close() {
         let (tx, mut jobs) = tokio::sync::mpsc::channel(2);
         let permit = tx.clone().try_reserve_owned().unwrap();
@@ -753,9 +1085,15 @@ mod tests {
         let (finished, completion) = mpsc::channel();
         let cleanup = std::thread::spawn(move || {
             jobs.close();
+            let (_salts_tx, salts) = mpsc::channel();
             reject_tail(
-                Some(job(0, 32)),
+                Some(Prepared {
+                    job: job(0, 32),
+                    origin: Origin::Stream,
+                    data: Ok(None),
+                }),
                 &mut jobs,
+                &salts,
                 &out,
                 &SampleError::Driver("injected fault".into()),
                 &CancelToken::default(),
@@ -784,7 +1122,7 @@ mod tests {
     fn preparation_workers_share_schedule_and_edge_storage() {
         let mut preparation = Preparation::new().unwrap();
         for index in 0..PREP_WORKERS {
-            preparation.submit(job(index, 32), CascadeSettings::default(), false);
+            preparation.submit(Source::Job(job(index, 32)), CascadeSettings::default());
         }
         let first = preparation.next().unwrap().data.unwrap().unwrap();
         for _ in 1..PREP_WORKERS {
@@ -901,14 +1239,13 @@ mod tests {
         loop {
             while submitted < 4000 && preparation.len() < PREP_BOUND {
                 preparation.submit(
-                    StreamJob {
+                    Source::Job(StreamJob {
                         job_id: submitted.to_le_bytes().to_vec(),
                         graph: job.graph.clone(),
                         params: job.params.clone(),
                         watermark: None,
-                    },
+                    }),
                     settings,
-                    false,
                 );
                 submitted += 1;
             }
@@ -977,13 +1314,27 @@ mod tests {
         drop(tx);
         let mut preparation = Preparation::new().unwrap();
         let mut eof = false;
-        preparation.fill(&mut jobs, CascadeSettings::default(), &mut eof);
+        let (_salts_tx, salts) = mpsc::channel();
+        let mut prefer_salt = false;
+        preparation.fill(
+            &mut jobs,
+            &salts,
+            CascadeSettings::default(),
+            &mut eof,
+            &mut prefer_salt,
+        );
         assert_eq!(preparation.len(), PREP_BOUND);
         assert_eq!(jobs.len(), count - PREP_BOUND);
         for id in 0..count {
             let prepared = preparation.next().unwrap();
             assert_eq!(prepared.job.job_id, id.to_le_bytes());
-            preparation.fill(&mut jobs, CascadeSettings::default(), &mut eof);
+            preparation.fill(
+                &mut jobs,
+                &salts,
+                CascadeSettings::default(),
+                &mut eof,
+                &mut prefer_salt,
+            );
             assert!(preparation.len() <= PREP_BOUND);
         }
         assert!(eof);
@@ -996,16 +1347,18 @@ mod tests {
         let runner = std::thread::spawn(move || {
             let mut preparation = Preparation::new().unwrap();
             for id in 0..PREP_BOUND {
-                preparation.submit(job(id, 32), CascadeSettings::default(), false);
+                preparation.submit(Source::Job(job(id, 32)), CascadeSettings::default());
             }
             let (tx, mut jobs) = tokio::sync::mpsc::channel(1);
             tx.try_send(job(PREP_BOUND, 32)).unwrap();
             let (out, results) = tokio::sync::mpsc::channel(1);
             drop(results);
+            let (_salts_tx, salts) = mpsc::channel();
             reject_preparation(
                 &mut preparation,
                 None,
                 &mut jobs,
+                &salts,
                 &out,
                 &SampleError::Driver("closed output".into()),
                 &CancelToken::default(),
@@ -1041,7 +1394,7 @@ mod tests {
             if id % 2 == 0 {
                 job.graph.edges.swap(0, 1);
             }
-            preparation.submit(job, CascadeSettings::default(), false);
+            preparation.submit(Source::Job(job), CascadeSettings::default());
         }
         assert_eq!(preparation.len(), PREP_BOUND);
         for id in 0..PREP_BOUND {
@@ -1065,7 +1418,7 @@ mod tests {
         let runner = std::thread::spawn(move || {
             let mut preparation = Preparation::new().unwrap();
             for id in 0..PREP_BOUND {
-                preparation.submit(job(id, 64), CascadeSettings::default(), false);
+                preparation.submit(Source::Job(job(id, 64)), CascadeSettings::default());
             }
             drop(preparation);
             finished.send(()).unwrap();
@@ -1082,9 +1435,8 @@ mod tests {
         let (out, mut results) = tokio::sync::mpsc::channel(PREP_BOUND + 3);
         for id in 0..PREP_BOUND {
             preparation.submit(
-                job(id, if id % 2 == 0 { 0 } else { 64 }),
+                Source::Job(job(id, if id % 2 == 0 { 0 } else { 64 })),
                 CascadeSettings::default(),
-                false,
             );
         }
         tx.try_send(job(PREP_BOUND + 1, 64)).unwrap();
@@ -1092,12 +1444,15 @@ mod tests {
         let error = SampleError::Driver("injected device fault".into());
         let pending = Prepared {
             job: job(PREP_BOUND, 64),
+            origin: Origin::Stream,
             data: Err(SampleError::TooLarge("invalid pending job".into())),
         };
+        let (_salts_tx, salts) = mpsc::channel();
         reject_preparation(
             &mut preparation,
             Some(pending),
             &mut jobs,
+            &salts,
             &out,
             &error,
             &CancelToken::default(),
@@ -1122,10 +1477,11 @@ mod tests {
             job
         };
         let mut preparation = Preparation::new().unwrap();
-        preparation.submit(non_exact(0, 1), CascadeSettings::default(), false);
-        preparation.submit(non_exact(1, 2), CascadeSettings::default(), false);
+        preparation.submit(Source::Job(non_exact(0, 1)), CascadeSettings::default());
+        preparation.submit(Source::Job(non_exact(1, 2)), CascadeSettings::default());
         let pending = Prepared {
             job: non_exact(2, 1),
+            origin: Origin::Stream,
             data: Ok(None),
         };
         let (tx, mut jobs) = tokio::sync::mpsc::channel(2);
@@ -1133,10 +1489,12 @@ mod tests {
         tx.try_send(non_exact(4, 2)).unwrap();
         let (out, mut results) = tokio::sync::mpsc::channel(5);
         let error = SampleError::Driver("injected fault".into());
+        let (_salts_tx, salts) = mpsc::channel();
         reject_preparation(
             &mut preparation,
             Some(pending),
             &mut jobs,
+            &salts,
             &out,
             &error,
             &cancel,
@@ -1161,9 +1519,15 @@ mod tests {
         tx.try_send(job(1, 8)).unwrap();
         tx.try_send(job(2, 8)).unwrap();
         let error = SampleError::Driver("injected fault".into());
+        let (_salts_tx, salts) = mpsc::channel();
         reject_tail(
-            Some(job(0, 8)),
+            Some(Prepared {
+                job: job(0, 8),
+                origin: Origin::Stream,
+                data: Ok(None),
+            }),
             &mut rx,
+            &salts,
             &out,
             &error,
             &CancelToken::default(),
@@ -1240,11 +1604,13 @@ mod tests {
             completed: RefCell::new(vec![0]),
             out: out.clone(),
         };
+        let (_salts_tx, salts) = mpsc::channel();
         run(
             &MetalDevice::open(0).unwrap(),
             &Mutex::new(CascadeSettings::default()),
             &Mutex::new(None),
             rx,
+            &salts,
             &out,
             &gov,
             &CancelToken::default(),
@@ -1411,11 +1777,13 @@ mod tests {
         input.graph.j[0] = 0.5;
         tx.try_send(input).unwrap();
         drop(tx);
+        let (_salts_tx, salts) = mpsc::channel();
         run(
             &device,
             &Mutex::new(CascadeSettings::default()),
             &Mutex::new(None),
             rx,
+            &salts,
             &out,
             &governor,
             &CancelToken::default(),
@@ -1498,6 +1866,7 @@ mod tests {
             .unwrap();
         pool.live[slot] = Some(Live {
             job: live_job,
+            origin: Origin::Stream,
             ticket,
             accounted_us: 0,
         });

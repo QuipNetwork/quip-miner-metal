@@ -1512,7 +1512,7 @@ mod tests {
     )]
     fn pool_probe_rate_against_run_stream() {
         use crate::cascade::{CascadeSettings, Controller, Ticket};
-        use crate::resident::{Preparation, PREP_BOUND, PREP_WORKERS};
+        use crate::resident::{Preparation, Source, PREP_BOUND, PREP_WORKERS};
         use crate::sampler::{encode_batch, harvest_batch, EncodedBatch};
         use quip_solver_core::StreamJob;
         use std::time::{Duration, Instant};
@@ -1553,7 +1553,7 @@ mod tests {
             while preparation.len() < PREP_BOUND && submitted < STEPS * capacity {
                 let index = submitted;
                 preparation.submit(
-                    StreamJob {
+                    Source::Job(StreamJob {
                         job_id: index.to_le_bytes().to_vec(),
                         graph: templates[index % capacity].clone(),
                         params: SampleParams {
@@ -1564,9 +1564,8 @@ mod tests {
                             ..Default::default()
                         },
                         watermark: None,
-                    },
+                    }),
                     settings,
-                    true,
                 );
                 submitted += 1;
             }
