@@ -4,12 +4,7 @@
 //! Salt leases through the real session and the MSA miner.
 //!
 //! Metal GPU tests: need a real device (Apple Silicon). Run with
-//! `--test-threads=1`. `lease_throughput_aglais` is an ignored bench.
-
-#![expect(
-    clippy::print_stderr,
-    reason = "the bench reports rates on stderr, like the other benches"
-)]
+//! `--test-threads=1`.
 
 mod support;
 
@@ -19,8 +14,8 @@ use quip_solver_core::quip_proto::v1::{
 };
 use quip_solver_core::quip_protocol::lease::verify_lease_result;
 use quip_solver_core::quip_protocol::wire::encode_i32_le;
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::time::Duration;
 use support::{aglais, lease, miner_binary, ring, target, wire_target, Session};
 
 const RING_A: [u8; 32] = [0x51; 32];
@@ -305,108 +300,3 @@ async fn invalid_leases_are_rejected_with_refunds() {
     );
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).map_or(default, |v| {
-        v.parse()
-            .unwrap_or_else(|_| panic!("{name} must be an integer"))
-    })
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "GPU benchmark: minutes of device time"]
-async fn lease_throughput_aglais() {
-    let seconds = env_u64("QUIP_LEASE_SECONDS", 600);
-    let per_lease = env_u64("QUIP_LEASE_SALTS", 4_000);
-    let sweeps = u32::try_from(env_u64("QUIP_LEASE_SWEEPS", 14_336)).expect("sweeps fit u32");
-    let target_milli = std::env::var("QUIP_LEASE_TARGET")
-        .map_or(support::AGLAIS_TARGET_MILLI, |v| {
-            v.parse().expect("QUIP_LEASE_TARGET must be an integer")
-        });
-    let backend_toml = std::env::var("QUIP_LEASE_BACKEND_TOML").unwrap_or_default();
-
-    let mut s = Session::start(&msa(), 64, &backend_toml).await;
-    let granted = s.log.credits[0];
-    let in_flight = env_u64("QUIP_LEASE_INFLIGHT", u64::from(granted));
-    assert!(in_flight > 0, "QUIP_LEASE_INFLIGHT must be positive");
-    let in_flight = in_flight.min(u64::from(granted));
-    let (topology, view) = aglais();
-    let t = target(target_milli, sweeps);
-    s.send(coord_msg::Msg::Topology(topology)).await;
-    s.send(coord_msg::Msg::SetTarget(t)).await;
-    eprintln!(
-        "lease: {granted} credits, {in_flight} leases in flight, {per_lease} salts per lease, {sweeps} sweeps, target {target_milli}, backend_toml={backend_toml:?}"
-    );
-
-    let mut specs: HashMap<Vec<u8>, IsingProblemGenerator> = HashMap::new();
-    let mut next = 0u64;
-    let issue = |next: u64| {
-        lease(
-            format!("bench-{next}").as_bytes(),
-            1,
-            support::AGLAIS_HASH,
-            next * per_lease,
-            per_lease,
-        )
-    };
-    for _ in 0..in_flight {
-        let job = issue(next);
-        specs.insert(job.job_id.clone(), generator(&job));
-        s.send(coord_msg::Msg::Job(job)).await;
-        next += 1;
-    }
-
-    let start = Instant::now();
-    let cpu_start = support::cpu_seconds(s.pid());
-    let mut summaries = 0;
-    let mut report_at = Duration::from_secs(10);
-    while start.elapsed() < Duration::from_secs(seconds) {
-        s.poll(Duration::from_secs(1)).await;
-        assert!(!s.log.closed, "miner closed the stream: {:?}", s.log.fatal);
-        assert!(
-            s.log.rejects.is_empty(),
-            "unexpected rejects: {:?}",
-            s.log.rejects
-        );
-        assert!(s.log.fatal.is_none(), "unexpected fatal: {:?}", s.log.fatal);
-        while s.log.lease_done.len() > summaries {
-            summaries += 1;
-            let job = issue(next);
-            specs.insert(job.job_id.clone(), generator(&job));
-            s.send(coord_msg::Msg::Job(job)).await;
-            next += 1;
-        }
-        if start.elapsed() >= report_at {
-            let salts = s.jobs_done().await;
-            eprintln!(
-                "lease: t={:.0} salts={salts} rate={:.2}/s results={}",
-                start.elapsed().as_secs_f64(),
-                salts as f64 / start.elapsed().as_secs_f64(),
-                s.log.results.len()
-            );
-            report_at += Duration::from_secs(10);
-        }
-    }
-    let salts = s.jobs_done().await;
-    let elapsed = start.elapsed().as_secs_f64();
-    let cpu = support::cpu_seconds(s.pid()) - cpu_start;
-    let mut verified = 0;
-    for result in &s.log.results {
-        let spec = specs.get(&result.job_id).expect("known lease");
-        verify_lease_result(spec, &view, &wire_target(&t), result).expect("winner verifies");
-        verified += 1;
-    }
-    eprintln!(
-        "lease summary: salts {salts} in {elapsed:.1} s = {:.2} salts/s; miner CPU ms per salt {:.3}; results {} verified {verified}; leases finished {summaries}; rejects {}",
-        salts as f64 / elapsed,
-        cpu * 1000.0 / salts.max(1) as f64,
-        s.log.results.len(),
-        s.log.rejects.len()
-    );
-    assert_eq!(s.shutdown(5_000).await, 0);
-    assert!(
-        s.log.rejects.is_empty(),
-        "unexpected rejects: {:?}",
-        s.log.rejects
-    );
-    assert!(s.log.fatal.is_none(), "unexpected fatal: {:?}", s.log.fatal);
-}

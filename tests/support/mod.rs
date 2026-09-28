@@ -152,10 +152,6 @@ impl Session {
         session
     }
 
-    pub(crate) fn pid(&self) -> u32 {
-        self.child.id().expect("miner is running")
-    }
-
     pub(crate) async fn send(&mut self, msg: coord_msg::Msg) {
         self.outbound
             .send(Ok(CoordMsg { msg: Some(msg) }))
@@ -183,16 +179,6 @@ impl Session {
                 Ok(Err(error)) => panic!("{phase}: transport error: {error}"),
                 Err(_) => panic!("{phase}: timed out after {limit:?}"),
             }
-        }
-    }
-
-    /// Fold at most one frame that arrives within `limit`.
-    pub(crate) async fn poll(&mut self, limit: Duration) {
-        match tokio::time::timeout(limit, self.inbound.message()).await {
-            Ok(Ok(Some(frame))) => self.observe(frame),
-            Ok(Ok(None)) => self.log.closed = true,
-            Ok(Err(error)) => panic!("transport error: {error}"),
-            Err(_) => {}
         }
     }
 
@@ -394,57 +380,4 @@ pub(crate) fn miner_binary(name: &str) -> String {
     path.push(name);
     assert!(path.exists(), "missing binary {}", path.display());
     path.to_string_lossy().into_owned()
-}
-
-fn parse_cputime(text: &str) -> Option<f64> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let (days, clock) = if let Some((days, clock)) = text.split_once('-') {
-        (days.parse::<f64>().ok()?, clock)
-    } else {
-        (0.0, text)
-    };
-    if !days.is_finite() || days < 0.0 {
-        return None;
-    }
-    let mut parts = clock.split(':');
-    let first = parts.next()?;
-    let second = parts.next()?;
-    let third = parts.next();
-    if parts.next().is_some() {
-        return None;
-    }
-    let (hours, minutes, seconds) = if let Some(third) = third {
-        (
-            first.parse::<f64>().ok()?,
-            second.parse::<f64>().ok()?,
-            third.parse::<f64>().ok()?,
-        )
-    } else {
-        (0.0, first.parse::<f64>().ok()?, second.parse::<f64>().ok()?)
-    };
-    if [hours, minutes, seconds]
-        .iter()
-        .any(|part| !part.is_finite() || *part < 0.0)
-    {
-        return None;
-    }
-    Some(days * 86_400.0 + hours * 3_600.0 + minutes * 60.0 + seconds)
-}
-
-/// CPU seconds a process has used, from `ps`.
-pub(crate) fn cpu_seconds(pid: u32) -> f64 {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "cputime=", "-p", &pid.to_string()])
-        .output()
-        .expect("ps cputime");
-    assert!(
-        output.status.success(),
-        "ps cputime exited {}",
-        output.status
-    );
-    let text = String::from_utf8(output.stdout).expect("ps cputime utf-8");
-    parse_cputime(text.trim()).unwrap_or_else(|| panic!("ps cputime format: {text:?}"))
 }
