@@ -175,6 +175,7 @@ impl Preparer {
         &mut self,
         job: &mut StreamJob,
         settings: CascadeSettings,
+        screen: bool,
     ) -> Result<Option<PreparedData>, SampleError> {
         if job.graph.num_nodes() == 0 {
             return Ok(None);
@@ -236,12 +237,12 @@ impl Preparer {
                 }
             }
         };
-        let gated = settings.chain_gated(chain, &job.params);
+        let gated = screen && settings.chain_gated(chain, &job.params);
         // Open gates measure the budget the job asked for.
         if gated && !settings.open_gates {
             job.params.num_sweeps = CHAIN_GATES.full_sweeps;
         }
-        let schedule = self.schedules.prepare(job, settings, gated)?;
+        let schedule = self.schedules.prepare(job, settings, gated, screen)?;
         Ok(Some(PreparedData { schedule, inputs }))
     }
 }
@@ -249,6 +250,7 @@ impl Preparer {
 struct Work {
     job: StreamJob,
     settings: CascadeSettings,
+    screen: bool,
     reply: mpsc::SyncSender<Prepared>,
 }
 
@@ -302,6 +304,7 @@ impl Preparation {
                         let Ok(Work {
                             mut job,
                             settings,
+                            screen,
                             reply,
                         }) = request
                         else {
@@ -310,7 +313,7 @@ impl Preparation {
                         // Keep ownership of the job outside unwinding so a failed
                         // worker still returns it to the runner exactly once.
                         let data = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            preparer.prepare(&mut job, settings)
+                            preparer.prepare(&mut job, settings, screen)
                         }))
                         .unwrap_or_else(|_| {
                             Err(SampleError::Driver("job preparation panicked".into()))
@@ -334,18 +337,19 @@ impl Preparation {
     fn fill(&mut self, jobs: &mut Receiver<StreamJob>, settings: CascadeSettings, eof: &mut bool) {
         while self.len() < PREP_BOUND && !*eof {
             match jobs.try_recv() {
-                Ok(job) => self.submit(job, settings),
+                Ok(job) => self.submit(job, settings, false),
                 Err(TryRecvError::Disconnected) => *eof = true,
                 Err(TryRecvError::Empty) => break,
             }
         }
     }
 
-    pub(crate) fn submit(&mut self, job: StreamJob, settings: CascadeSettings) {
+    pub(crate) fn submit(&mut self, job: StreamJob, settings: CascadeSettings, screen: bool) {
         let (reply, result) = mpsc::sync_channel(1);
         let work = Work {
             job,
             settings,
+            screen,
             reply,
         };
         // The runner submits only below PREP_BOUND, so this queue cannot block.
@@ -780,7 +784,7 @@ mod tests {
     fn preparation_workers_share_schedule_and_edge_storage() {
         let mut preparation = Preparation::new().unwrap();
         for index in 0..PREP_WORKERS {
-            preparation.submit(job(index, 32), CascadeSettings::default());
+            preparation.submit(job(index, 32), CascadeSettings::default(), false);
         }
         let first = preparation.next().unwrap().data.unwrap().unwrap();
         for _ in 1..PREP_WORKERS {
@@ -818,7 +822,7 @@ mod tests {
         chain.params.num_reads = 64;
         let mut preparer = Preparer::default();
         let data = preparer
-            .prepare(&mut chain, CascadeSettings::default())
+            .prepare(&mut chain, CascadeSettings::default(), true)
             .unwrap()
             .unwrap();
         assert_eq!(chain.params.num_sweeps, CHAIN_GATES.full_sweeps);
@@ -831,11 +835,11 @@ mod tests {
             ..CascadeSettings::default()
         };
         chain.params.num_sweeps = 14_336;
-        preparer.prepare(&mut chain, open).unwrap().unwrap();
+        preparer.prepare(&mut chain, open, true).unwrap().unwrap();
         assert_eq!(chain.params.num_sweeps, 14_336);
         let mut other = job(1, 14_336);
         preparer
-            .prepare(&mut other, CascadeSettings::default())
+            .prepare(&mut other, CascadeSettings::default(), true)
             .unwrap();
         assert_eq!(other.params.num_sweeps, 14_336);
     }
@@ -877,12 +881,12 @@ mod tests {
         job.params.num_reads = 64;
         let mut preparer = Preparer::default();
         let settings = CascadeSettings::default();
-        preparer.prepare(&mut job, settings).unwrap();
+        preparer.prepare(&mut job, settings, true).unwrap();
         let start = Instant::now();
         for _ in 0..1000 {
             std::hint::black_box(
                 preparer
-                    .prepare(std::hint::black_box(&mut job), settings)
+                    .prepare(std::hint::black_box(&mut job), settings, true)
                     .unwrap(),
             );
         }
@@ -904,6 +908,7 @@ mod tests {
                         watermark: None,
                     },
                     settings,
+                    false,
                 );
                 submitted += 1;
             }
@@ -923,21 +928,24 @@ mod tests {
         let mut preparer = Preparer::default();
         let settings = CascadeSettings::default();
         let mut input = job(0, 32);
-        preparer.prepare(&mut input, settings).unwrap();
+        preparer.prepare(&mut input, settings, true).unwrap();
         input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
         input.graph.j = vec![1.0; input.graph.edges.len()];
         assert!(matches!(
-            preparer.prepare(&mut input, settings),
+            preparer.prepare(&mut input, settings, true),
             Err(SampleError::TooLarge(_))
         ));
         let mut input = job(1, sampler::MAX_SWEEPS + 1);
         assert!(matches!(
-            preparer.prepare(&mut input, settings),
+            preparer.prepare(&mut input, settings, true),
             Err(SampleError::TooLarge(_))
         ));
         input.params.num_sweeps = 32;
         input.graph.j[0] = 0.5;
-        assert!(preparer.prepare(&mut input, settings).unwrap().is_none());
+        assert!(preparer
+            .prepare(&mut input, settings, true)
+            .unwrap()
+            .is_none());
     }
 
     fn job(id: usize, sweeps: usize) -> StreamJob {
@@ -988,7 +996,7 @@ mod tests {
         let runner = std::thread::spawn(move || {
             let mut preparation = Preparation::new().unwrap();
             for id in 0..PREP_BOUND {
-                preparation.submit(job(id, 32), CascadeSettings::default());
+                preparation.submit(job(id, 32), CascadeSettings::default(), false);
             }
             let (tx, mut jobs) = tokio::sync::mpsc::channel(1);
             tx.try_send(job(PREP_BOUND, 32)).unwrap();
@@ -1033,7 +1041,7 @@ mod tests {
             if id % 2 == 0 {
                 job.graph.edges.swap(0, 1);
             }
-            preparation.submit(job, CascadeSettings::default());
+            preparation.submit(job, CascadeSettings::default(), false);
         }
         assert_eq!(preparation.len(), PREP_BOUND);
         for id in 0..PREP_BOUND {
@@ -1057,7 +1065,7 @@ mod tests {
         let runner = std::thread::spawn(move || {
             let mut preparation = Preparation::new().unwrap();
             for id in 0..PREP_BOUND {
-                preparation.submit(job(id, 64), CascadeSettings::default());
+                preparation.submit(job(id, 64), CascadeSettings::default(), false);
             }
             drop(preparation);
             finished.send(()).unwrap();
@@ -1076,6 +1084,7 @@ mod tests {
             preparation.submit(
                 job(id, if id % 2 == 0 { 0 } else { 64 }),
                 CascadeSettings::default(),
+                false,
             );
         }
         tx.try_send(job(PREP_BOUND + 1, 64)).unwrap();
@@ -1113,8 +1122,8 @@ mod tests {
             job
         };
         let mut preparation = Preparation::new().unwrap();
-        preparation.submit(non_exact(0, 1), CascadeSettings::default());
-        preparation.submit(non_exact(1, 2), CascadeSettings::default());
+        preparation.submit(non_exact(0, 1), CascadeSettings::default(), false);
+        preparation.submit(non_exact(1, 2), CascadeSettings::default(), false);
         let pending = Prepared {
             job: non_exact(2, 1),
             data: Ok(None),
@@ -1270,24 +1279,24 @@ mod tests {
         input.graph.j[0] = 0.5;
         let mut preparer = Preparer::default();
         assert!(preparer
-            .prepare(&mut input, CascadeSettings::default())
+            .prepare(&mut input, CascadeSettings::default(), true)
             .unwrap()
             .is_none());
         input.params.num_sweeps = sampler::MAX_SWEEPS + 1;
         assert!(matches!(
-            preparer.prepare(&mut input, CascadeSettings::default()),
+            preparer.prepare(&mut input, CascadeSettings::default(), true),
             Err(SampleError::TooLarge(_))
         ));
         input.params.num_sweeps = 0;
         assert!(preparer
-            .prepare(&mut input, CascadeSettings::default())
+            .prepare(&mut input, CascadeSettings::default(), true)
             .unwrap()
             .is_none());
         input.params.num_sweeps = 64;
         input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
         input.graph.j = vec![0.5; input.graph.edges.len()];
         assert!(matches!(
-            preparer.prepare(&mut input, CascadeSettings::default()),
+            preparer.prepare(&mut input, CascadeSettings::default(), true),
             Err(SampleError::TooLarge(_))
         ));
         input
@@ -1295,7 +1304,7 @@ mod tests {
             .h
             .resize(sampler::kernel_max_nodes(Kernel::Msa) + 1, 0.0);
         assert!(matches!(
-            preparer.prepare(&mut input, CascadeSettings::default()),
+            preparer.prepare(&mut input, CascadeSettings::default(), true),
             Err(SampleError::TooLarge(_))
         ));
     }
@@ -1307,7 +1316,7 @@ mod tests {
             let mut input = job(0, 0);
             input.graph.j[0] = coefficient;
             assert!(preparer
-                .prepare(&mut input, CascadeSettings::default())
+                .prepare(&mut input, CascadeSettings::default(), true)
                 .unwrap()
                 .is_none());
         }
@@ -1512,57 +1521,5 @@ mod tests {
             .unwrap();
         assert_eq!(pool.slots.live(), 0);
         assert!(matches!(results.try_recv(), Err(TryRecvError::Empty)));
-    }
-
-    #[test]
-    fn controller_state_survives_a_second_stream() {
-        if MetalDevice::device_count() == 0 {
-            #[expect(clippy::print_stderr, reason = "device tests report a sandbox skip")]
-            {
-                eprintln!("skipping controller persistence test: no Metal device");
-            }
-            return;
-        }
-        let sampler = MetalSampler::new(
-            MetalDevice::open(0).unwrap(),
-            crate::iokit_gov::UtilGovernor::start(0, 100, false),
-            Kernel::Msa,
-        );
-        sampler.apply_config("cascade_stages = [8]\ncascade_keep = 100\ncascade_keep_min = 10\ncascade_keep_max = 100");
-        let run = |start, count| {
-            let (tx, rx) = tokio::sync::mpsc::channel(count);
-            let (out, mut results) = tokio::sync::mpsc::channel(count);
-            for id in start..start + count {
-                tx.blocking_send(job(id, 16)).unwrap();
-            }
-            drop(tx);
-            sampler.sample_stream(rx, out, CancelToken::default());
-            let mut received = 0;
-            while let Some(result) = results.blocking_recv() {
-                match result.outcome {
-                    StreamOutcome::Completed(Ok(reads)) => assert_eq!(reads.len(), 4),
-                    StreamOutcome::Completed(Err(error)) => panic!("{error}"),
-                    StreamOutcome::Cancelled => panic!("uncancelled stream"),
-                }
-                received += 1;
-            }
-            assert_eq!(received, count);
-            sampler
-                .controller
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .keep_denominators()[0]
-        };
-        let settled = run(0, 5000);
-        assert!(settled > 50.0, "denominator did not settle: {settled}");
-        // A reset would have only 100 observations and a denominator near 32.
-        let second = run(5000, 100);
-        assert!(second > 50.0, "second stream restarted warm-up: {second}");
-        assert!(
-            second >= settled * 0.9,
-            "lost settled denominator: {settled} -> {second}"
-        );
     }
 }

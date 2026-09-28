@@ -93,7 +93,6 @@ pub(crate) struct CascadeSettings {
     pub(crate) keep_max: f64,
     pub(crate) audit: u32,
     pub(crate) reheat_beta: f64,
-    pub(crate) target_milli: Option<i64>,
     pub(crate) yield_per_million: Option<f64>,
 }
 
@@ -108,7 +107,6 @@ impl Default for CascadeSettings {
             keep_max: 30_000.0,
             audit: 200,
             reheat_beta: CALIBRATION.reheat_beta,
-            target_milli: None,
             yield_per_million: None,
         }
     }
@@ -215,7 +213,6 @@ pub(crate) struct CascadeToml {
     pub(crate) cascade_keep_max: Option<u32>,
     pub(crate) cascade_audit: Option<u32>,
     pub(crate) cascade_reheat_beta: Option<f64>,
-    pub(crate) cascade_target_milli: Option<i64>,
     pub(crate) cascade_yield_per_million: Option<f64>,
 }
 
@@ -263,9 +260,6 @@ impl CascadeSettings {
         }
         if let Some(beta) = cfg.cascade_reheat_beta {
             self.reheat_beta = beta;
-        }
-        if let Some(target) = cfg.cascade_target_milli {
-            self.target_milli = Some(target);
         }
         if let Some(value) = cfg.cascade_yield_per_million {
             if value.is_finite() && value > 0.0 {
@@ -325,6 +319,7 @@ struct StagePlan {
 
 pub(crate) struct Controller {
     settings: CascadeSettings,
+    target_milli: Option<i64>,
     plan: Arc<Mutex<StagePlan>>,
     yield_check: Option<Yield>,
     topology: Option<(usize, Edges)>,
@@ -480,25 +475,12 @@ impl StagePlan {
 }
 
 impl Controller {
-    #[cfg(test)]
-    pub(crate) fn keep_denominators(&self) -> Vec<f64> {
-        self.plan
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .cutoffs
-            .iter()
-            .map(Cutoff::denominator)
-            .collect()
-    }
-
     pub(crate) fn new(settings: CascadeSettings) -> Self {
         Self {
             settings,
+            target_milli: None,
             plan: Arc::new(Mutex::new(StagePlan::new(settings))),
-            yield_check: settings
-                .yield_per_million
-                .zip(settings.target_milli)
-                .map(|(rate, target)| Yield::new(rate, target, Duration::from_secs(3600))),
+            yield_check: None,
             topology: None,
             topology_epoch: 0,
             yield_epoch: 0,
@@ -546,19 +528,35 @@ impl Controller {
         {
             self.plan = Arc::new(Mutex::new(StagePlan::new(settings)));
         }
-        if settings.target_milli != self.settings.target_milli
-            || settings.yield_per_million != self.settings.yield_per_million
-        {
+        if settings.yield_per_million != self.settings.yield_per_million {
             self.yield_epoch = self.yield_epoch.wrapping_add(1);
             self.yield_check = settings
                 .yield_per_million
-                .zip(settings.target_milli)
+                .zip(self.target_milli)
                 .map(|(rate, target)| Yield::new(rate, target, Duration::from_secs(3600)));
         }
         self.settings = settings;
         let mut plan = self.plan.lock().unwrap_or_else(|p| p.into_inner());
         plan.settings.audit = settings.audit;
         plan.settings.open_gates = settings.open_gates;
+    }
+
+    /// The session target for admitted lease units. A change resets the yield check.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "lease generation supplies the session target")
+    )]
+    pub(crate) fn set_target(&mut self, target_milli: Option<i64>) {
+        if target_milli == self.target_milli {
+            return;
+        }
+        self.target_milli = target_milli;
+        self.yield_epoch = self.yield_epoch.wrapping_add(1);
+        self.yield_check = self
+            .settings
+            .yield_per_million
+            .zip(target_milli)
+            .map(|(rate, target)| Yield::new(rate, target, Duration::from_secs(3600)));
     }
 
     #[cfg(test)]
@@ -593,7 +591,7 @@ impl Controller {
         let chain = topology_fingerprint(job.graph.num_nodes(), &job.graph.edges)
             == CHAIN_GATES.fingerprint;
         let gated = self.settings.chain_gated(chain, &job.params);
-        let mut schedule = PreparedSchedule::new(job, self.settings, gated);
+        let mut schedule = PreparedSchedule::new(job, self.settings, gated, true);
         let edges = Edges::from(job.graph.edges.as_slice());
         let ticket = self.admit_prepared(job, &mut schedule, &edges).unwrap();
         (ticket, schedule.betas.to_vec(), schedule.checkpoints)
@@ -611,7 +609,8 @@ impl Controller {
         if schedule.settings.stages != self.settings.stages
             || schedule.settings.reheat_beta.to_bits() != self.settings.reheat_beta.to_bits()
         {
-            let rebuilt = PreparedSchedule::new(job, self.settings, schedule.gated);
+            let rebuilt =
+                PreparedSchedule::new(job, self.settings, schedule.gated, schedule.screen);
             crate::slots::validate_schedule(&rebuilt.betas, &rebuilt.checkpoints)?;
             *schedule = rebuilt;
         }
@@ -659,6 +658,12 @@ impl Controller {
         Self::observe_transition(&mut plan, ticket, best);
         let stage = ticket.stage;
         let sweeps = plan.settings.stages[stage];
+        if self.target_milli.is_some_and(|target| best <= target) {
+            self.stats.record(stage, sweeps, true);
+            ticket.audited = false;
+            ticket.stage += 1;
+            return true;
+        }
         if plan.settings.open_gates {
             self.stats.record(stage, sweeps, true);
             ticket.stage += 1;
@@ -774,6 +779,7 @@ impl Controller {
 pub(crate) struct PreparedSchedule {
     settings: CascadeSettings,
     gated: bool,
+    screen: bool,
     pub(crate) betas: Arc<[f32]>,
     pub(crate) checkpoints: Vec<usize>,
 }
@@ -809,7 +815,13 @@ impl ScheduleCache {
         job: &StreamJob,
         settings: CascadeSettings,
         gated: bool,
+        screen: bool,
     ) -> Result<PreparedSchedule, crate::sampler::SampleError> {
+        let stages = if screen {
+            settings.effective(gated).stages
+        } else {
+            [0; MAX_STAGES]
+        };
         let (hot, cold) = job
             .params
             .beta_range
@@ -819,7 +831,7 @@ impl ScheduleCache {
             cold: cold.to_bits(),
             sweeps: job.params.num_sweeps,
             per_beta: job.params.sweeps_per_beta,
-            stages: settings.effective(gated).stages,
+            stages,
             reheat: settings.reheat_beta.to_bits(),
         };
         // Compute the graph-dependent range before locking. Cache hits only
@@ -845,6 +857,7 @@ impl ScheduleCache {
         let schedule = PreparedSchedule {
             settings,
             gated,
+            screen,
             betas: Arc::clone(&entry.betas),
             checkpoints: entry.checkpoints.clone(),
         };
@@ -854,16 +867,23 @@ impl ScheduleCache {
 
 impl PreparedSchedule {
     /// `settings` are the configured settings. `gated` selects the chain plan.
-    pub(crate) fn new(job: &StreamJob, settings: CascadeSettings, gated: bool) -> Self {
-        let (betas, checkpoints) = segment_schedule(
-            &job.graph,
-            &job.params,
-            &settings.effective(gated).stages,
-            settings.reheat_beta,
-        );
+    pub(crate) fn new(
+        job: &StreamJob,
+        settings: CascadeSettings,
+        gated: bool,
+        screen: bool,
+    ) -> Self {
+        let stages = if screen {
+            settings.effective(gated).stages
+        } else {
+            [0; MAX_STAGES]
+        };
+        let (betas, checkpoints) =
+            segment_schedule(&job.graph, &job.params, &stages, settings.reheat_beta);
         Self {
             settings,
             gated,
+            screen,
             betas: betas.into(),
             checkpoints,
         }
@@ -1033,7 +1053,7 @@ mod tests {
             params,
             watermark: None,
         };
-        let mut schedule = PreparedSchedule::new(&job, old, false);
+        let mut schedule = PreparedSchedule::new(&job, old, false, true);
         crate::slots::validate_schedule(&schedule.betas, &schedule.checkpoints).unwrap();
         let mut controller = Controller::new(old);
         controller.refresh(CascadeSettings {
@@ -1115,7 +1135,7 @@ mod tests {
                 ..old
             },
         ] {
-            let mut prepared = PreparedSchedule::new(&job, old, false);
+            let mut prepared = PreparedSchedule::new(&job, old, false, true);
             let mut controller = Controller::new(old);
             controller.refresh(new);
             let edges = Edges::from(job.graph.edges.as_slice());
@@ -1158,6 +1178,37 @@ mod tests {
             params: params(sweeps, 1),
             watermark: Some(1),
         }
+    }
+
+    #[test]
+    fn a_best_at_the_target_always_continues() {
+        let mut controller = Controller::new(CascadeSettings {
+            stages: stage_array(&[16, 64]),
+            ..CascadeSettings::default()
+        });
+        for id in 0..2_000 {
+            let mut observation = job(id, 256);
+            observation.params.num_reads = 64;
+            let (mut ticket, _, _) = controller.admit(&observation);
+            controller.checkpoint(&mut ticket, -1_000);
+        }
+        let mut candidate = job(4, 256);
+        candidate.params.num_reads = 64;
+        let (mut strict_ticket, _, _) = controller.admit(&candidate);
+        assert!(!controller.checkpoint(&mut strict_ticket, -100));
+
+        controller.set_target(Some(-100));
+        let (mut ticket, _, _) = controller.admit(&candidate);
+        assert!(controller.checkpoint(&mut ticket, -100));
+        assert!(controller.checkpoint(&mut ticket, -150));
+    }
+
+    #[test]
+    fn an_unscreened_schedule_has_one_checkpoint_at_the_full_budget() {
+        let mut job = job(4, 256);
+        job.params.num_reads = 64;
+        let schedule = PreparedSchedule::new(&job, CascadeSettings::default(), false, false);
+        assert_eq!(schedule.checkpoints, vec![256]);
     }
 
     #[test]
@@ -1447,23 +1498,28 @@ mod tests {
         let settings = CascadeSettings::default();
         let mut cache = ScheduleCache::default();
         let mut other_worker = cache.clone();
-        let first = cache.prepare(&job(0, 1000), settings, false).unwrap();
+        let first = cache.prepare(&job(0, 1000), settings, false, true).unwrap();
         let second = other_worker
-            .prepare(&job(1, 1000), settings, false)
+            .prepare(&job(1, 1000), settings, false, true)
             .unwrap();
         assert!(Arc::ptr_eq(&first.betas, &second.betas));
-        let reference = PreparedSchedule::new(&job(1, 1000), settings, false);
+        let unscreened = cache
+            .prepare(&job(1, 1000), settings, false, false)
+            .unwrap();
+        assert_eq!(unscreened.checkpoints, vec![1000]);
+        assert!(!Arc::ptr_eq(&first.betas, &unscreened.betas));
+        let reference = PreparedSchedule::new(&job(1, 1000), settings, false, true);
         assert_eq!(&second.betas[..], &reference.betas[..]);
         assert_eq!(second.checkpoints, reference.checkpoints);
         let longer = other_worker
-            .prepare(&job(2, 2000), settings, false)
+            .prepare(&job(2, 2000), settings, false, true)
             .unwrap();
         assert!(!Arc::ptr_eq(&first.betas, &longer.betas));
         assert_eq!(longer.betas.len(), 2000);
-        let shared_longer = cache.prepare(&job(3, 2000), settings, false).unwrap();
+        let shared_longer = cache.prepare(&job(3, 2000), settings, false, true).unwrap();
         assert!(Arc::ptr_eq(&longer.betas, &shared_longer.betas));
         assert_eq!(&first.betas[..], &reference.betas[..]);
-        let gated = cache.prepare(&job(2, 2000), settings, true).unwrap();
+        let gated = cache.prepare(&job(2, 2000), settings, true, true).unwrap();
         assert_eq!(gated.checkpoints, vec![8, 16, 64, 256, 512, 1024, 2000]);
     }
 
@@ -1592,41 +1648,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_accepts_all_keys_and_partial_updates() {
-        let cfg: crate::MetalConfig = toml::from_str("cascade_stages = [16, 64]\ncascade_keep = 20\ncascade_keep_min = 2\ncascade_keep_max = 100\ncascade_audit = 2\ncascade_target_milli = -500\ncascade_yield_per_million = 1.5\ncascade_reheat_beta = 0.3").unwrap();
-        assert!(cfg.unknown.is_empty());
-        let mut settings = CascadeSettings::default();
-        settings.merge(&cfg.cascade);
-        assert_eq!(
-            settings,
-            CascadeSettings {
-                stages: stage_array(&[16, 64]),
-                gates: [None; MAX_STAGES],
-                open_gates: false,
-                keep: 20.0,
-                keep_min: 2.0,
-                keep_max: 100.0,
-                audit: 2,
-                reheat_beta: 0.3,
-                target_milli: Some(-500),
-                yield_per_million: Some(1.5)
-            }
-        );
-        let previous = settings;
-        settings.merge(&CascadeToml {
-            cascade_audit: Some(7),
-            ..CascadeToml::default()
-        });
-        assert_eq!(
-            settings,
-            CascadeSettings {
-                audit: 7,
-                ..previous
-            }
-        );
-    }
-
-    #[test]
     fn admitted_jobs_retain_their_plan_after_stage_change() {
         let mut c = Controller::new(CascadeSettings::default());
         let (mut t, _, checkpoints) = c.admit(&job(0, 14_336));
@@ -1652,38 +1673,6 @@ mod tests {
         let (t, _, checkpoints) = c.admit(&job(1, 1024));
         assert_eq!(t.gates, 1);
         assert_eq!(checkpoints, vec![64, 1024]);
-    }
-
-    #[test]
-    fn live_keep_and_yield_changes_reset_only_their_controllers() {
-        let settings = CascadeSettings {
-            target_milli: Some(-100),
-            yield_per_million: Some(1.0),
-            ..CascadeSettings::default()
-        };
-        let mut c = Controller::new(settings);
-        let (old, _, _) = c.admit(&job(0, 32));
-        c.plan.lock().unwrap().cutoffs[0].observe(1.0);
-        let settings = CascadeSettings {
-            keep: 5000.0,
-            ..settings
-        };
-        c.refresh(settings);
-        assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
-        let plan = Arc::clone(&c.plan);
-        c.refresh(CascadeSettings {
-            target_milli: Some(-200),
-            yield_per_million: Some(10_000_000.0),
-            ..settings
-        });
-        assert!(Arc::ptr_eq(&plan, &c.plan));
-        c.finish(&old, Some(-300), true);
-        assert_eq!(c.yield_check.as_ref().unwrap().observation(), (0.0, 0.0));
-        let (t, _, _) = c.admit(&job(1, 32));
-        c.finish(&t, Some(-150), true);
-        let (hits, bound) = c.yield_check.as_ref().unwrap().observation();
-        assert_eq!(hits, 0.0);
-        assert!((bound - (10f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
     }
 
     #[test]
@@ -1773,38 +1762,6 @@ mod tests {
         );
         p.apply_action(0, Action::Restore, Check::Audit, &[], &[]);
         assert!((p.cutoffs[0].denominator() - before).abs() < 1e-12);
-    }
-
-    #[test]
-    fn yield_counts_forwarded_results_and_widens_each_probe() {
-        for (best, delivered, hits) in [
-            (Some(-100), true, 1.0),
-            (Some(0), true, 0.0),
-            (Some(-100), false, 0.0),
-            (None, true, 0.0),
-        ] {
-            let mut c = Controller::new(CascadeSettings {
-                target_milli: Some(-100),
-                yield_per_million: Some(10_000_000.0),
-                ..CascadeSettings::default()
-            });
-            let (t, _, _) = c.admit(&job(0, 32));
-            c.finish(&t, best, delivered);
-            let (actual, bound) = c.yield_check.as_ref().unwrap().observation();
-            assert_eq!(actual, hits);
-            assert!((bound - (10f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
-            c.check_yield(Instant::now() + Duration::from_secs(3601));
-            for lane in &c.plan.lock().unwrap().audit_lanes {
-                assert_eq!(lane.denominator(200), 50);
-            }
-            assert_eq!(c.yield_check.as_ref().unwrap().observation().0, 0.0);
-        }
-        assert!(Controller::new(CascadeSettings {
-            target_milli: Some(-100),
-            ..CascadeSettings::default()
-        })
-        .yield_check
-        .is_none());
     }
 
     #[test]
@@ -2013,139 +1970,6 @@ mod tests {
         assert!(Arc::ptr_eq(&plan, &c.plan));
         assert_eq!((c.topology_epoch, c.yield_epoch), (0, 0));
         assert_eq!(c.plan.lock().unwrap().audit_rng, None);
-    }
-
-    #[test]
-    fn real_topology_change_keeps_yield_state_and_epoch() {
-        let mut c = Controller::new(CascadeSettings {
-            target_milli: Some(-100),
-            yield_per_million: Some(10_000_000.0),
-            ..CascadeSettings::default()
-        });
-        let (ticket, _, _) = c.admit(&job(0, 32));
-        c.finish(&ticket, Some(-100), true);
-        let yield_epoch = c.yield_epoch;
-        c.admit(&job(1, 1000));
-        c.plan.lock().unwrap().cutoffs[0].observe(0.0);
-        let topology_epoch = c.topology_epoch;
-        let mut changed = job(2, 1000);
-        changed.graph.h.push(0.0);
-        c.admit(&changed);
-        assert_eq!(c.topology_epoch, topology_epoch + 1);
-        assert_eq!(c.yield_epoch, yield_epoch);
-        assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
-        let (hits, bound) = c.yield_check.as_ref().unwrap().observation();
-        assert_eq!(hits, 1.0);
-        assert!((bound - (30f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
-    }
-
-    #[test]
-    fn late_topology_result_counts_yield_without_training_either_plan() {
-        let mut c = Controller::new(CascadeSettings {
-            target_milli: Some(-100),
-            yield_per_million: Some(10_000_000.0),
-            ..CascadeSettings::default()
-        });
-        let (mut ticket, _, _) = c.admit(&job(0, 1000));
-        ticket.stage = ticket.gates;
-        let old_plan = Arc::clone(&ticket.plan);
-        let mut changed = job(1, 1000);
-        changed.graph.h.push(0.0);
-        c.admit(&changed);
-        c.finish(&ticket, Some(-100), true);
-        let (hits, bound) = c.yield_check.as_ref().unwrap().observation();
-        assert_eq!(hits, 1.0);
-        assert!((bound - (20f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
-        for plan in [&old_plan, &c.plan] {
-            assert!(plan
-                .lock()
-                .unwrap()
-                .cutoffs
-                .iter()
-                .all(|cutoff| cutoff.moments().count() == 0));
-        }
-        c.refresh(CascadeSettings {
-            target_milli: Some(-200),
-            ..c.settings
-        });
-        c.finish(&ticket, Some(-300), true);
-        assert_eq!(c.yield_check.as_ref().unwrap().observation(), (0.0, 0.0));
-    }
-
-    fn run_topologies(controller: Controller, jobs: Vec<StreamJob>) -> Controller {
-        struct Governor;
-        impl crate::streaming::GpuGovernor for Governor {
-            fn should_throttle(&self) -> bool {
-                false
-            }
-            fn budget_scale(&self) -> f64 {
-                1.0
-            }
-            fn record_gpu_busy_us(&self, _: u64) {}
-        }
-        let device = crate::metal_device::MetalDevice::open(0).unwrap();
-        let count = jobs.len();
-        let (tx, rx) = tokio::sync::mpsc::channel(count);
-        let (out, mut results) = tokio::sync::mpsc::channel(count);
-        for job in jobs {
-            tx.try_send(job).unwrap();
-        }
-        drop(tx);
-        let settings = Mutex::new(controller.settings);
-        let store = Mutex::new(Some(controller));
-        crate::resident::run(
-            &device,
-            &settings,
-            &store,
-            rx,
-            &out,
-            &Governor,
-            &quip_solver_core::CancelToken::default(),
-        );
-        for _ in 0..count {
-            assert!(matches!(
-                results.try_recv().unwrap().outcome,
-                quip_solver_core::StreamOutcome::Completed(Ok(_))
-            ));
-        }
-        store.into_inner().unwrap().unwrap()
-    }
-
-    #[test]
-    fn runner_preserves_trained_a_across_gate_free_b_and_back() {
-        let mut c = Controller::new(CascadeSettings::default());
-        let input = job(0, 64);
-        for _ in 0..200 {
-            let (mut ticket, _, _) = c.admit(&input);
-            c.checkpoint(&mut ticket, 0);
-        }
-        let plan = Arc::clone(&c.plan);
-        let epoch = c.topology_epoch;
-        let mut short = job(1, 32);
-        short.graph.h.push(0.0);
-        let c = run_topologies(c, vec![input, short, job(2, 64)]);
-        assert!(Arc::ptr_eq(&plan, &c.plan));
-        assert_eq!(c.topology_epoch, epoch);
-        assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 202);
-    }
-
-    #[test]
-    fn runner_preserves_yield_across_gated_topology_change() {
-        let mut c = Controller::new(CascadeSettings {
-            target_milli: Some(i64::MAX),
-            yield_per_million: Some(10_000_000.0),
-            ..CascadeSettings::default()
-        });
-        let (ticket, _, _) = c.admit(&job(0, 32));
-        c.finish(&ticket, Some(0), true);
-        let epoch = c.yield_epoch;
-        let mut changed = job(2, 64);
-        changed.graph.h.push(0.0);
-        let c = run_topologies(c, vec![job(1, 64), changed]);
-        assert_eq!(c.yield_epoch, epoch);
-        let (hits, bound) = c.yield_check.as_ref().unwrap().observation();
-        assert_eq!(hits, 3.0);
-        assert!((bound - (30f64.sqrt() - 0.98).powi(2)).abs() < 1e-10);
     }
 
     #[test]

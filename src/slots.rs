@@ -1566,6 +1566,7 @@ mod tests {
                         watermark: None,
                     },
                     settings,
+                    true,
                 );
                 submitted += 1;
             }
