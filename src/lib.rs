@@ -242,6 +242,17 @@ pub struct MetalSampler {
     controller: std::sync::Mutex<Option<cascade::Controller>>,
     salts_tx: std::sync::mpsc::SyncSender<resident::Salt>,
     salts_rx: std::sync::Mutex<std::sync::mpsc::Receiver<resident::Salt>>,
+    /// Cleared when the resident runner exits, so a lease stops waiting on it.
+    runner_live: std::sync::atomic::AtomicBool,
+}
+
+/// Stores a value into a flag when dropped, on every exit path.
+struct StoreOnDrop<'a>(&'a std::sync::atomic::AtomicBool, bool);
+
+impl Drop for StoreOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(self.1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for MetalSampler {
@@ -308,6 +319,17 @@ impl MetalSampler {
             controller: std::sync::Mutex::new(None),
             salts_tx,
             salts_rx,
+            runner_live: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    fn require_runner(&self) -> Result<(), quip_solver_core::SampleError> {
+        if self.runner_live.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(quip_solver_core::SampleError::DeviceFault(
+                "resident runner stopped during a lease".into(),
+            ))
         }
     }
 
@@ -337,6 +359,7 @@ impl quip_solver_core::Sampler for MetalSampler {
         let window = resident::PREP_BOUND as u64;
         let (mut next, mut open) = (0u64, 0u64);
         while !sink.is_stopped() && (next < lease.salt_count() || open > 0) {
+            self.require_runner()?;
             while open < window && next < lease.salt_count() {
                 let mut salt = resident::Salt {
                     topology: std::sync::Arc::clone(&topology),
@@ -351,6 +374,7 @@ impl quip_solver_core::Sampler for MetalSampler {
                     if sink.is_stopped() {
                         return Ok(());
                     }
+                    self.require_runner()?;
                     match self.salts_tx.try_send(salt) {
                         Ok(()) => break,
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Ok(()),
@@ -376,6 +400,11 @@ impl quip_solver_core::Sampler for MetalSampler {
                 resident::SaltOutcome::Dropped { index } => {
                     tracing::debug!(index, "lease salt dropped before reporting");
                     Ok(())
+                }
+                resident::SaltOutcome::Failed { index, error } => {
+                    return Err(quip_solver_core::SampleError::DeviceFault(format!(
+                        "lease salt {index}: {error}"
+                    )));
                 }
             };
             if reported.is_err() {
@@ -410,6 +439,9 @@ impl quip_solver_core::Sampler for MetalSampler {
     ) {
         // Both runners report device time to the same governor that sizes work.
         if self.kernel == Kernel::Msa {
+            self.runner_live
+                .store(true, std::sync::atomic::Ordering::Release);
+            let _exited = StoreOnDrop(&self.runner_live, false);
             resident::run(
                 &self.device,
                 &self.cascade,

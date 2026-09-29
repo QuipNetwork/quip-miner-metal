@@ -37,8 +37,14 @@ pub(crate) enum SaltOutcome {
         index: u64,
         reads: Vec<SamplerResult>,
     },
+    /// Cancel or shutdown ended the salt before it finished.
     Dropped {
         index: u64,
+    },
+    /// Drawing, preparing, or running the salt failed.
+    Failed {
+        index: u64,
+        error: quip_solver_core::SampleError,
     },
 }
 
@@ -107,7 +113,8 @@ fn answer(
                     index,
                     energy_milli,
                 },
-                Answer::Cancelled | Answer::Failed(_) => SaltOutcome::Dropped { index },
+                Answer::Cancelled => SaltOutcome::Dropped { index },
+                Answer::Failed(error) => SaltOutcome::Failed { index, error },
             };
             reply.send(outcome).is_ok()
         }
@@ -568,7 +575,7 @@ impl Preparation {
                     });
                 }
                 Source::Salt(salt) => {
-                    let _ = salt.reply.send(SaltOutcome::Dropped { index: salt.index });
+                    refuse_salt(salt, &SampleError::Driver("preparation workers stopped".into()));
                 }
             }
         }
@@ -624,8 +631,16 @@ fn reject_tail(
         reject_or_cancel(out, Origin::Stream, job, error, cancel);
     }
     while let Ok(salt) = salts.try_recv() {
-        let _ = salt.reply.send(SaltOutcome::Dropped { index: salt.index });
+        refuse_salt(salt, error);
     }
+}
+
+/// Answer a salt that will not run.
+fn refuse_salt(salt: Salt, error: &SampleError) {
+    let _ = salt.reply.send(SaltOutcome::Failed {
+        index: salt.index,
+        error: error.to_sample_error(),
+    });
 }
 
 fn reject_preparation(
@@ -980,7 +995,7 @@ mod tests {
     use quip_solver_core::Sampler;
 
     #[test]
-    fn mixed_intake_screens_salts_preserves_survivors_and_drops_draw_errors() {
+    fn mixed_intake_screens_salts_preserves_survivors_and_fails_draw_errors() {
         let device = MetalDevice::open(0).unwrap();
         let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
         let topology = Arc::new(quip_solver_core::quip_protocol::lease::TopologyView {
@@ -1057,10 +1072,12 @@ mod tests {
                     }
                     index
                 }
-                SaltOutcome::Dropped { index } => {
+                SaltOutcome::Failed { index, error } => {
                     assert_eq!(index, 2);
+                    assert!(error.is_fatal(), "{error}");
                     index
                 }
+                SaltOutcome::Dropped { index } => panic!("salt {index} dropped"),
             };
             assert!(!seen[index as usize]);
             seen[index as usize] = true;
@@ -1075,6 +1092,52 @@ mod tests {
             StreamOutcome::Cancelled => panic!("plain job was cancelled"),
         }
         assert!(results.try_recv().is_err());
+    }
+
+    fn salt(index: u64, reply: &mpsc::Sender<SaltOutcome>) -> Salt {
+        Salt {
+            topology: Arc::new(quip_solver_core::quip_protocol::lease::TopologyView {
+                num_nodes: 2,
+                edges: vec![(0, 1)],
+                allowed_h_milli: vec![0],
+                allowed_j_milli: vec![-1000],
+            }),
+            nonce: [0; 32],
+            index,
+            params: SampleParams {
+                num_reads: 4,
+                num_sweeps: 16,
+                ..Default::default()
+            },
+            watermark: None,
+            target_milli: None,
+            reply: reply.clone(),
+        }
+    }
+
+    #[test]
+    fn a_fault_fails_queued_salts_with_its_error() {
+        let (reply, outcomes) = mpsc::channel();
+        let (salts_tx, salts) = mpsc::sync_channel(PREP_BOUND);
+        salts_tx.send(salt(7, &reply)).unwrap();
+        let (_tx, mut jobs) = tokio::sync::mpsc::channel(1);
+        let (out, _results) = tokio::sync::mpsc::channel(1);
+        reject_tail(
+            None,
+            &mut jobs,
+            &salts,
+            &out,
+            &SampleError::Driver("injected fault".into()),
+            &CancelToken::default(),
+        );
+        match outcomes.try_recv().unwrap() {
+            SaltOutcome::Failed { index, error } => {
+                assert_eq!(index, 7);
+                assert!(error.to_string().contains("injected fault"), "{error}");
+            }
+            _ => panic!("a faulted salt must carry the fault"),
+        }
+        assert!(outcomes.try_recv().is_err());
     }
 
     #[test]
