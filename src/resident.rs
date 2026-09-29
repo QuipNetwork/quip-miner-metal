@@ -61,8 +61,6 @@ pub(crate) struct Salt {
     pub(crate) reply: mpsc::Sender<SaltOutcome>,
 }
 
-pub(crate) type Intake = (mpsc::SyncSender<Salt>, Mutex<mpsc::Receiver<Salt>>);
-
 pub(crate) enum Source {
     Job(StreamJob),
     Salt(Salt),
@@ -153,7 +151,7 @@ fn salt_job(salt: &Salt) -> Result<StreamJob, SampleError> {
             .collect()
     };
     let mut params = salt.params.clone();
-    params.seed = salt_seed(salt.index);
+    params.seed = salt_seed(salt.nonce);
     Ok(StreamJob {
         job_id: salt.index.to_le_bytes().to_vec(),
         graph: IsingGraph::new(to_units(h), to_units(j), salt.topology.edges.clone()),
@@ -162,11 +160,12 @@ fn salt_job(salt: &Salt) -> Result<StreamJob, SampleError> {
     })
 }
 
-fn salt_seed(index: u64) -> u64 {
+/// The nonce is unique to the lease and salt, so concurrent leases never share a seed.
+fn salt_seed(nonce: [u8; 32]) -> u64 {
     use std::hash::BuildHasher;
     static KEYS: std::sync::OnceLock<std::collections::hash_map::RandomState> =
         std::sync::OnceLock::new();
-    KEYS.get_or_init(Default::default).hash_one(index).max(1)
+    KEYS.get_or_init(Default::default).hash_one(nonce).max(1)
 }
 
 struct Pool {
@@ -238,10 +237,10 @@ impl Pool {
             if checkpoint.last {
                 done.push(checkpoint.slot);
             } else if !controller.checkpoint(&mut live.ticket, checkpoint.best, target_milli) {
+                self.slots.release(checkpoint.slot)?;
                 let Some(live) = self.live[checkpoint.slot].take() else {
                     continue;
                 };
-                self.slots.release(checkpoint.slot)?;
                 let delivered = answer(
                     out,
                     live.origin,
@@ -1140,6 +1139,18 @@ mod tests {
             target_milli: None,
             reply: reply.clone(),
         }
+    }
+
+    #[test]
+    fn the_same_salt_index_in_two_leases_gets_two_seeds() {
+        let (reply, _outcomes) = mpsc::channel();
+        let first = salt(3, &reply);
+        let mut second = salt(3, &reply);
+        second.nonce = [1; 32];
+        assert_ne!(
+            salt_job(&first).unwrap().params.seed,
+            salt_job(&second).unwrap().params.seed
+        );
     }
 
     #[test]

@@ -309,8 +309,6 @@ impl MetalSampler {
         kernel: Kernel,
     ) -> Self {
         let (salts_tx, salts_rx) = std::sync::mpsc::sync_channel(resident::PREP_BOUND);
-        let intake: resident::Intake = (salts_tx, std::sync::Mutex::new(salts_rx));
-        let (salts_tx, salts_rx) = intake;
         Self {
             device,
             gov,
@@ -318,7 +316,7 @@ impl MetalSampler {
             cascade: std::sync::Mutex::new(cascade::CascadeSettings::default()),
             controller: std::sync::Mutex::new(None),
             salts_tx,
-            salts_rx,
+            salts_rx: std::sync::Mutex::new(salts_rx),
             runner_live: std::sync::atomic::AtomicBool::new(true),
         }
     }

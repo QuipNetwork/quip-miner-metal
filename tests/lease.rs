@@ -71,6 +71,7 @@ async fn every_salt_is_counted_once() {
 
     let done = s.log.done(b"lease-median").expect("LeaseDone");
     assert_eq!(done.salts_done, 200, "every salt is counted once");
+    assert_eq!(s.log.done_count(b"lease-median"), 1, "one summary");
     let results = s.log.results_for(b"lease-median");
     assert!(
         results.len() < 200,
