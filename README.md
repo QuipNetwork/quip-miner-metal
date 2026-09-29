@@ -95,10 +95,10 @@ Other kernels and the Apple Neural Engine use separate paths.
 | `cascade_keep_max` | `30000` | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | audit lane denominator |
 | `cascade_reheat_beta` | `0.25` | starting beta for later segments |
-| `cascade_target_milli` | none | chain target energy |
 | `cascade_yield_per_million` | none | expected nonces per million below target |
 
 These keys enter through `backend_toml`.
+The target energy comes from the session target, not from a key.
 See [probe cascade](docs/cascade.md) for slots, schedules, controller lifetime,
 key validation, and model checks.
 

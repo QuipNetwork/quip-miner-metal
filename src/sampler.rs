@@ -1688,7 +1688,7 @@ fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, Sample
 
 // Host-side (GPU-free) logic only: everything under test here is `cfg(macos)`,
 // so the module carries the same gate. The dispatch itself is covered by
-// `tests/golden_parity.rs`, which needs a real device.
+// `tests/stream_contract.rs`, which needs a real device.
 #[cfg(test)]
 mod tests {
     use super::*;

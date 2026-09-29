@@ -77,7 +77,6 @@ report](perf/2026-09-23-cascade-calibration.md) explains the defaults.
 | `cascade_keep_max` | `30000` | unsigned 32-bit integer, subject to group rule | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | unsigned 32-bit integer, at least 2 | audit lane denominator |
 | `cascade_reheat_beta` | `0.25` | greater than hot beta and less than cold beta | otherwise use the standard schedule |
-| `cascade_target_milli` | none | signed 64-bit integer | chain target energy |
 | `cascade_yield_per_million` | none | finite and greater than 0 | expected nonces per million below target |
 
 The keep values pass as one group when `2 <= cascade_keep_min <= cascade_keep
@@ -91,9 +90,10 @@ fraction is `1 / 2000^(1/2)`, about 1 in 44.7 per stage. The two default
 stages aim to keep about 1 in 2,000 nonces through the full budget. Audits and
 load changes can change that rate.
 
-The yield check runs only when the coordinator sets both
-`cascade_target_milli` and `cascade_yield_per_million`. It checks target hits
-from new jobs against the set yield.
+The target energy comes from the session target that the coordinator sets,
+not from a key. The yield check runs only when a lease carries that target and
+the coordinator sets `cascade_yield_per_million`. It checks target hits from
+new lease units against the set yield.
 
 ## Screened-out results
 
