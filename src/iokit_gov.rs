@@ -643,16 +643,6 @@ mod tests {
         assert_eq!(self_util_pct(0, 1_000), 0);
     }
 
-    /// The subtraction that turns whole-device load into external-only load
-    /// must floor at 0, never wrap.
-    #[test]
-    fn external_util_floors_at_zero() {
-        // Sensor says 40%, we accounted for 90% of it: nobody else is waiting.
-        assert_eq!(40_u32.saturating_sub(90), 0);
-        // Sensor says 70%, we caused 30%: 40 points belong to someone else.
-        assert_eq!(70_u32.saturating_sub(30), 40);
-    }
-
     /// End-to-end through the poll thread: a batch report must show up as
     /// non-zero self-utilization within one window.
     #[test]

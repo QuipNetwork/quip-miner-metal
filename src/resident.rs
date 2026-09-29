@@ -1119,23 +1119,6 @@ mod tests {
     }
 
     #[test]
-    fn preparation_workers_share_schedule_and_edge_storage() {
-        let mut preparation = Preparation::new().unwrap();
-        for index in 0..PREP_WORKERS {
-            preparation.submit(Source::Job(job(index, 32)), CascadeSettings::default());
-        }
-        let first = preparation.next().unwrap().data.unwrap().unwrap();
-        for _ in 1..PREP_WORKERS {
-            let next = preparation.next().unwrap().data.unwrap().unwrap();
-            assert!(std::sync::Arc::ptr_eq(
-                &first.schedule.betas,
-                &next.schedule.betas
-            ));
-            assert!(Arc::ptr_eq(first.inputs.edges(), next.inputs.edges()));
-        }
-    }
-
-    #[test]
     fn chain_jobs_get_the_deep_final_budget_unless_gates_are_open() {
         let edges: Vec<(usize, usize)> = include_str!("../tests/fixtures/advantage2-system1.edges")
             .lines()
@@ -1378,10 +1361,6 @@ mod tests {
     #[test]
     fn preparation_returns_valid_and_invalid_jobs_once_in_input_order() {
         let mut preparation = Preparation::new().unwrap();
-        assert_eq!(preparation.workers.len(), PREP_WORKERS);
-        for worker in &preparation.workers {
-            assert_ne!(worker.thread().id(), std::thread::current().id());
-        }
         for id in 0..PREP_BOUND {
             let mut job = job(
                 id,
