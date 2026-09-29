@@ -16,6 +16,7 @@ use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -53,7 +54,9 @@ pub(crate) struct Salt {
     pub(crate) nonce: [u8; 32],
     pub(crate) index: u64,
     pub(crate) params: SampleParams,
-    pub(crate) watermark: Option<u64>,
+    /// Set when the issuing lease ends. Its queued and live units then stop
+    /// and answer `Dropped`.
+    pub(crate) stop: Arc<AtomicBool>,
     pub(crate) target_milli: Option<i64>,
     pub(crate) reply: mpsc::Sender<SaltOutcome>,
 }
@@ -70,8 +73,25 @@ enum Origin {
     Salt {
         index: u64,
         target_milli: Option<i64>,
+        stop: Arc<AtomicBool>,
         reply: mpsc::Sender<SaltOutcome>,
     },
+}
+
+impl Origin {
+    /// Whether the lease that issued this unit has ended.
+    fn stopped(&self) -> bool {
+        match self {
+            Self::Stream => false,
+            Self::Salt { stop, .. } => stop.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// Whether nobody wants the unit's answer: its generation was cancelled or
+/// its lease ended.
+fn abandoned(cancel: &CancelToken, job: &StreamJob, origin: &Origin) -> bool {
+    cancel.is_cancelled(job.watermark) || origin.stopped()
 }
 
 enum Answer {
@@ -138,7 +158,7 @@ fn salt_job(salt: &Salt) -> Result<StreamJob, SampleError> {
         job_id: salt.index.to_le_bytes().to_vec(),
         graph: IsingGraph::new(to_units(h), to_units(j), salt.topology.edges.clone()),
         params,
-        watermark: salt.watermark,
+        watermark: None,
     })
 }
 
@@ -190,7 +210,7 @@ impl Pool {
             let us = self.slots.device_us(slot);
             busy_us = busy_us.saturating_add(us.saturating_sub(live.accounted_us));
             live.accounted_us = us;
-            if cancel.is_cancelled(live.job.watermark) {
+            if abandoned(cancel, &live.job, &live.origin) {
                 self.slots.release(slot)?;
                 let Some(live) = entry.take() else { continue };
                 let _ = answer(out, live.origin, live.job, Answer::Cancelled, us);
@@ -239,7 +259,7 @@ impl Pool {
             let Some(live) = self.live[slot].take() else {
                 continue;
             };
-            let cancelled = cancel.is_cancelled(live.job.watermark);
+            let cancelled = abandoned(cancel, &live.job, &live.origin);
             let best = if cancelled {
                 None
             } else {
@@ -456,6 +476,7 @@ impl Preparation {
                                 let origin = Origin::Salt {
                                     index: salt.index,
                                     target_milli: salt.target_milli,
+                                    stop: Arc::clone(&salt.stop),
                                     reply: salt.reply.clone(),
                                 };
                                 match salt_job(&salt) {
@@ -469,7 +490,7 @@ impl Preparation {
                                                 Vec::new(),
                                             ),
                                             params: salt.params,
-                                            watermark: salt.watermark,
+                                            watermark: None,
                                         },
                                         origin,
                                         work_screen,
@@ -607,7 +628,7 @@ fn reject_or_cancel(
     error: &SampleError,
     cancel: &CancelToken,
 ) {
-    let outcome = if cancel.is_cancelled(job.watermark) {
+    let outcome = if abandoned(cancel, &job, &origin) {
         Answer::Cancelled
     } else {
         Answer::Failed(error.to_sample_error())
@@ -639,9 +660,14 @@ fn reject_tail(
 
 /// Answer a salt that will not run.
 fn refuse_salt(salt: Salt, error: &SampleError) {
-    let _ = salt.reply.send(SaltOutcome::Failed {
-        index: salt.index,
-        error: error.to_sample_error(),
+    let index = salt.index;
+    let _ = salt.reply.send(if salt.stop.load(Ordering::Acquire) {
+        SaltOutcome::Dropped { index }
+    } else {
+        SaltOutcome::Failed {
+            index,
+            error: error.to_sample_error(),
+        }
     });
 }
 
@@ -673,11 +699,11 @@ fn run_fallback(
     let result = (|| {
         let mut batch = sampler::encode_batch(device, &[&job.graph], &job.params, Kernel::Msa, 1)?;
         for _ in 0..batch.chunk_count() {
-            if out.is_closed() || cancel.is_cancelled(job.watermark) {
+            if out.is_closed() || abandoned(cancel, &job, &origin) {
                 break;
             }
             crate::streaming::yield_gate(out, gov);
-            if !batch.commit_next(|| out.is_closed() || cancel.is_cancelled(job.watermark)) {
+            if !batch.commit_next(|| out.is_closed() || abandoned(cancel, &job, &origin)) {
                 break;
             }
             batch.wait_until_completed();
@@ -689,7 +715,7 @@ fn run_fallback(
                 "metal command buffer did not complete: status {status:?}"
             )));
         }
-        if out.is_closed() || cancel.is_cancelled(job.watermark) {
+        if out.is_closed() || abandoned(cancel, &job, &origin) {
             return Ok(Vec::new());
         }
         let mut reads = sampler::harvest_batch(&batch, &[&job.graph])?.remove(0);
@@ -701,7 +727,7 @@ fn run_fallback(
         Err(SampleError::Driver(message)) => Some(SampleError::Driver(message.clone())),
         Err(SampleError::Metal(error)) => Some(SampleError::Driver(error.to_string())),
     };
-    let outcome = if out.is_closed() || cancel.is_cancelled(job.watermark) {
+    let outcome = if out.is_closed() || abandoned(cancel, &job, &origin) {
         Answer::Cancelled
     } else {
         match result {
@@ -814,7 +840,7 @@ pub(crate) fn run(
                 break;
             };
             let Prepared { job, origin, data } = prepared;
-            if cancel.is_cancelled(job.watermark) {
+            if abandoned(cancel, &job, &origin) {
                 let _ = answer(out, origin, job, Answer::Cancelled, 0);
                 continue;
             }
@@ -1025,7 +1051,7 @@ mod tests {
                         num_sweeps: 16,
                         ..Default::default()
                     },
-                    watermark: None,
+                    stop: Arc::default(),
                     target_milli: Some(if index == 1 { i64::MAX } else { -1_000_000 }),
                     reply: reply.clone(),
                 })
@@ -1110,7 +1136,7 @@ mod tests {
                 num_sweeps: 16,
                 ..Default::default()
             },
-            watermark: None,
+            stop: Arc::default(),
             target_milli: None,
             reply: reply.clone(),
         }
@@ -1933,5 +1959,109 @@ mod tests {
             .unwrap();
         assert_eq!(pool.slots.live(), 0);
         assert!(matches!(results.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn salts_of_a_stopped_lease_are_dropped_at_admission() {
+        let device = MetalDevice::open(0).unwrap();
+        let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
+        let (reply, outcomes) = mpsc::channel();
+        let (salts_tx, salts) = mpsc::sync_channel(PREP_BOUND);
+        let stop = Arc::new(AtomicBool::new(true));
+        for index in 0..3 {
+            let mut salt = salt(index, &reply);
+            salt.stop = Arc::clone(&stop);
+            salts_tx.send(salt).unwrap();
+        }
+        let (tx, jobs) = tokio::sync::mpsc::channel(1);
+        tx.try_send(job(100, 16)).unwrap();
+        drop(tx);
+        let (out, mut results) = tokio::sync::mpsc::channel(1);
+        run(
+            &device,
+            &Mutex::new(CascadeSettings::default()),
+            &Mutex::new(None),
+            jobs,
+            &salts,
+            &out,
+            &gov,
+            &CancelToken::default(),
+        );
+        let mut dropped: Vec<u64> = outcomes
+            .try_iter()
+            .map(|outcome| match outcome {
+                SaltOutcome::Dropped { index } => index,
+                _ => panic!("a stopped lease's salt must not run"),
+            })
+            .collect();
+        dropped.sort_unstable();
+        assert_eq!(dropped, [0, 1, 2]);
+        assert!(matches!(
+            results.try_recv().unwrap().outcome,
+            StreamOutcome::Completed(Ok(_))
+        ));
+    }
+
+    #[test]
+    fn stopping_a_lease_releases_its_live_unit_once() {
+        struct Governor;
+        impl GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let device = MetalDevice::open(0).unwrap();
+        let mut controller = Controller::new(CascadeSettings {
+            stages: stage_array(&[8]),
+            ..CascadeSettings::default()
+        });
+        let live_job = job(1000, 256);
+        let mut pool = Pool::new(&device, &live_job, 1).unwrap();
+        let (ticket, schedule, checkpoints) = controller.admit(&live_job);
+        let slot = pool
+            .slots
+            .admit(SlotJob {
+                graph: live_job.graph.clone(),
+                schedule: schedule.into(),
+                checkpoints,
+                seed: live_job.params.seed,
+            })
+            .unwrap();
+        let (reply, outcomes) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        pool.live[slot] = Some(Live {
+            job: live_job,
+            origin: Origin::Salt {
+                index: 5,
+                target_milli: Some(i64::MAX),
+                stop: Arc::clone(&stop),
+                reply,
+            },
+            ticket,
+            accounted_us: 0,
+        });
+        let (out, _results) = tokio::sync::mpsc::channel(1);
+        let cancel = CancelToken::default();
+        pool.slots.commit_step(8).unwrap();
+        pool.harvest(&mut controller, &out, &cancel, &Governor)
+            .unwrap();
+        assert_eq!(pool.slots.live(), 1, "a unit at its target keeps running");
+        assert!(outcomes.try_recv().is_err());
+        pool.slots.commit_step(8).unwrap();
+        stop.store(true, Ordering::Release);
+        pool.harvest(&mut controller, &out, &cancel, &Governor)
+            .unwrap();
+        assert!(matches!(
+            outcomes.try_recv().unwrap(),
+            SaltOutcome::Dropped { index: 5 }
+        ));
+        assert_eq!(pool.slots.live(), 0);
+        pool.harvest(&mut controller, &out, &cancel, &Governor)
+            .unwrap();
+        assert!(outcomes.try_recv().is_err());
     }
 }

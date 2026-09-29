@@ -356,6 +356,9 @@ impl quip_solver_core::Sampler for MetalSampler {
         }
         let topology = std::sync::Arc::new(topology.clone());
         let (reply, outcomes) = std::sync::mpsc::channel();
+        // Queued, preparing, and live units of this lease stop once it returns.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _stop = StoreOnDrop(&stop, true);
         let window = resident::PREP_BOUND as u64;
         let (mut next, mut open) = (0u64, 0u64);
         while !sink.is_stopped() && (next < lease.salt_count() || open > 0) {
@@ -366,7 +369,7 @@ impl quip_solver_core::Sampler for MetalSampler {
                     nonce: lease.nonce(next),
                     index: next,
                     params: params.clone(),
-                    watermark: None,
+                    stop: std::sync::Arc::clone(&stop),
                     target_milli: sink.target_energy_milli(),
                     reply: reply.clone(),
                 };
