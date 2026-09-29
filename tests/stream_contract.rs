@@ -12,7 +12,8 @@ use quip_miner_metal::metal_device::MetalDevice;
 use quip_miner_metal::{GibbsTag, Kernel, MetalSampler, MsaTag, SaTag, TaggedSampler};
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::{
-    CancelToken, IsingGraph, SampleParams, Sampler, StreamJob, StreamOutcome, StreamResult,
+    CancelToken, IsingGraph, SampleError, SampleParams, Sampler, StreamJob, StreamOutcome,
+    StreamResult,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -251,7 +252,7 @@ fn an_oversized_job_fails_without_a_panic() {
         assert_eq!(results.len(), 2, "{kernel:?}");
         for r in &results {
             match (id_of(r).as_str(), &r.outcome) {
-                ("oversized", StreamOutcome::Completed(Err(_))) => {}
+                ("oversized", StreamOutcome::Completed(Err(SampleError::Capacity))) => {}
                 ("valid", StreamOutcome::Completed(Ok(reads))) => {
                     assert_eq!(reads.len(), 8, "{kernel:?}");
                 }
