@@ -215,10 +215,9 @@ impl Pool {
                 Origin::Stream => None,
                 Origin::Salt { target_milli, .. } => *target_milli,
             };
-            controller.set_target(target_milli);
             if checkpoint.last {
                 done.push(checkpoint.slot);
-            } else if !controller.checkpoint(&mut live.ticket, checkpoint.best) {
+            } else if !controller.checkpoint(&mut live.ticket, checkpoint.best, target_milli) {
                 let Some(live) = self.live[checkpoint.slot].take() else {
                     continue;
                 };
@@ -575,7 +574,10 @@ impl Preparation {
                     });
                 }
                 Source::Salt(salt) => {
-                    refuse_salt(salt, &SampleError::Driver("preparation workers stopped".into()));
+                    refuse_salt(
+                        salt,
+                        &SampleError::Driver("preparation workers stopped".into()),
+                    );
                 }
             }
         }
@@ -883,11 +885,10 @@ pub(crate) fn run(
             }
             let Some(pools) = &mut pools else { continue };
             let pool = &mut pools[turn];
-            let target_milli = match &origin {
-                Origin::Stream => None,
-                Origin::Salt { target_milli, .. } => *target_milli,
-            };
-            controller.set_target(target_milli);
+            // Plain jobs have no target and leave the yield check alone.
+            if let Origin::Salt { target_milli, .. } = &origin {
+                controller.set_yield_target(*target_milli);
+            }
             let ticket = match controller.admit_prepared(&job, &mut data.schedule, &edges) {
                 Ok(ticket) => ticket,
                 Err(error) => {
@@ -1892,7 +1893,7 @@ mod tests {
         // Direct settings isolate slot cancellation from TOML's minimum of two.
         for _ in 0..200 {
             let (mut ticket, _, _) = controller.admit(&live_job);
-            controller.checkpoint(&mut ticket, 0);
+            controller.checkpoint(&mut ticket, 0, None);
             controller.finish(&ticket, None, false);
         }
         let mut pool = Pool::new(&device, &live_job, 1).unwrap();

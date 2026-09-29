@@ -319,7 +319,8 @@ struct StagePlan {
 
 pub(crate) struct Controller {
     settings: CascadeSettings,
-    target_milli: Option<i64>,
+    /// The lease target the yield check measures against.
+    yield_target_milli: Option<i64>,
     plan: Arc<Mutex<StagePlan>>,
     yield_check: Option<Yield>,
     topology: Option<(usize, Edges)>,
@@ -478,7 +479,7 @@ impl Controller {
     pub(crate) fn new(settings: CascadeSettings) -> Self {
         Self {
             settings,
-            target_milli: None,
+            yield_target_milli: None,
             plan: Arc::new(Mutex::new(StagePlan::new(settings))),
             yield_check: None,
             topology: None,
@@ -532,7 +533,7 @@ impl Controller {
             self.yield_epoch = self.yield_epoch.wrapping_add(1);
             self.yield_check = settings
                 .yield_per_million
-                .zip(self.target_milli)
+                .zip(self.yield_target_milli)
                 .map(|(rate, target)| Yield::new(rate, target, Duration::from_secs(3600)));
         }
         self.settings = settings;
@@ -541,12 +542,12 @@ impl Controller {
         plan.settings.open_gates = settings.open_gates;
     }
 
-    /// The session target for admitted lease units. A change resets the yield check.
-    pub(crate) fn set_target(&mut self, target_milli: Option<i64>) {
-        if target_milli == self.target_milli {
+    /// The session target of an admitted lease unit. A change resets the yield check.
+    pub(crate) fn set_yield_target(&mut self, target_milli: Option<i64>) {
+        if target_milli == self.yield_target_milli {
             return;
         }
-        self.target_milli = target_milli;
+        self.yield_target_milli = target_milli;
         self.yield_epoch = self.yield_epoch.wrapping_add(1);
         self.yield_check = self
             .settings
@@ -645,8 +646,13 @@ impl Controller {
         })
     }
 
-    /// Called at a non-last checkpoint. true = keep running.
-    pub(crate) fn checkpoint(&mut self, ticket: &mut Ticket, best: i64) -> bool {
+    /// Called at a non-last checkpoint with the unit's target. true = keep running.
+    pub(crate) fn checkpoint(
+        &mut self,
+        ticket: &mut Ticket,
+        best: i64,
+        target_milli: Option<i64>,
+    ) -> bool {
         if ticket.topology_epoch != self.topology_epoch {
             return false;
         }
@@ -654,7 +660,7 @@ impl Controller {
         Self::observe_transition(&mut plan, ticket, best);
         let stage = ticket.stage;
         let sweeps = plan.settings.stages[stage];
-        if self.target_milli.is_some_and(|target| best <= target) {
+        if target_milli.is_some_and(|target| best <= target) {
             self.stats.record(stage, sweeps, true);
             ticket.audited = false;
             ticket.stage += 1;
@@ -1186,17 +1192,34 @@ mod tests {
             let mut observation = job(id, 256);
             observation.params.num_reads = 64;
             let (mut ticket, _, _) = controller.admit(&observation);
-            controller.checkpoint(&mut ticket, -1_000);
+            controller.checkpoint(&mut ticket, -1_000, None);
         }
         let mut candidate = job(4, 256);
         candidate.params.num_reads = 64;
         let (mut strict_ticket, _, _) = controller.admit(&candidate);
-        assert!(!controller.checkpoint(&mut strict_ticket, -100));
+        assert!(!controller.checkpoint(&mut strict_ticket, -100, None));
 
-        controller.set_target(Some(-100));
         let (mut ticket, _, _) = controller.admit(&candidate);
-        assert!(controller.checkpoint(&mut ticket, -100));
-        assert!(controller.checkpoint(&mut ticket, -150));
+        assert!(controller.checkpoint(&mut ticket, -100, Some(-100)));
+        assert!(controller.checkpoint(&mut ticket, -150, Some(-100)));
+    }
+
+    #[test]
+    fn plain_units_between_lease_units_keep_the_yield_check() {
+        let mut c = Controller::new(CascadeSettings {
+            stages: stage_array(&[16, 64]),
+            yield_per_million: Some(1.0),
+            ..CascadeSettings::default()
+        });
+        c.set_yield_target(Some(-100));
+        let (mut salt, _, _) = c.admit(&job(0, 256));
+        let (mut plain, _, _) = c.admit(&job(1, 256));
+        c.checkpoint(&mut plain, 0, None);
+        c.finish(&plain, Some(0), true);
+        assert!(c.checkpoint(&mut salt, -200, Some(-100)));
+        c.finish(&salt, Some(-200), true);
+        let hits = c.yield_check.as_ref().expect("yield check").observation().0;
+        assert_eq!(hits, 1.0, "the lease unit's hit is counted");
     }
 
     #[test]
@@ -1284,7 +1307,7 @@ mod tests {
                 let best = (1000.0
                     * (-2.0 * uniform().ln()).sqrt()
                     * (std::f64::consts::TAU * uniform()).cos()) as i64;
-                let keep = controller.checkpoint(&mut ticket, best);
+                let keep = controller.checkpoint(&mut ticket, best, None);
                 if i == 0 {
                     assert!(!keep);
                 }
@@ -1312,10 +1335,10 @@ mod tests {
             p.kept[0].push_back(-100);
             p.audit_rng = Some(0);
         }
-        assert!(c.checkpoint(&mut t, 0));
+        assert!(c.checkpoint(&mut t, 0, None));
         assert!(t.audited);
         c.plan.lock().unwrap().audit_rng = None;
-        assert!(!c.checkpoint(&mut t, -200));
+        assert!(!c.checkpoint(&mut t, -200, None));
         let observation = c.plan.lock().unwrap().audit_lanes[0].observation(false);
         let mut expected = AuditLane::new(CALIBRATION.false_negative[0].1);
         expected.record(true);
@@ -1332,7 +1355,7 @@ mod tests {
     fn topology_change_resets_the_distribution() {
         let mut c = Controller::new(CascadeSettings::default());
         let (mut old, _, _) = c.admit(&job(0, 1000));
-        c.checkpoint(&mut old, 0);
+        c.checkpoint(&mut old, 0, None);
         assert!(c.matches_topology(&ring()));
         let mut same_topology = job(1, 1000);
         same_topology.graph.h[0] = 0.5;
@@ -1342,7 +1365,7 @@ mod tests {
         changed.graph.h.push(0.0);
         c.admit(&changed);
         assert!(!c.matches_topology(&ring()));
-        assert!(!c.checkpoint(&mut old, -100));
+        assert!(!c.checkpoint(&mut old, -100, None));
         c.finish(&old, Some(-100), true);
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
     }
@@ -1351,7 +1374,7 @@ mod tests {
     fn settings_change_to_stages_rebuilds_but_audit_change_does_not() {
         let mut c = Controller::new(CascadeSettings::default());
         let (mut t, _, _) = c.admit(&job(0, 1000));
-        c.checkpoint(&mut t, 0);
+        c.checkpoint(&mut t, 0, None);
         c.refresh(CascadeSettings {
             audit: 50,
             ..CascadeSettings::default()
@@ -1408,12 +1431,12 @@ mod tests {
         });
         let (mut kept, _, checkpoints) = c.admit(&job(0, 100));
         assert_eq!(checkpoints, vec![8, 16, 100]);
-        assert!(c.checkpoint(&mut kept, -10));
-        assert!(c.checkpoint(&mut kept, -20));
+        assert!(c.checkpoint(&mut kept, -10, None));
+        assert!(c.checkpoint(&mut kept, -20, None));
         assert_eq!(kept.stage, 2);
         for _ in 0..50 {
             let (mut screened, _, _) = c.admit(&job(0, 100));
-            assert!(!c.checkpoint(&mut screened, -9));
+            assert!(!c.checkpoint(&mut screened, -9, None));
             assert!(!screened.audited);
             assert_eq!(screened.stage, 0);
         }
@@ -1531,11 +1554,11 @@ mod tests {
             -14_500_000,
             -14_550_000,
         ] {
-            assert!(c.checkpoint(&mut kept, best));
+            assert!(c.checkpoint(&mut kept, best, None));
         }
         c.finish(&kept, Some(-14_600_000), true);
         let (mut screened, _, _) = c.admit(&job(0, 1000));
-        assert!(!c.checkpoint(&mut screened, -13_000_000));
+        assert!(!c.checkpoint(&mut screened, -13_000_000, None));
         c.finish(&screened, Some(-13_000_000), true);
         let (cancelled, _, _) = c.admit(&job(0, 1000));
         c.finish(&cancelled, None, false);
@@ -1584,8 +1607,8 @@ mod tests {
             ..settings
         });
         let (mut ticket, _, _) = c.admit(&job(0, 1000));
-        assert!(c.checkpoint(&mut ticket, 0));
-        assert!(c.checkpoint(&mut ticket, 0));
+        assert!(c.checkpoint(&mut ticket, 0, None));
+        assert!(c.checkpoint(&mut ticket, 0, None));
         assert_eq!(ticket.stage, ticket.gates);
     }
 
@@ -1633,7 +1656,7 @@ mod tests {
         let mut controller = Controller::new(settings);
         let (mut ticket, _, checkpoints) = controller.admit(&job(0, 1024));
         assert_eq!(checkpoints, vec![32, 256, 1024]);
-        assert!(!controller.checkpoint(&mut ticket, 0));
+        assert!(!controller.checkpoint(&mut ticket, 0, None));
     }
 
     #[test]
@@ -1659,8 +1682,8 @@ mod tests {
         });
         assert!(!Arc::ptr_eq(&t.plan, &c.plan));
         assert_eq!(checkpoints, vec![32, 256, 14_336]);
-        assert!(c.checkpoint(&mut t, -1));
-        assert!(c.checkpoint(&mut t, -1));
+        assert!(c.checkpoint(&mut t, -1, None));
+        assert!(c.checkpoint(&mut t, -1, None));
         c.finish(&t, Some(-1), true);
         assert_eq!(t.plan.lock().unwrap().cutoffs[2].moments().count(), 201);
         drop(t);
@@ -1710,7 +1733,7 @@ mod tests {
             expected.observe(-1.0);
             expected.denominator()
         };
-        c.checkpoint(&mut t, -1);
+        c.checkpoint(&mut t, -1, None);
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].denominator(), before);
     }
 
@@ -1724,8 +1747,8 @@ mod tests {
                     cutoff.observe(0.0);
                 }
             }
-            assert!(c.checkpoint(&mut t, -1));
-            assert!(c.checkpoint(&mut t, -1));
+            assert!(c.checkpoint(&mut t, -1, None));
+            assert!(c.checkpoint(&mut t, -1, None));
             c.finish(&t, Some(-1), true);
         }
         assert_eq!(c.plan.lock().unwrap().kept[1].len(), 1);
@@ -1734,8 +1757,8 @@ mod tests {
         }
         let (mut t, _, _) = c.admit(&job(2, 1024));
         c.plan.lock().unwrap().audit_rng = Some(0);
-        assert!(c.checkpoint(&mut t, 0));
-        assert!(!c.checkpoint(&mut t, 0));
+        assert!(c.checkpoint(&mut t, 0, None));
+        assert!(!c.checkpoint(&mut t, 0, None));
         assert!(!t.audited);
     }
 
@@ -1788,12 +1811,12 @@ mod tests {
         for _ in 0..100_000 {
             c.plan.lock().unwrap().cutoffs[0].observe(-100.0);
         }
-        assert!(c.checkpoint(&mut t, -1000));
+        assert!(c.checkpoint(&mut t, -1000, None));
         c.finish(&t, Some(-1000), true);
         let before = c.plan.lock().unwrap().cutoffs[0].denominator();
         for id in 1..1000 {
             let (mut t, _, _) = c.admit(&job(id, 256));
-            if c.checkpoint(&mut t, 0) {
+            if c.checkpoint(&mut t, 0, None) {
                 c.finish(&t, Some(-2000), true);
             } else {
                 c.finish(&t, Some(0), true);
@@ -1852,7 +1875,7 @@ mod tests {
                 p.cutoffs[0].observe(0.0);
             }
         }
-        assert!(c.checkpoint(&mut t, -1));
+        assert!(c.checkpoint(&mut t, -1, None));
         c.finish(&t, Some(-2), true);
         let p = c.plan.lock().unwrap();
         assert_eq!(p.cutoffs[1].moments().count(), 0);
@@ -1888,7 +1911,7 @@ mod tests {
             p.kept[0].push_back(-100);
             p.audit_rng = Some(0);
         }
-        assert!(c.checkpoint(&mut t, 0));
+        assert!(c.checkpoint(&mut t, 0, None));
         assert!(t.audited);
         c.finish(&t, Some(-200), true);
         let mut expected = AuditLane::new(CALIBRATION.false_negative[0].1);
@@ -1898,7 +1921,7 @@ mod tests {
             expected.observation(false)
         );
         let (mut cancelled, _, _) = c.admit(&job(1, 256));
-        assert!(c.checkpoint(&mut cancelled, 0));
+        assert!(c.checkpoint(&mut cancelled, 0, None));
         c.finish(&cancelled, None, true);
         let p = c.plan.lock().unwrap();
         assert_eq!(
@@ -1951,7 +1974,7 @@ mod tests {
         assert_eq!((c.topology_epoch, c.yield_epoch), epochs);
         assert!(c.matches_topology(&ring()));
         assert_eq!(c.plan.lock().unwrap().audit_rng, rng);
-        c.checkpoint(&mut ticket, -100);
+        c.checkpoint(&mut ticket, -100, None);
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 1);
     }
 
