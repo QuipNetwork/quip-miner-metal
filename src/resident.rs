@@ -61,9 +61,11 @@ impl LiveTarget {
 
 /// How many of a lease's best-finishing salts are streamed back with reads
 /// instead of merely screened. Streaming as units finish (rather than
-/// holding the set to lease end) means a round cancel does not drop them;
-/// expected cost is about 10*ln(n/10) `Result`s per lease, roughly 110 for a
-/// 1,000,000-salt lease.
+/// holding the set to lease end) means a round cancel does not drop them.
+/// A lease's total `Result` count is its final-checkpoint/target-hit
+/// survivors (always pushed) plus the salts that ever entered this running
+/// top-N as a screen: expected entrants are about `k + k*ln(n/k)` for
+/// `k = LEASE_TOP_N` and `n` salts, roughly 125 for a 1,000,000-salt lease.
 pub(crate) const LEASE_TOP_N: usize = 10;
 
 /// A lease's running top-[`LEASE_TOP_N`] finished energies, shared by every
@@ -1317,11 +1319,101 @@ mod tests {
     }
 
     #[test]
-    fn lease_top10_reports_only_qualifying_screens_and_a_new_lease_starts_empty() {
+    fn a_gate_screen_stays_screened_with_no_read_back_when_the_lease_top10_is_full() {
+        let device = MetalDevice::open(0).unwrap();
+        let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
+        let topology = Arc::new(quip_solver_core::quip_protocol::lease::TopologyView {
+            num_nodes: 2,
+            edges: vec![(0, 1)],
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![-1000],
+        });
+        let (reply, outcomes) = mpsc::channel();
+        let (salts_tx, salts) = mpsc::sync_channel(PREP_BOUND);
+        // Pre-fill the lease's shared top-LEASE_TOP_N with energies below
+        // -1000: this 2-node, one-edge, unit-coupling graph can only ever
+        // score -1000 or 1000 (see the `read.energy_milli` assertion in the
+        // sibling empty-top10 test above), so no real salt from it can ever
+        // beat this fabricated, already-full set.
         let top10 = LeaseTopK::new();
-        // Ten screened units finish with descending (improving) energies:
-        // the empty lease's top-LEASE_TOP_N has room for each, so every one
-        // is reported with reads instead of merely screened.
+        for below_reach in (1010..=1100).step_by(10) {
+            assert!(top10.offer(-below_reach), "filling the top-{LEASE_TOP_N}");
+        }
+        salts_tx
+            .send(Salt {
+                topology,
+                nonce: [0; 32],
+                index: 0,
+                params: SampleParams {
+                    num_reads: 4,
+                    num_sweeps: 16,
+                    ..Default::default()
+                },
+                stop: Arc::default(),
+                // Unreachable, so the salt never finishes via a target hit —
+                // it must reach the gate-screening branch this test checks.
+                target: LiveTarget::new(Some(-1_000_000)),
+                top10,
+                reply,
+            })
+            .unwrap();
+        let (tx, jobs) = tokio::sync::mpsc::channel::<StreamJob>(1);
+        drop(tx);
+        let (out, mut results) = tokio::sync::mpsc::channel(1);
+        let mut settings = CascadeSettings {
+            stages: stage_array(&[8]),
+            ..Default::default()
+        };
+        // Below the graph's reachable range, so the gate always screens.
+        settings.gates[0] = Some(-1_000_000);
+        run(
+            &device,
+            &Mutex::new(settings),
+            &Mutex::new(None),
+            jobs,
+            &salts,
+            &out,
+            &gov,
+            &CancelToken::default(),
+        );
+        // A full running top-N must screen the salt with no read-back: if
+        // the harvest branch that checks `offer_top10` before releasing the
+        // slot ever dropped its `continue` or released before pushing to
+        // `done`, this would come back `Survived` (or the run would fault
+        // on a double release, turning this into `Failed`/`Dropped`)
+        // instead of `Screened`.
+        match outcomes.try_recv().unwrap() {
+            SaltOutcome::Screened { index, energy_milli } => {
+                assert_eq!(index, 0);
+                assert!(
+                    (-1000..=1000).contains(&energy_milli),
+                    "energy {energy_milli} outside the graph's reachable range"
+                );
+            }
+            other => panic!(
+                "expected a screen with no read-back, got {}",
+                match other {
+                    SaltOutcome::Survived { .. } => "Survived",
+                    SaltOutcome::Dropped { .. } => "Dropped",
+                    SaltOutcome::Failed { .. } => "Failed",
+                    SaltOutcome::Screened { .. } => unreachable!(),
+                }
+            ),
+        }
+        // Exactly one answer: no duplicate send from a dropped `continue`.
+        assert!(outcomes.try_recv().is_err());
+        assert!(results.try_recv().is_err());
+    }
+
+    #[test]
+    fn lease_top_k_offer_admits_evicts_ties_and_a_new_lease_starts_empty() {
+        let top10 = LeaseTopK::new();
+        // Ten energies in increasing (worsening) order: the empty lease's
+        // top-LEASE_TOP_N has room for each regardless of order, so every
+        // `offer` call returns true (the harvest-level effect — pushed with
+        // reads instead of merely screened — is exercised separately, in
+        // `mixed_intake_pushes_a_gate_screen_that_enters_the_empty_top10_preserves_survivors_and_fails_draw_errors`
+        // and its full-top-10 counterpart).
         let bests = [-100, -90, -80, -70, -60, -50, -40, -30, -20, -10];
         for &best in &bests {
             assert!(

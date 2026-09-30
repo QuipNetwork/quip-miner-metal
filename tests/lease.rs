@@ -151,27 +151,32 @@ async fn screened_salts_never_send_one_result_per_salt() {
         done.best_energy_milli > bound,
         "the unreachable target is never met"
     );
-    // No salt beats the unreachable target, so nothing is a real winner:
-    // every reported salt got here through the lease's running top-N,
-    // streamed back with reads as it displaces a worse entry, instead of
-    // merely screened. The set itself never holds more than LEASE_TOP_N
-    // entries, but streaming as units finish (rather than holding the set
-    // to lease end) reports each displacement, so the lease's total Result
-    // count is not bounded by LEASE_TOP_N: it is the running top-k's
-    // expected total emission count, about k*ln(n/k) for k=LEASE_TOP_N and
-    // n salts — far below one Result per salt.
+    // No salt beats the unreachable target, so nothing is a real winner and
+    // there are no final-checkpoint survivors either: every reported salt
+    // got here through the lease's running top-N, streamed back with reads
+    // as it displaces a worse entry, instead of merely screened. The set
+    // itself never holds more than LEASE_TOP_N entries, but streaming as
+    // units finish (rather than holding the set to lease end) reports each
+    // displacement, so the lease's total Result count is not bounded by
+    // LEASE_TOP_N. A lease's total Results are its final-checkpoint/
+    // target-hit survivors (always pushed; none here) plus the salts that
+    // ever entered the running top-N as a screen — expected about
+    // k + k*ln(n/k) for k = LEASE_TOP_N and n salts, far below one Result
+    // per salt.
     let results = s.log.results_for(b"lease-none");
     assert!(
-        !results.is_empty(),
-        "the running top-{LEASE_TOP_N} reports its best screens"
+        results.len() >= LEASE_TOP_N,
+        "the first {LEASE_TOP_N} screens always fill the still-open top-{LEASE_TOP_N}, got {}",
+        results.len()
     );
     let ceiling = salt_count as usize / 2;
     assert!(
         results.len() < ceiling,
-        "expected roughly {}*ln({salt_count}/{}) ~= {:.0} results, got {} (>= the {ceiling} ceiling)",
+        "expected roughly {}+{}*ln({salt_count}/{}) ~= {:.0} results, got {} (>= the {ceiling} ceiling)",
         LEASE_TOP_N,
         LEASE_TOP_N,
-        LEASE_TOP_N as f64 * (salt_count as f64 / LEASE_TOP_N as f64).ln(),
+        LEASE_TOP_N,
+        LEASE_TOP_N as f64 + LEASE_TOP_N as f64 * (salt_count as f64 / LEASE_TOP_N as f64).ln(),
         results.len()
     );
     let mut salts = HashSet::new();
