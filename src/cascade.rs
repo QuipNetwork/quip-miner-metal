@@ -294,6 +294,9 @@ pub(crate) struct Ticket {
     pub(crate) audited: bool,
     pub(crate) topology_epoch: u64,
     pub(crate) yield_epoch: u64,
+    /// Set by [`Controller::checkpoint`] when a target hit ends the unit early,
+    /// to the sweep count of the checkpoint that hit. `None` otherwise.
+    pub(crate) finish_sweeps: Option<usize>,
     // Preserve admitted transitions and controllers across settings changes.
     plan: Arc<Mutex<StagePlan>>,
     final_sweeps: usize,
@@ -641,12 +644,16 @@ impl Controller {
             audited: false,
             topology_epoch: self.topology_epoch,
             yield_epoch: self.yield_epoch,
+            finish_sweeps: None,
             plan: Arc::clone(&self.plan),
             final_sweeps: job.params.num_sweeps,
         })
     }
 
-    /// Called at a non-last checkpoint with the unit's target. true = keep running.
+    /// Called at a non-last checkpoint with the unit's target. true = keep
+    /// running. A target hit strictly below the target (the chain rule) ends
+    /// the unit now: `false`, with `ticket.finish_sweeps` set so the caller
+    /// delivers the current reads instead of screening the unit out.
     pub(crate) fn checkpoint(
         &mut self,
         ticket: &mut Ticket,
@@ -660,11 +667,18 @@ impl Controller {
         Self::observe_transition(&mut plan, ticket, best);
         let stage = ticket.stage;
         let sweeps = plan.settings.stages[stage];
-        if target_milli.is_some_and(|target| best <= target) {
-            self.stats.record(stage, sweeps, true);
-            ticket.audited = false;
-            ticket.stage += 1;
-            return true;
+        if let Some(target) = target_milli {
+            if best < target {
+                self.stats.record(stage, sweeps, true);
+                ticket.finish_sweeps = Some(sweeps);
+                return false;
+            }
+            if best == target {
+                self.stats.record(stage, sweeps, true);
+                ticket.audited = false;
+                ticket.stage += 1;
+                return true;
+            }
         }
         if plan.settings.open_gates {
             self.stats.record(stage, sweeps, true);
@@ -1183,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn a_best_at_the_target_always_continues() {
+    fn checkpoint_decision_at_a_target() {
         let mut controller = Controller::new(CascadeSettings {
             stages: stage_array(&[16, 64]),
             ..CascadeSettings::default()
@@ -1196,12 +1210,26 @@ mod tests {
         }
         let mut candidate = job(4, 256);
         candidate.params.num_reads = 64;
+
+        // No target: the adaptive gate screens a shallow best.
         let (mut strict_ticket, _, _) = controller.admit(&candidate);
         assert!(!controller.checkpoint(&mut strict_ticket, -100, None));
 
-        let (mut ticket, _, _) = controller.admit(&candidate);
-        assert!(controller.checkpoint(&mut ticket, -100, Some(-100)));
-        assert!(controller.checkpoint(&mut ticket, -150, Some(-100)));
+        // Above target: falls through to the same adaptive gate and is
+        // screened, same as no target at all.
+        let (mut above, _, _) = controller.admit(&candidate);
+        assert!(!controller.checkpoint(&mut above, -100, Some(-150)));
+        assert_eq!(above.finish_sweeps, None);
+
+        // Equal to target: the chain rule keeps the unit, unscreened.
+        let (mut equal, _, _) = controller.admit(&candidate);
+        assert!(controller.checkpoint(&mut equal, -150, Some(-150)));
+        assert_eq!(equal.finish_sweeps, None);
+
+        // Below target: the unit finishes immediately at this checkpoint.
+        let (mut below, _, _) = controller.admit(&candidate);
+        assert!(!controller.checkpoint(&mut below, -200, Some(-150)));
+        assert_eq!(below.finish_sweeps, Some(16));
     }
 
     #[test]
@@ -1216,7 +1244,8 @@ mod tests {
         let (mut plain, _, _) = c.admit(&job(1, 256));
         c.checkpoint(&mut plain, 0, None);
         c.finish(&plain, Some(0), true);
-        assert!(c.checkpoint(&mut salt, -200, Some(-100)));
+        assert!(!c.checkpoint(&mut salt, -200, Some(-100)));
+        assert!(salt.finish_sweeps.is_some());
         c.finish(&salt, Some(-200), true);
         let hits = c.yield_check.as_ref().expect("yield check").observation().0;
         assert_eq!(hits, 1.0, "the lease unit's hit is counted");

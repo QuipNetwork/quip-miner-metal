@@ -27,6 +27,7 @@ struct Live {
     origin: Origin,
     ticket: Ticket,
     accounted_us: u64,
+    admitted: Instant,
 }
 
 pub(crate) enum SaltOutcome {
@@ -237,6 +238,22 @@ impl Pool {
             if checkpoint.last {
                 done.push(checkpoint.slot);
             } else if !controller.checkpoint(&mut live.ticket, checkpoint.best, target_milli) {
+                if let Some(sweeps) = live.ticket.finish_sweeps {
+                    let index = match &live.origin {
+                        Origin::Salt { index, .. } => Some(*index),
+                        Origin::Stream => None,
+                    };
+                    tracing::info!(
+                        target: "quip_miner_metal::cascade_trace",
+                        ?index,
+                        sweeps,
+                        best = checkpoint.best,
+                        elapsed_ms = live.admitted.elapsed().as_millis() as u64,
+                        "salt finished on a target hit"
+                    );
+                    done.push(checkpoint.slot);
+                    continue;
+                }
                 self.slots.release(checkpoint.slot)?;
                 let Some(live) = self.live[checkpoint.slot].take() else {
                     continue;
@@ -934,6 +951,7 @@ pub(crate) fn run(
                         origin,
                         ticket,
                         accounted_us: 0,
+                        admitted: Instant::now(),
                     })
                 }
                 Err(error) => {
@@ -1118,6 +1136,131 @@ mod tests {
             StreamOutcome::Cancelled => panic!("plain job was cancelled"),
         }
         assert!(results.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_target_hit_finishes_early_and_a_salt_without_a_target_runs_every_stage() {
+        if MetalDevice::device_count() == 0 {
+            #[expect(clippy::print_stderr, reason = "device tests report a sandbox skip")]
+            {
+                eprintln!("skipping target-hit finish test: no Metal device");
+            }
+            return;
+        }
+        struct Governor;
+        impl GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let device = MetalDevice::open(0).unwrap();
+        let settings = CascadeSettings {
+            stages: stage_array(&[8]),
+            open_gates: true,
+            ..CascadeSettings::default()
+        };
+        let mut controller = Controller::new(settings);
+        let hit_job = job(2000, 256);
+        let mut pool = Pool::new(&device, &hit_job, 2).unwrap();
+
+        let (hit_reply, hit_outcomes) = mpsc::channel();
+        let (hit_ticket, hit_schedule, hit_checkpoints) = controller.admit(&hit_job);
+        let hit_slot = pool
+            .slots
+            .admit(SlotJob {
+                graph: hit_job.graph.clone(),
+                schedule: hit_schedule.into(),
+                checkpoints: hit_checkpoints,
+                seed: hit_job.params.seed,
+            })
+            .unwrap();
+        pool.live[hit_slot] = Some(Live {
+            job: hit_job,
+            origin: Origin::Salt {
+                index: 1,
+                // Easily beaten: any real energy is below it, so the unit
+                // finishes at the first checkpoint (the chain rule, strict <).
+                target_milli: Some(i64::MAX - 1),
+                stop: Arc::default(),
+                reply: hit_reply,
+            },
+            ticket: hit_ticket,
+            accounted_us: 0,
+            admitted: Instant::now(),
+        });
+
+        let plain_job = job(2001, 256);
+        let (plain_reply, plain_outcomes) = mpsc::channel();
+        let (plain_ticket, plain_schedule, plain_checkpoints) = controller.admit(&plain_job);
+        let plain_slot = pool
+            .slots
+            .admit(SlotJob {
+                graph: plain_job.graph.clone(),
+                schedule: plain_schedule.into(),
+                checkpoints: plain_checkpoints,
+                seed: plain_job.params.seed,
+            })
+            .unwrap();
+        pool.live[plain_slot] = Some(Live {
+            job: plain_job,
+            origin: Origin::Salt {
+                index: 2,
+                target_milli: None,
+                stop: Arc::default(),
+                reply: plain_reply,
+            },
+            ticket: plain_ticket,
+            accounted_us: 0,
+            admitted: Instant::now(),
+        });
+
+        let (out, mut results) = tokio::sync::mpsc::channel(4);
+        let cancel = CancelToken::default();
+        pool.slots.commit_step(8).unwrap();
+        pool.harvest(&mut controller, &out, &cancel, &Governor)
+            .unwrap();
+
+        // The target hit ends the unit at the first checkpoint: released now,
+        // with the reads it already has, and the later stage never runs.
+        assert!(pool.live[hit_slot].is_none());
+        match hit_outcomes.try_recv().unwrap() {
+            SaltOutcome::Survived { index, reads } => {
+                assert_eq!(index, 1);
+                assert_eq!(reads.len(), 4);
+            }
+            SaltOutcome::Screened { .. } => panic!("a target hit must not screen the unit out"),
+            other => panic!("expected a survivor, got {}", debug_variant(&other)),
+        }
+
+        // The salt without a target is still mid-schedule: no report yet.
+        assert!(pool.live[plain_slot].is_some());
+        assert!(plain_outcomes.try_recv().is_err());
+
+        pool.slots.commit_step(256).unwrap();
+        pool.harvest(&mut controller, &out, &cancel, &Governor)
+            .unwrap();
+        match plain_outcomes.try_recv().unwrap() {
+            SaltOutcome::Survived { index, reads } => {
+                assert_eq!(index, 2);
+                assert_eq!(reads.len(), 4);
+            }
+            other => panic!("expected a survivor, got {}", debug_variant(&other)),
+        }
+        assert_eq!(pool.slots.live(), 0);
+        assert!(results.try_recv().is_err());
+
+        fn debug_variant(outcome: &SaltOutcome) -> &'static str {
+            match outcome {
+                SaltOutcome::Screened { .. } => "Screened",
+                SaltOutcome::Survived { .. } => "Survived",
+                SaltOutcome::Dropped { .. } => "Dropped",
+                SaltOutcome::Failed { .. } => "Failed",
+            }
+        }
     }
 
     fn salt(index: u64, reply: &mpsc::Sender<SaltOutcome>) -> Salt {
@@ -1949,6 +2092,7 @@ mod tests {
             origin: Origin::Stream,
             ticket,
             accounted_us: 0,
+            admitted: Instant::now(),
         });
         let (out, mut results) = tokio::sync::mpsc::channel(2);
         let cancel = CancelToken::default();
@@ -2026,8 +2170,11 @@ mod tests {
             fn record_gpu_busy_us(&self, _: u64) {}
         }
         let device = MetalDevice::open(0).unwrap();
+        // open_gates keeps the unit past the first checkpoint deterministically;
+        // this test is about the lease `stop` flag, not the target hit.
         let mut controller = Controller::new(CascadeSettings {
             stages: stage_array(&[8]),
+            open_gates: true,
             ..CascadeSettings::default()
         });
         let live_job = job(1000, 256);
@@ -2048,19 +2195,20 @@ mod tests {
             job: live_job,
             origin: Origin::Salt {
                 index: 5,
-                target_milli: Some(i64::MAX),
+                target_milli: None,
                 stop: Arc::clone(&stop),
                 reply,
             },
             ticket,
             accounted_us: 0,
+            admitted: Instant::now(),
         });
         let (out, _results) = tokio::sync::mpsc::channel(1);
         let cancel = CancelToken::default();
         pool.slots.commit_step(8).unwrap();
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
-        assert_eq!(pool.slots.live(), 1, "a unit at its target keeps running");
+        assert_eq!(pool.slots.live(), 1, "the unit keeps running past stage 0");
         assert!(outcomes.try_recv().is_err());
         pool.slots.commit_step(8).unwrap();
         stop.store(true, Ordering::Release);
