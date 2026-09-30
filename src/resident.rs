@@ -16,11 +16,48 @@ use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender};
+
+/// Sentinel stored in [`LiveTarget`] for "no target". Real targets are
+/// milli-energies; the benchmark and test fixtures span roughly
+/// -15,000,000..=i64::MAX, never this value, so it is safe to reserve.
+const NO_TARGET: i64 = i64::MIN;
+
+/// A lease's session target, shared by every unit the lease has in flight.
+///
+/// `MetalSampler::sample_lease` (src/lib.rs) owns the write side: its
+/// intake loop already runs continuously while the lease is open, so it
+/// refreshes this cell from `LeaseSink::target_energy_milli` (the live
+/// `watch` channel quip-solver-core keeps for the session) on every pass
+/// instead of capturing the target once at enqueue time. The resident
+/// runner (this module) only ever reads it, at each checkpoint/harvest, via
+/// a relaxed atomic load — no lock, no polling thread of its own.
+#[derive(Clone)]
+pub(crate) struct LiveTarget(Arc<AtomicI64>);
+
+impl LiveTarget {
+    pub(crate) fn new(target_milli: Option<i64>) -> Self {
+        Self(Arc::new(AtomicI64::new(target_milli.unwrap_or(NO_TARGET))))
+    }
+
+    /// Refresh the shared cell. Called from the lease's intake loop.
+    pub(crate) fn set(&self, target_milli: Option<i64>) {
+        self.0
+            .store(target_milli.unwrap_or(NO_TARGET), Ordering::Relaxed);
+    }
+
+    /// The current live target. Called at each checkpoint/harvest.
+    pub(crate) fn get(&self) -> Option<i64> {
+        match self.0.load(Ordering::Relaxed) {
+            NO_TARGET => None,
+            value => Some(value),
+        }
+    }
+}
 
 struct Live {
     job: StreamJob,
@@ -28,6 +65,8 @@ struct Live {
     ticket: Ticket,
     accounted_us: u64,
     admitted: Instant,
+    /// The target last seen for this unit, to log only on a change.
+    last_target_milli: Option<i64>,
 }
 
 pub(crate) enum SaltOutcome {
@@ -58,7 +97,9 @@ pub(crate) struct Salt {
     /// Set when the issuing lease ends. Its queued and live units then stop
     /// and answer `Dropped`.
     pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) target_milli: Option<i64>,
+    /// Shared handle to the lease's live target; `MetalSampler::sample_lease`
+    /// keeps it fresh for as long as the lease is open.
+    pub(crate) target: LiveTarget,
     pub(crate) reply: mpsc::Sender<SaltOutcome>,
 }
 
@@ -71,7 +112,7 @@ enum Origin {
     Stream,
     Salt {
         index: u64,
-        target_milli: Option<i64>,
+        target: LiveTarget,
         stop: Arc<AtomicBool>,
         reply: mpsc::Sender<SaltOutcome>,
     },
@@ -233,8 +274,18 @@ impl Pool {
             );
             let target_milli = match &live.origin {
                 Origin::Stream => None,
-                Origin::Salt { target_milli, .. } => *target_milli,
+                Origin::Salt { target, .. } => target.get(),
             };
+            if target_milli != live.last_target_milli {
+                tracing::debug!(
+                    target: "quip_miner_metal::cascade_trace",
+                    job = %String::from_utf8_lossy(&live.job.job_id),
+                    old = ?live.last_target_milli,
+                    new = ?target_milli,
+                    "live target changed"
+                );
+                live.last_target_milli = target_milli;
+            }
             if checkpoint.last {
                 done.push(checkpoint.slot);
             } else if !controller.checkpoint(&mut live.ticket, checkpoint.best, target_milli) {
@@ -491,7 +542,7 @@ impl Preparation {
                             Source::Salt(salt) => {
                                 let origin = Origin::Salt {
                                     index: salt.index,
-                                    target_milli: salt.target_milli,
+                                    target: salt.target.clone(),
                                     stop: Arc::clone(&salt.stop),
                                     reply: salt.reply.clone(),
                                 };
@@ -928,9 +979,13 @@ pub(crate) fn run(
             let Some(pools) = &mut pools else { continue };
             let pool = &mut pools[turn];
             // Plain jobs have no target and leave the yield check alone.
-            if let Origin::Salt { target_milli, .. } = &origin {
-                controller.set_yield_target(*target_milli);
-            }
+            let initial_target_milli = if let Origin::Salt { target, .. } = &origin {
+                let target_milli = target.get();
+                controller.set_yield_target(target_milli);
+                target_milli
+            } else {
+                None
+            };
             let ticket = match controller.admit_prepared(&job, &mut data.schedule, &edges) {
                 Ok(ticket) => ticket,
                 Err(error) => {
@@ -952,6 +1007,7 @@ pub(crate) fn run(
                         ticket,
                         accounted_us: 0,
                         admitted: Instant::now(),
+                        last_target_milli: initial_target_milli,
                     })
                 }
                 Err(error) => {
@@ -1069,7 +1125,7 @@ mod tests {
                         ..Default::default()
                     },
                     stop: Arc::default(),
-                    target_milli: Some(if index == 1 { i64::MAX } else { -1_000_000 }),
+                    target: LiveTarget::new(Some(if index == 1 { i64::MAX } else { -1_000_000 })),
                     reply: reply.clone(),
                 })
                 .unwrap();
@@ -1184,13 +1240,14 @@ mod tests {
                 index: 1,
                 // Easily beaten: any real energy is below it, so the unit
                 // finishes at the first checkpoint (the chain rule, strict <).
-                target_milli: Some(i64::MAX - 1),
+                target: LiveTarget::new(Some(i64::MAX - 1)),
                 stop: Arc::default(),
                 reply: hit_reply,
             },
             ticket: hit_ticket,
             accounted_us: 0,
             admitted: Instant::now(),
+            last_target_milli: None,
         });
 
         let plain_job = job(2001, 256);
@@ -1209,13 +1266,14 @@ mod tests {
             job: plain_job,
             origin: Origin::Salt {
                 index: 2,
-                target_milli: None,
+                target: LiveTarget::new(None),
                 stop: Arc::default(),
                 reply: plain_reply,
             },
             ticket: plain_ticket,
             accounted_us: 0,
             admitted: Instant::now(),
+            last_target_milli: None,
         });
 
         let (out, mut results) = tokio::sync::mpsc::channel(4);
@@ -1263,6 +1321,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn easing_the_live_target_between_checkpoints_finishes_the_unit_early() {
+        if MetalDevice::device_count() == 0 {
+            #[expect(clippy::print_stderr, reason = "device tests report a sandbox skip")]
+            {
+                eprintln!("skipping live-target finish test: no Metal device");
+            }
+            return;
+        }
+        struct Governor;
+        impl GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let device = MetalDevice::open(0).unwrap();
+        // Three checkpoints (8, 64, 256) so the second is not the last: the
+        // unit must finish there on the eased target, not by running out
+        // the schedule.
+        let settings = CascadeSettings {
+            stages: stage_array(&[8, 64]),
+            open_gates: true,
+            ..CascadeSettings::default()
+        };
+        let mut controller = Controller::new(settings);
+        let unit_job = job(3000, 256);
+        let mut pool = Pool::new(&device, &unit_job, 1).unwrap();
+
+        let (reply, outcomes) = mpsc::channel();
+        let (ticket, schedule, checkpoints) = controller.admit(&unit_job);
+        let slot = pool
+            .slots
+            .admit(SlotJob {
+                graph: unit_job.graph.clone(),
+                schedule: schedule.into(),
+                checkpoints,
+                seed: unit_job.params.seed,
+            })
+            .unwrap();
+        // Unreachable: this job's energy never goes below -1_000_000 milli,
+        // so the first checkpoint cannot hit it and the unit keeps running.
+        let target = LiveTarget::new(Some(-1_000_000));
+        pool.live[slot] = Some(Live {
+            job: unit_job,
+            origin: Origin::Salt {
+                index: 9,
+                target: target.clone(),
+                stop: Arc::default(),
+                reply,
+            },
+            ticket,
+            accounted_us: 0,
+            admitted: Instant::now(),
+            last_target_milli: None,
+        });
+
+        let (out, mut results) = tokio::sync::mpsc::channel(2);
+        let cancel = CancelToken::default();
+
+        // First checkpoint (8 sweeps): the target is unreachable, so the
+        // unit keeps running.
+        pool.slots.commit_step(8).unwrap();
+        pool.harvest(&mut controller, &out, &cancel, &Governor)
+            .unwrap();
+        assert!(pool.live[slot].is_some(), "unit ended before easing");
+        assert!(outcomes.try_recv().is_err());
+
+        // The chain's decay ratchet eases the session target above this
+        // unit's best energy, live, between checkpoints.
+        target.set(Some(i64::MAX - 1));
+
+        // Second checkpoint (64 sweeps, not the schedule's last): the live
+        // read now sees the eased target and finishes the unit here.
+        pool.slots.commit_step(64).unwrap();
+        pool.harvest(&mut controller, &out, &cancel, &Governor)
+            .unwrap();
+        assert!(
+            pool.live[slot].is_none(),
+            "the eased live target must finish the unit at the next checkpoint"
+        );
+        match outcomes.try_recv().unwrap() {
+            SaltOutcome::Survived { index, reads } => {
+                assert_eq!(index, 9);
+                assert_eq!(reads.len(), 4);
+            }
+            other => panic!(
+                "expected a survivor from the eased target, got {}",
+                match other {
+                    SaltOutcome::Screened { .. } => "Screened",
+                    SaltOutcome::Dropped { .. } => "Dropped",
+                    SaltOutcome::Failed { .. } => "Failed",
+                    SaltOutcome::Survived { .. } => unreachable!(),
+                }
+            ),
+        }
+        assert_eq!(pool.slots.live(), 0);
+        assert!(results.try_recv().is_err());
+    }
+
     fn salt(index: u64, reply: &mpsc::Sender<SaltOutcome>) -> Salt {
         Salt {
             topology: Arc::new(quip_solver_core::quip_protocol::lease::TopologyView {
@@ -1279,7 +1440,7 @@ mod tests {
                 ..Default::default()
             },
             stop: Arc::default(),
-            target_milli: None,
+            target: LiveTarget::new(None),
             reply: reply.clone(),
         }
     }
@@ -2093,6 +2254,7 @@ mod tests {
             ticket,
             accounted_us: 0,
             admitted: Instant::now(),
+            last_target_milli: None,
         });
         let (out, mut results) = tokio::sync::mpsc::channel(2);
         let cancel = CancelToken::default();
@@ -2195,13 +2357,14 @@ mod tests {
             job: live_job,
             origin: Origin::Salt {
                 index: 5,
-                target_milli: None,
+                target: LiveTarget::new(None),
                 stop: Arc::clone(&stop),
                 reply,
             },
             ticket,
             accounted_us: 0,
             admitted: Instant::now(),
+            last_target_milli: None,
         });
         let (out, _results) = tokio::sync::mpsc::channel(1);
         let cancel = CancelToken::default();

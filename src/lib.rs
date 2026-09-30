@@ -359,8 +359,16 @@ impl quip_solver_core::Sampler for MetalSampler {
         let _stop = StoreOnDrop(&stop, true);
         let window = resident::PREP_BOUND as u64;
         let (mut next, mut open) = (0u64, 0u64);
+        // Shared with every unit of this lease. quip-solver-core keeps the
+        // session target in a live `watch` channel (LeaseSink::target_energy_milli,
+        // a cheap borrow); this loop already runs continuously for as long as
+        // the lease is open, so it refreshes this cell on every pass instead
+        // of units each capturing a target snapshot at enqueue time. The
+        // resident runner only reads it, at each checkpoint.
+        let live_target = resident::LiveTarget::new(sink.target_energy_milli());
         while !sink.is_stopped() && (next < lease.salt_count() || open > 0) {
             self.require_runner()?;
+            live_target.set(sink.target_energy_milli());
             while open < window && next < lease.salt_count() {
                 let mut salt = resident::Salt {
                     topology: std::sync::Arc::clone(&topology),
@@ -368,7 +376,7 @@ impl quip_solver_core::Sampler for MetalSampler {
                     index: next,
                     params: params.clone(),
                     stop: std::sync::Arc::clone(&stop),
-                    target_milli: sink.target_energy_milli(),
+                    target: live_target.clone(),
                     reply: reply.clone(),
                 };
                 loop {
