@@ -16,7 +16,12 @@ use quip_solver_core::quip_protocol::lease::verify_lease_result;
 use quip_solver_core::quip_protocol::wire::encode_i32_le;
 use std::collections::HashSet;
 use std::time::Duration;
-use support::{aglais, lease, miner_binary, ring, target, wire_target, Session};
+use support::{aglais, lease, miner_binary, permissive_target, ring, target, Session};
+
+/// How many of a lease's best-finishing screens the miner streams back with
+/// reads instead of merely screening. Mirrors `resident::LEASE_TOP_N`
+/// (private to the miner crate, so the integration tests hardcode it).
+const LEASE_TOP_N: usize = 10;
 
 const RING_A: [u8; 32] = [0x51; 32];
 const RING_B: [u8; 32] = [0x52; 32];
@@ -79,15 +84,18 @@ async fn every_salt_is_counted_once() {
     );
     let mut salts = HashSet::new();
     for result in &results {
-        let verified = verify_lease_result(&spec, &view, &wire_target(&t), result)
-            .expect("every winner verifies against the lease");
+        // A permissive target: `push` forwards every non-empty read set
+        // unfiltered, so a reported salt's reads need not beat `t`, only
+        // decode to the energies it claims for its redrawn problem.
+        let verified = verify_lease_result(&spec, &view, &permissive_target(), result)
+            .expect("every reported salt verifies against the lease");
         assert!(salts.insert(verified.salt), "one result per salt");
     }
     assert_eq!(s.shutdown(2_000).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reachable_target_screens_no_winner() {
+async fn an_i64_max_target_reports_every_salt_as_a_winner() {
     let mut s = Session::start(&msa(), 4, "").await;
     let (topology, view) = ring(64, RING_A);
     s.send(coord_msg::Msg::Topology(topology)).await;
@@ -105,7 +113,10 @@ async fn a_reachable_target_screens_no_winner() {
     assert_eq!(results.len(), 64, "an i64::MAX target makes every salt win");
     let mut salts = HashSet::new();
     for result in &results {
-        let verified = verify_lease_result(&spec, &view, &wire_target(&t), result)
+        // A permissive target: `push` forwards every non-empty read set
+        // unfiltered, so a winner's full read set need not fit a proof-set
+        // size; this only checks it decodes to the energies it claims.
+        let verified = verify_lease_result(&spec, &view, &permissive_target(), result)
             .expect("every winner verifies against the lease");
         assert!(salts.insert(verified.salt), "one result per salt");
     }
@@ -113,36 +124,62 @@ async fn a_reachable_target_screens_no_winner() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn screened_salts_send_no_reads() {
+async fn screened_salts_never_send_one_result_per_salt() {
     let mut s = Session::start(&msa(), 4, "").await;
-    let (topology, _) = ring(64, RING_A);
+    let (topology, view) = ring(64, RING_A);
     s.send(coord_msg::Msg::Topology(topology)).await;
     // 64 nodes and 64 edges: no spin assignment on unit couplings can go
-    // below -(64 + 64) * 1000, so this target screens every salt.
+    // below -(64 + 64) * 1000, so this target screens every salt. 256
+    // sweeps (above the cascade's first calibrated stage, 32) gives every
+    // salt a real gate checkpoint before its final one, so most salts are
+    // gate-screened rather than running straight to the final checkpoint.
     let bound = -(64i64 + 64) * 1000 - 1;
-    s.send(coord_msg::Msg::SetTarget(target(bound, 32))).await;
+    s.send(coord_msg::Msg::SetTarget(target(bound, 256))).await;
     let salt_count = 200;
-    s.send(coord_msg::Msg::Job(lease(
-        b"lease-none",
-        3,
-        RING_A,
-        0,
-        salt_count,
-    )))
-    .await;
+    let job = lease(b"lease-none", 3, RING_A, 0, salt_count);
+    let spec = generator(&job);
+    s.send(coord_msg::Msg::Job(job)).await;
     s.until("lease done", LONG, |log| {
         log.done(b"lease-none").is_some()
     })
     .await;
 
     let done = s.log.done(b"lease-none").expect("LeaseDone");
-    assert_eq!(done.salts_done, salt_count);
-    assert!(s.log.results_for(b"lease-none").is_empty());
+    assert_eq!(done.salts_done, salt_count, "every salt is counted once");
     assert!(done.best_energy_milli < i64::MAX, "reads finished");
     assert!(
         done.best_energy_milli > bound,
         "the unreachable target is never met"
     );
+    // No salt beats the unreachable target, so nothing is a real winner:
+    // every reported salt got here through the lease's running top-N,
+    // streamed back with reads as it displaces a worse entry, instead of
+    // merely screened. The set itself never holds more than LEASE_TOP_N
+    // entries, but streaming as units finish (rather than holding the set
+    // to lease end) reports each displacement, so the lease's total Result
+    // count is not bounded by LEASE_TOP_N: it is the running top-k's
+    // expected total emission count, about k*ln(n/k) for k=LEASE_TOP_N and
+    // n salts — far below one Result per salt.
+    let results = s.log.results_for(b"lease-none");
+    assert!(
+        !results.is_empty(),
+        "the running top-{LEASE_TOP_N} reports its best screens"
+    );
+    let ceiling = salt_count as usize / 2;
+    assert!(
+        results.len() < ceiling,
+        "expected roughly {}*ln({salt_count}/{}) ~= {:.0} results, got {} (>= the {ceiling} ceiling)",
+        LEASE_TOP_N,
+        LEASE_TOP_N,
+        LEASE_TOP_N as f64 * (salt_count as f64 / LEASE_TOP_N as f64).ln(),
+        results.len()
+    );
+    let mut salts = HashSet::new();
+    for result in &results {
+        let verified = verify_lease_result(&spec, &view, &permissive_target(), result)
+            .expect("every reported salt verifies against the lease");
+        assert!(salts.insert(verified.salt), "one result per salt");
+    }
     assert_eq!(s.shutdown(2_000).await, 0);
 }
 
@@ -359,7 +396,10 @@ async fn a_topology_change_between_leases_uses_the_new_graph() {
     let results = s.log.results_for(b"lease-b");
     assert_eq!(results.len(), 40);
     for result in results {
-        verify_lease_result(&spec, &view, &wire_target(&t), result)
+        // A permissive target: `push` forwards every non-empty read set
+        // unfiltered, so this only checks the 96-node ring was actually
+        // used to redraw and score the salt.
+        verify_lease_result(&spec, &view, &permissive_target(), result)
             .expect("second-lease winners use the 96-node ring");
     }
     assert_eq!(s.shutdown(2_000).await, 0);

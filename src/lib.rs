@@ -366,6 +366,9 @@ impl quip_solver_core::Sampler for MetalSampler {
         // of units each capturing a target snapshot at enqueue time. The
         // resident runner only reads it, at each checkpoint.
         let live_target = resident::LiveTarget::new(sink.target_energy_milli());
+        // Shared with every unit of this lease. A new lease starts empty;
+        // see `resident::LeaseTopK`.
+        let top10 = resident::LeaseTopK::new();
         while !sink.is_stopped() && (next < lease.salt_count() || open > 0) {
             self.require_runner()?;
             live_target.set(sink.target_energy_milli());
@@ -377,6 +380,7 @@ impl quip_solver_core::Sampler for MetalSampler {
                     params: params.clone(),
                     stop: std::sync::Arc::clone(&stop),
                     target: live_target.clone(),
+                    top10: top10.clone(),
                     reply: reply.clone(),
                 };
                 loop {

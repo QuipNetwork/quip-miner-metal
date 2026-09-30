@@ -59,6 +59,57 @@ impl LiveTarget {
     }
 }
 
+/// How many of a lease's best-finishing salts are streamed back with reads
+/// instead of merely screened. Streaming as units finish (rather than
+/// holding the set to lease end) means a round cancel does not drop them;
+/// expected cost is about 10*ln(n/10) `Result`s per lease, roughly 110 for a
+/// 1,000,000-salt lease.
+pub(crate) const LEASE_TOP_N: usize = 10;
+
+/// A lease's running top-[`LEASE_TOP_N`] finished energies, shared by every
+/// unit of that lease still in flight. Fixed-size and allocation-free: a new
+/// lease starts empty via [`LeaseTopK::new`].
+#[derive(Clone)]
+pub(crate) struct LeaseTopK(Arc<Mutex<TopKState>>);
+
+struct TopKState {
+    /// Ascending (best/lowest first); only `len` entries are meaningful.
+    energies: [i64; LEASE_TOP_N],
+    len: usize,
+}
+
+impl LeaseTopK {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(TopKState {
+            energies: [0; LEASE_TOP_N],
+            len: 0,
+        })))
+    }
+
+    /// Offers a finished unit's best energy to the lease's running top
+    /// [`LEASE_TOP_N`]. Returns whether it enters. A tie with the current
+    /// worst kept entry does not enter. Inserts in sorted position when it
+    /// does; no allocation.
+    fn offer(&self, energy_milli: i64) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let TopKState { energies, len } = &mut *state;
+        if *len < LEASE_TOP_N {
+            let pos = energies[..*len].partition_point(|&e| e <= energy_milli);
+            energies.copy_within(pos..*len, pos + 1);
+            energies[pos] = energy_milli;
+            *len += 1;
+            true
+        } else if energy_milli < energies[LEASE_TOP_N - 1] {
+            let pos = energies[..*len].partition_point(|&e| e <= energy_milli);
+            energies.copy_within(pos..LEASE_TOP_N - 1, pos + 1);
+            energies[pos] = energy_milli;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct Live {
     job: StreamJob,
     origin: Origin,
@@ -100,6 +151,9 @@ pub(crate) struct Salt {
     /// Shared handle to the lease's live target; `MetalSampler::sample_lease`
     /// keeps it fresh for as long as the lease is open.
     pub(crate) target: LiveTarget,
+    /// Shared handle to the lease's running top-[`LEASE_TOP_N`] finished
+    /// energies; a new lease starts this empty.
+    pub(crate) top10: LeaseTopK,
     pub(crate) reply: mpsc::Sender<SaltOutcome>,
 }
 
@@ -113,6 +167,7 @@ enum Origin {
     Salt {
         index: u64,
         target: LiveTarget,
+        top10: LeaseTopK,
         stop: Arc<AtomicBool>,
         reply: mpsc::Sender<SaltOutcome>,
     },
@@ -124,6 +179,16 @@ impl Origin {
         match self {
             Self::Stream => false,
             Self::Salt { stop, .. } => stop.load(Ordering::Acquire),
+        }
+    }
+
+    /// Offers `energy_milli` to this unit's lease's running top
+    /// [`LEASE_TOP_N`]. Always `false` for a plain stream job, which has no
+    /// lease.
+    fn offer_top10(&self, energy_milli: i64) -> bool {
+        match self {
+            Self::Stream => false,
+            Self::Salt { top10, .. } => top10.offer(energy_milli),
         }
     }
 }
@@ -288,6 +353,7 @@ impl Pool {
                 // strict chain rule as a gate hit, but no gate, no stage
                 // advance, and no controller stats — it is not a checkpoint.
                 if target_milli.is_some_and(|target| checkpoint.best < target) {
+                    live.origin.offer_top10(checkpoint.best);
                     let index = match &live.origin {
                         Origin::Salt { index, .. } => Some(*index),
                         Origin::Stream => None,
@@ -314,9 +380,11 @@ impl Pool {
                 "checkpoint"
             );
             if checkpoint.last {
+                live.origin.offer_top10(checkpoint.best);
                 done.push(checkpoint.slot);
             } else if !controller.checkpoint(&mut live.ticket, checkpoint.best, target_milli) {
                 if let Some(sweeps) = live.ticket.finish_sweeps {
+                    live.origin.offer_top10(checkpoint.best);
                     let index = match &live.origin {
                         Origin::Salt { index, .. } => Some(*index),
                         Origin::Stream => None,
@@ -330,6 +398,14 @@ impl Pool {
                         at = "gate",
                         "salt finished on a target hit"
                     );
+                    done.push(checkpoint.slot);
+                    continue;
+                }
+                // A gate-screened unit whose energy still enters the lease's
+                // running top-N is read back and pushed like a survivor,
+                // instead of released without read-back. `done` decodes and
+                // answers it below through the same path as a real survivor.
+                if live.origin.offer_top10(checkpoint.best) {
                     done.push(checkpoint.slot);
                     continue;
                 }
@@ -356,7 +432,9 @@ impl Pool {
                 "live target changed"
             );
         }
-        // Decode only completed slots; screened slots are released above.
+        // Decode completed slots and gate-screened slots that qualify for the
+        // lease's running top-N; screened-out slots without a qualifying
+        // energy are released above without read-back.
         let reads = self.slots.reads_many(&done, self.reads)?;
         for (slot, reads) in done.into_iter().zip(reads) {
             self.slots.release(slot)?;
@@ -580,6 +658,7 @@ impl Preparation {
                                 let origin = Origin::Salt {
                                     index: salt.index,
                                     target: salt.target.clone(),
+                                    top10: salt.top10.clone(),
                                     stop: Arc::clone(&salt.stop),
                                     reply: salt.reply.clone(),
                                 };
@@ -1136,7 +1215,8 @@ mod tests {
     use quip_solver_core::Sampler;
 
     #[test]
-    fn mixed_intake_screens_salts_preserves_survivors_and_fails_draw_errors() {
+    fn mixed_intake_pushes_a_gate_screen_that_enters_the_empty_top10_preserves_survivors_and_fails_draw_errors()
+     {
         let device = MetalDevice::open(0).unwrap();
         let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
         let topology = Arc::new(quip_solver_core::quip_protocol::lease::TopologyView {
@@ -1147,6 +1227,11 @@ mod tests {
         });
         let (reply, outcomes) = mpsc::channel();
         let (salts_tx, salts) = mpsc::sync_channel(PREP_BOUND);
+        // Shared by every salt of this lease, as `MetalSampler::sample_lease`
+        // shares one handle per lease. With fewer than LEASE_TOP_N finishers,
+        // a gate screen (salt 0) still enters the running top-N and is
+        // pushed with reads instead of merely screened.
+        let top10 = LeaseTopK::new();
         for index in 0..3 {
             let topology = if index == 2 {
                 let mut invalid = (*topology).clone();
@@ -1167,6 +1252,7 @@ mod tests {
                     },
                     stop: Arc::default(),
                     target: LiveTarget::new(Some(if index == 1 { i64::MAX } else { -1_000_000 })),
+                    top10: top10.clone(),
                     reply: reply.clone(),
                 })
                 .unwrap();
@@ -1193,16 +1279,11 @@ mod tests {
         let mut seen = [false; 3];
         for _ in 0..3 {
             let index = match outcomes.try_recv().unwrap() {
-                SaltOutcome::Screened {
-                    index,
-                    energy_milli,
-                } => {
-                    assert_eq!(index, 0);
-                    assert!((-1000..=1000).contains(&energy_milli));
-                    index
+                SaltOutcome::Screened { index, .. } => {
+                    panic!("salt {index}: an empty lease's top-{LEASE_TOP_N} always has room")
                 }
                 SaltOutcome::Survived { index, reads } => {
-                    assert_eq!(index, 1);
+                    assert!(index == 0 || index == 1, "unexpected survivor {index}");
                     assert_eq!(reads.len(), 4);
                     for read in reads {
                         assert_eq!(read.spins.len(), 2);
@@ -1233,6 +1314,47 @@ mod tests {
             StreamOutcome::Cancelled => panic!("plain job was cancelled"),
         }
         assert!(results.try_recv().is_err());
+    }
+
+    #[test]
+    fn lease_top10_reports_only_qualifying_screens_and_a_new_lease_starts_empty() {
+        let top10 = LeaseTopK::new();
+        // Ten screened units finish with descending (improving) energies:
+        // the empty lease's top-LEASE_TOP_N has room for each, so every one
+        // is reported with reads instead of merely screened.
+        let bests = [-100, -90, -80, -70, -60, -50, -40, -30, -20, -10];
+        for &best in &bests {
+            assert!(
+                top10.offer(best),
+                "energy {best} must enter the still-open top-{LEASE_TOP_N}"
+            );
+        }
+        // An 11th unit no better than the current worst kept entry (-10):
+        // it does not enter, so it is screened with no read-back.
+        assert!(
+            !top10.offer(0),
+            "worse than every kept entry must not enter"
+        );
+        // A tie with the worst kept entry does not enter either.
+        assert!(
+            !top10.offer(-10),
+            "a tie with the worst kept entry must not enter"
+        );
+        // Strictly better than the current worst kept entry evicts it and
+        // enters: this unit is reported with reads.
+        assert!(
+            top10.offer(-15),
+            "strictly better than the worst kept entry must enter"
+        );
+
+        // A second lease starts with an empty top-LEASE_TOP_N: an energy
+        // (-10) the first lease's tightened set would now reject has room
+        // here.
+        let second_lease = LeaseTopK::new();
+        assert!(
+            second_lease.offer(-10),
+            "a new lease's top-{LEASE_TOP_N} must start empty"
+        );
     }
 
     #[test]
@@ -1283,6 +1405,7 @@ mod tests {
                 // Easily beaten: any real energy is below it, so the unit
                 // finishes at the first checkpoint (the chain rule, strict <).
                 target: LiveTarget::new(Some(i64::MAX - 1)),
+                top10: LeaseTopK::new(),
                 stop: Arc::default(),
                 reply: hit_reply,
             },
@@ -1310,6 +1433,7 @@ mod tests {
             origin: Origin::Salt {
                 index: 2,
                 target: LiveTarget::new(None),
+                top10: LeaseTopK::new(),
                 stop: Arc::default(),
                 reply: plain_reply,
             },
@@ -1416,6 +1540,7 @@ mod tests {
             origin: Origin::Salt {
                 index: 9,
                 target: target.clone(),
+                top10: LeaseTopK::new(),
                 stop: Arc::default(),
                 reply,
             },
@@ -1520,6 +1645,7 @@ mod tests {
             origin: Origin::Salt {
                 index: 5,
                 target: target.clone(),
+                top10: LeaseTopK::new(),
                 stop: Arc::default(),
                 reply,
             },
@@ -1649,6 +1775,7 @@ mod tests {
             },
             stop: Arc::default(),
             target: LiveTarget::new(None),
+            top10: LeaseTopK::new(),
             reply: reply.clone(),
         }
     }
@@ -2568,6 +2695,7 @@ mod tests {
             origin: Origin::Salt {
                 index: 5,
                 target: LiveTarget::new(None),
+                top10: LeaseTopK::new(),
                 stop: Arc::clone(&stop),
                 reply,
             },

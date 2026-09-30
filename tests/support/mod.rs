@@ -351,12 +351,20 @@ pub(crate) fn target(max_energy_milli: i64, num_sweeps: u32) -> SetTarget {
     }
 }
 
-pub(crate) fn wire_target(t: &SetTarget) -> Target {
+/// A target that only checks a result's energies, nonce, and salt against
+/// its redrawn problem — never its solution count or its energy against the
+/// live session target. `LeaseSink::push` forwards every non-empty read set
+/// unfiltered (no target check, no truncation to a proof-set size), so a
+/// lease `Result` carries the salt's full read set: it can exceed the size
+/// or miss the energy bound a session `Target` derived from `SetTarget`
+/// would enforce for an on-chain proof. The coordinator, not this test,
+/// decides which verified rows beat the live target.
+pub(crate) fn permissive_target() -> Target {
     Target {
-        max_energy_milli: t.max_energy_milli,
-        min_solutions: t.min_solutions,
-        min_diversity_milli: t.min_diversity_milli,
-        max_proof_solutions: t.max_proof_solutions,
+        max_energy_milli: i64::MAX,
+        min_solutions: 1,
+        min_diversity_milli: 0,
+        max_proof_solutions: u32::MAX,
     }
 }
 
