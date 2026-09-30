@@ -62,10 +62,12 @@ pub(crate) struct SlotJob {
     pub(crate) checkpoints: Vec<usize>,
     pub(crate) seed: u64,
     /// Whether this job gets observe-only readback points between its
-    /// cascade checkpoints (see [`OBSERVE_INTERVAL`]). Only units that can
-    /// use them (salts carrying a live target) should set this; stream jobs
-    /// and salts leave it false so no extra output steps are ever built for
-    /// them.
+    /// cascade checkpoints (see [`OBSERVE_INTERVAL`]). Every salt sets this,
+    /// even one with no target yet: the lease's live target can appear or
+    /// change at any point while the unit is running, and an observe point
+    /// checks the *current* target, not the one at admission. Stream jobs,
+    /// which never carry a target, leave it false so no extra output steps
+    /// are ever built for them.
     pub(crate) observe: bool,
 }
 
@@ -603,15 +605,17 @@ impl SlotPool {
                     .map(i64::from)
                     .ok_or_else(|| SampleError::Driver("slot has no energies".into()))?;
                 let observe = step.flags & SLOT_OBSERVE != 0;
-                // An observe readback does not advance next_checkpoint: it is
-                // not a gate, so the next real checkpoint stays exactly where
-                // the cascade schedule put it, and `last` is always false.
+                // Either kind of output write leaves the buffers valid for
+                // reads_many. An observe readback does not advance
+                // next_checkpoint: it is not a gate, so the next real
+                // checkpoint stays exactly where the cascade schedule put
+                // it, and `last` is always false.
+                r.has_output = true;
                 let (index, last) = if observe {
                     (r.next_checkpoint, false)
                 } else {
                     let index = r.next_checkpoint;
                     r.next_checkpoint += 1;
-                    r.has_output = true;
                     (index, r.next_checkpoint == r.job.checkpoints.len())
                 };
                 checkpoints.push(Checkpoint {
@@ -1599,6 +1603,37 @@ mod tests {
             assert!(!checkpoints[0].observe);
             break;
         }
+    }
+
+    #[test]
+    fn observe_hit_before_any_checkpoint_can_be_read() {
+        let Some(device) = device() else {
+            return;
+        };
+        // The one real checkpoint sits past the first observe boundary, so
+        // the observe stop is this slot's very first output write — no real
+        // checkpoint has ever fired for it yet.
+        let checkpoint = OBSERVE_INTERVAL + 17;
+        let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
+        pool.admit(observing_job(7, checkpoint, vec![checkpoint]))
+            .unwrap();
+        loop {
+            let checkpoints = finish_step(&mut pool, checkpoint);
+            if checkpoints.is_empty() {
+                assert!(pool.position(0) < checkpoint);
+                continue;
+            }
+            assert_eq!(checkpoints.len(), 1);
+            let cp = &checkpoints[0];
+            assert!(cp.observe);
+            assert_eq!(cp.position, OBSERVE_INTERVAL);
+            break;
+        }
+        // Before has_output was set on an observe stop, this failed with
+        // "slot has no checkpoint output" instead of returning the reads
+        // the device already wrote.
+        let reads = pool.reads(0, READS).unwrap();
+        assert_eq!(reads.len(), READS);
     }
 
     #[test]

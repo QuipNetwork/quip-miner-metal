@@ -260,10 +260,11 @@ impl Pool {
         }
         gov.record_gpu_busy_us(busy_us);
         let mut done = Vec::with_capacity(checkpoints.len());
-        // At most one (old, new) summary per harvest: several units can each
-        // observe the same lease's target change in this batch, but that is
-        // one event, not one per unit.
-        let mut target_change: Option<(Option<i64>, Option<i64>)> = None;
+        // One summary per distinct (old, new) pair per harvest, not one per
+        // unit: several units of the same lease can each observe the same
+        // target change in this batch, and that is one event. Concurrent
+        // leases with different targets still each get their own line.
+        let mut target_changes: Vec<(Option<i64>, Option<i64>, u32)> = Vec::new();
         for checkpoint in checkpoints {
             let Some(live) = self.live[checkpoint.slot].as_mut() else {
                 continue;
@@ -273,8 +274,12 @@ impl Pool {
                 Origin::Salt { target, .. } => target.get(),
             };
             if target_milli != live.last_target_milli {
-                if target_change.is_none() {
-                    target_change = Some((live.last_target_milli, target_milli));
+                match target_changes
+                    .iter_mut()
+                    .find(|(old, new, _)| *old == live.last_target_milli && *new == target_milli)
+                {
+                    Some((.., units)) => *units += 1,
+                    None => target_changes.push((live.last_target_milli, target_milli, 1)),
                 }
                 live.last_target_milli = target_milli;
             }
@@ -342,11 +347,12 @@ impl Pool {
                 controller.finish(&live.ticket, Some(checkpoint.best), delivered);
             }
         }
-        if let Some((old, new)) = target_change {
+        for (old, new, units) in target_changes {
             tracing::debug!(
                 target: "quip_miner_metal::cascade_trace",
                 ?old,
                 ?new,
+                units,
                 "live target changed"
             );
         }
@@ -1526,38 +1532,71 @@ mod tests {
         let (out, mut results) = tokio::sync::mpsc::channel(2);
         let cancel = CancelToken::default();
 
-        // The gate at 8 sweeps: open_gates keeps it running regardless of
-        // any target.
-        pool.slots.commit_step(8).unwrap();
-        pool.harvest(&mut controller, &out, &cancel, &Governor)
-            .unwrap();
-        assert!(pool.live[slot].is_some());
-        assert!(outcomes.try_recv().is_err());
+        // Capture the "salt finished on a target hit" log so this test can
+        // tell *where* the unit finished apart from just *that* it
+        // finished: a broken observe point (e.g. never checked, or a no-op)
+        // would let the unit run all the way to the real final checkpoint,
+        // which also reports `Survived` but never emits this log line
+        // (`checkpoint.last` delivers directly, with no target-hit log at
+        // all) and would obviously never carry `at = "observe"`.
+        #[derive(Clone)]
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
 
-        // Reach the first observe boundary with no target set: an observe
-        // point with nothing to check against must do nothing.
-        while pool.slots.position(slot) < crate::slots::OBSERVE_INTERVAL {
-            pool.slots.commit_step(crate::slots::OBSERVE_INTERVAL).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            // The gate at 8 sweeps: open_gates keeps it running regardless
+            // of any target.
+            pool.slots.commit_step(8).unwrap();
             pool.harvest(&mut controller, &out, &cancel, &Governor)
                 .unwrap();
-        }
-        assert!(
-            pool.live[slot].is_some(),
-            "an observe point with no live target must not finish the unit"
-        );
-        assert!(outcomes.try_recv().is_err());
+            assert!(pool.live[slot].is_some());
+            assert!(outcomes.try_recv().is_err());
 
-        // Set a target so easy that any real energy beats it.
-        target.set(Some(i64::MAX - 1));
+            // Reach the first observe boundary with no target set: an
+            // observe point with nothing to check against must do nothing.
+            while pool.slots.position(slot) < crate::slots::OBSERVE_INTERVAL {
+                pool.slots
+                    .commit_step(crate::slots::OBSERVE_INTERVAL)
+                    .unwrap();
+                pool.harvest(&mut controller, &out, &cancel, &Governor)
+                    .unwrap();
+            }
+            assert!(
+                pool.live[slot].is_some(),
+                "an observe point with no live target must not finish the unit"
+            );
+            assert!(outcomes.try_recv().is_err());
 
-        // Reach the second observe boundary: still far short of the final
-        // gate checkpoint at `sweeps`. The observe point must finish the
-        // unit here, not at the schedule's end.
-        while pool.live[slot].is_some() {
-            pool.slots.commit_step(crate::slots::OBSERVE_INTERVAL).unwrap();
-            pool.harvest(&mut controller, &out, &cancel, &Governor)
-                .unwrap();
-        }
+            // Set a target so easy that any real energy beats it.
+            target.set(Some(i64::MAX - 1));
+
+            // Reach the second observe boundary: still far short of the
+            // final gate checkpoint at `sweeps`. The observe point must
+            // finish the unit here, not at the schedule's end.
+            while pool.live[slot].is_some() {
+                pool.slots
+                    .commit_step(crate::slots::OBSERVE_INTERVAL)
+                    .unwrap();
+                pool.harvest(&mut controller, &out, &cancel, &Governor)
+                    .unwrap();
+            }
+        });
+
         match outcomes.try_recv().unwrap() {
             SaltOutcome::Survived { index, reads } => {
                 assert_eq!(index, 5);
@@ -1575,6 +1614,22 @@ mod tests {
         }
         assert_eq!(pool.slots.live(), 0);
         assert!(results.try_recv().is_err());
+
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let target_hit_lines: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("salt finished on a target hit"))
+            .collect();
+        assert_eq!(
+            target_hit_lines.len(),
+            1,
+            "expected exactly one target-hit log line, got:\n{log}"
+        );
+        assert!(
+            target_hit_lines[0].contains("at=\"observe\""),
+            "the unit must finish at the observe point, not the final gate checkpoint: {}",
+            target_hit_lines[0]
+        );
     }
 
     fn salt(index: u64, reply: &mpsc::Sender<SaltOutcome>) -> Salt {
