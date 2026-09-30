@@ -389,6 +389,10 @@ impl quip_solver_core::Sampler for MetalSampler {
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Ok(()),
                         Err(std::sync::mpsc::TrySendError::Full(waiting)) => {
                             salt = waiting;
+                            // Backpressure can hold this loop here for a
+                            // while; keep the target live rather than only
+                            // refreshing it once per outer pass.
+                            live_target.set(sink.target_energy_milli());
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                     }

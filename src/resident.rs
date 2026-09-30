@@ -260,10 +260,46 @@ impl Pool {
         }
         gov.record_gpu_busy_us(busy_us);
         let mut done = Vec::with_capacity(checkpoints.len());
+        // At most one (old, new) summary per harvest: several units can each
+        // observe the same lease's target change in this batch, but that is
+        // one event, not one per unit.
+        let mut target_change: Option<(Option<i64>, Option<i64>)> = None;
         for checkpoint in checkpoints {
             let Some(live) = self.live[checkpoint.slot].as_mut() else {
                 continue;
             };
+            let target_milli = match &live.origin {
+                Origin::Stream => None,
+                Origin::Salt { target, .. } => target.get(),
+            };
+            if target_milli != live.last_target_milli {
+                if target_change.is_none() {
+                    target_change = Some((live.last_target_milli, target_milli));
+                }
+                live.last_target_milli = target_milli;
+            }
+            if checkpoint.observe {
+                // An observe-only readback between real checkpoints: same
+                // strict chain rule as a gate hit, but no gate, no stage
+                // advance, and no controller stats — it is not a checkpoint.
+                if target_milli.is_some_and(|target| checkpoint.best < target) {
+                    let index = match &live.origin {
+                        Origin::Salt { index, .. } => Some(*index),
+                        Origin::Stream => None,
+                    };
+                    tracing::info!(
+                        target: "quip_miner_metal::cascade_trace",
+                        ?index,
+                        sweeps = checkpoint.position,
+                        best = checkpoint.best,
+                        elapsed_ms = live.admitted.elapsed().as_millis() as u64,
+                        at = "observe",
+                        "salt finished on a target hit"
+                    );
+                    done.push(checkpoint.slot);
+                }
+                continue;
+            }
             debug_assert_eq!(checkpoint.index, live.ticket.stage);
             tracing::debug!(
                 target: "quip_miner_metal::cascade_trace",
@@ -272,20 +308,6 @@ impl Pool {
                 best = checkpoint.best,
                 "checkpoint"
             );
-            let target_milli = match &live.origin {
-                Origin::Stream => None,
-                Origin::Salt { target, .. } => target.get(),
-            };
-            if target_milli != live.last_target_milli {
-                tracing::debug!(
-                    target: "quip_miner_metal::cascade_trace",
-                    job = %String::from_utf8_lossy(&live.job.job_id),
-                    old = ?live.last_target_milli,
-                    new = ?target_milli,
-                    "live target changed"
-                );
-                live.last_target_milli = target_milli;
-            }
             if checkpoint.last {
                 done.push(checkpoint.slot);
             } else if !controller.checkpoint(&mut live.ticket, checkpoint.best, target_milli) {
@@ -300,6 +322,7 @@ impl Pool {
                         sweeps,
                         best = checkpoint.best,
                         elapsed_ms = live.admitted.elapsed().as_millis() as u64,
+                        at = "gate",
                         "salt finished on a target hit"
                     );
                     done.push(checkpoint.slot);
@@ -318,6 +341,14 @@ impl Pool {
                 );
                 controller.finish(&live.ticket, Some(checkpoint.best), delivered);
             }
+        }
+        if let Some((old, new)) = target_change {
+            tracing::debug!(
+                target: "quip_miner_metal::cascade_trace",
+                ?old,
+                ?new,
+                "live target changed"
+            );
         }
         // Decode only completed slots; screened slots are released above.
         let reads = self.slots.reads_many(&done, self.reads)?;
@@ -993,11 +1024,15 @@ pub(crate) fn run(
                     continue;
                 }
             };
+            // Only salts carry a live target, so only they can finish early
+            // at an observe point. Stream jobs never get observe points.
+            let observe = matches!(origin, Origin::Salt { .. });
             let admitted = pool.slots.admit_prepared(
                 data.inputs,
                 data.schedule.betas,
                 data.schedule.checkpoints,
                 job.params.seed,
+                observe,
             );
             match admitted {
                 Ok(slot) => {
@@ -1232,6 +1267,7 @@ mod tests {
                 schedule: hit_schedule.into(),
                 checkpoints: hit_checkpoints,
                 seed: hit_job.params.seed,
+                observe: true,
             })
             .unwrap();
         pool.live[hit_slot] = Some(Live {
@@ -1260,6 +1296,7 @@ mod tests {
                 schedule: plain_schedule.into(),
                 checkpoints: plain_checkpoints,
                 seed: plain_job.params.seed,
+                observe: true,
             })
             .unwrap();
         pool.live[plain_slot] = Some(Live {
@@ -1362,6 +1399,7 @@ mod tests {
                 schedule: schedule.into(),
                 checkpoints,
                 seed: unit_job.params.seed,
+                observe: true,
             })
             .unwrap();
         // Unreachable: this job's energy never goes below -1_000_000 milli,
@@ -1412,6 +1450,121 @@ mod tests {
             }
             other => panic!(
                 "expected a survivor from the eased target, got {}",
+                match other {
+                    SaltOutcome::Screened { .. } => "Screened",
+                    SaltOutcome::Dropped { .. } => "Dropped",
+                    SaltOutcome::Failed { .. } => "Failed",
+                    SaltOutcome::Survived { .. } => unreachable!(),
+                }
+            ),
+        }
+        assert_eq!(pool.slots.live(), 0);
+        assert!(results.try_recv().is_err());
+    }
+
+    #[test]
+    fn observe_point_finishes_a_unit_before_the_next_gate_checkpoint() {
+        if MetalDevice::device_count() == 0 {
+            #[expect(clippy::print_stderr, reason = "device tests report a sandbox skip")]
+            {
+                eprintln!("skipping observe-point finish test: no Metal device");
+            }
+            return;
+        }
+        struct Governor;
+        impl GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let device = MetalDevice::open(0).unwrap();
+        // One gate at 8 sweeps, then nothing until the end of the schedule,
+        // two OBSERVE_INTERVAL boundaries later: the kind of gap a deep
+        // cascade stage leaves between real checkpoints.
+        let settings = CascadeSettings {
+            stages: stage_array(&[8]),
+            open_gates: true,
+            ..CascadeSettings::default()
+        };
+        let mut controller = Controller::new(settings);
+        let sweeps = 8 + 2 * crate::slots::OBSERVE_INTERVAL;
+        let unit_job = job(4000, sweeps);
+        let mut pool = Pool::new(&device, &unit_job, 1).unwrap();
+
+        let (reply, outcomes) = mpsc::channel();
+        let (ticket, schedule, checkpoints) = controller.admit(&unit_job);
+        assert_eq!(checkpoints, vec![8, sweeps]);
+        let slot = pool
+            .slots
+            .admit(SlotJob {
+                graph: unit_job.graph.clone(),
+                schedule: schedule.into(),
+                checkpoints,
+                seed: unit_job.params.seed,
+                observe: true,
+            })
+            .unwrap();
+        let target = LiveTarget::new(None);
+        pool.live[slot] = Some(Live {
+            job: unit_job,
+            origin: Origin::Salt {
+                index: 5,
+                target: target.clone(),
+                stop: Arc::default(),
+                reply,
+            },
+            ticket,
+            accounted_us: 0,
+            admitted: Instant::now(),
+            last_target_milli: None,
+        });
+
+        let (out, mut results) = tokio::sync::mpsc::channel(2);
+        let cancel = CancelToken::default();
+
+        // The gate at 8 sweeps: open_gates keeps it running regardless of
+        // any target.
+        pool.slots.commit_step(8).unwrap();
+        pool.harvest(&mut controller, &out, &cancel, &Governor)
+            .unwrap();
+        assert!(pool.live[slot].is_some());
+        assert!(outcomes.try_recv().is_err());
+
+        // Reach the first observe boundary with no target set: an observe
+        // point with nothing to check against must do nothing.
+        while pool.slots.position(slot) < crate::slots::OBSERVE_INTERVAL {
+            pool.slots.commit_step(crate::slots::OBSERVE_INTERVAL).unwrap();
+            pool.harvest(&mut controller, &out, &cancel, &Governor)
+                .unwrap();
+        }
+        assert!(
+            pool.live[slot].is_some(),
+            "an observe point with no live target must not finish the unit"
+        );
+        assert!(outcomes.try_recv().is_err());
+
+        // Set a target so easy that any real energy beats it.
+        target.set(Some(i64::MAX - 1));
+
+        // Reach the second observe boundary: still far short of the final
+        // gate checkpoint at `sweeps`. The observe point must finish the
+        // unit here, not at the schedule's end.
+        while pool.live[slot].is_some() {
+            pool.slots.commit_step(crate::slots::OBSERVE_INTERVAL).unwrap();
+            pool.harvest(&mut controller, &out, &cancel, &Governor)
+                .unwrap();
+        }
+        match outcomes.try_recv().unwrap() {
+            SaltOutcome::Survived { index, reads } => {
+                assert_eq!(index, 5);
+                assert_eq!(reads.len(), 4);
+            }
+            other => panic!(
+                "expected a survivor from the observe point, got {}",
                 match other {
                     SaltOutcome::Screened { .. } => "Screened",
                     SaltOutcome::Dropped { .. } => "Dropped",
@@ -2246,6 +2399,7 @@ mod tests {
                 schedule: schedule.into(),
                 checkpoints,
                 seed: live_job.params.seed,
+                observe: false,
             })
             .unwrap();
         pool.live[slot] = Some(Live {
@@ -2349,6 +2503,7 @@ mod tests {
                 schedule: schedule.into(),
                 checkpoints,
                 seed: live_job.params.seed,
+                observe: true,
             })
             .unwrap();
         let (reply, outcomes) = mpsc::channel();

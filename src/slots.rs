@@ -61,6 +61,12 @@ pub(crate) struct SlotJob {
     pub(crate) schedule: Arc<[f32]>,
     pub(crate) checkpoints: Vec<usize>,
     pub(crate) seed: u64,
+    /// Whether this job gets observe-only readback points between its
+    /// cascade checkpoints (see [`OBSERVE_INTERVAL`]). Only units that can
+    /// use them (salts carrying a live target) should set this; stream jobs
+    /// and salts leave it false so no extra output steps are ever built for
+    /// them.
+    pub(crate) observe: bool,
 }
 
 impl SlotJob {
@@ -158,6 +164,12 @@ pub(crate) struct Checkpoint {
     pub(crate) index: usize,
     pub(crate) last: bool,
     pub(crate) best: i64,
+    /// An observe-only readback: `index`/`last` describe the *next* real
+    /// checkpoint and must not be treated as one. No gate, no stage advance,
+    /// no controller stats.
+    pub(crate) observe: bool,
+    /// Cumulative sweeps completed by the job as of this readback.
+    pub(crate) position: usize,
 }
 
 struct ResidentJob {
@@ -375,6 +387,7 @@ impl SlotPool {
         schedule: Arc<[f32]>,
         checkpoints: Vec<usize>,
         seed: u64,
+        observe: bool,
     ) -> Result<SlotId, SampleError> {
         self.idle()?;
         if schedule.len() > self.sched_stride {
@@ -391,6 +404,7 @@ impl SlotPool {
             schedule,
             checkpoints,
             seed,
+            observe,
         };
         self.upload(job, &inputs.couplings, &inputs.fields)
     }
@@ -457,18 +471,37 @@ impl SlotPool {
                     "release final-checkpoint slots before stepping".into(),
                 ));
             };
-            let count = slice.min(checkpoint - r.position);
+            // An observe job also stops no later than the next multiple of
+            // OBSERVE_INTERVAL, so its best energy reaches the host at least
+            // that often even when the next real checkpoint is far away.
+            // This only ever shrinks the step; it never changes which betas
+            // run or their order, so the anneal itself is unaffected.
+            let checkpoint_room = checkpoint - r.position;
+            let mut room = checkpoint_room;
+            let mut observe_stop = false;
+            if r.job.observe {
+                let next_observe = (r.position / OBSERVE_INTERVAL + 1) * OBSERVE_INTERVAL;
+                let observe_room = next_observe - r.position;
+                if observe_room < room {
+                    room = observe_room;
+                    observe_stop = true;
+                }
+            }
+            let count = slice.min(room);
+            let flags = if count == checkpoint_room {
+                SLOT_WRITE_OUTPUT
+            } else if observe_stop && count == room {
+                SLOT_WRITE_OUTPUT | SLOT_OBSERVE
+            } else {
+                0
+            };
             self.steps.push(SlotStep {
                 slot: slot as u32,
                 beta_start: r.position as i32,
                 beta_count: count as i32,
                 num_betas: r.job.schedule.len() as i32,
                 seed: slot_seed(r.job.seed),
-                flags: if r.position + count == checkpoint {
-                    SLOT_WRITE_OUTPUT
-                } else {
-                    0
-                },
+                flags,
             });
         }
         self.write(25, 0, &self.steps)?;
@@ -542,7 +575,7 @@ impl SlotPool {
             .filter(|step| step.flags & SLOT_WRITE_OUTPUT != 0)
             .count();
         let mut checkpoints = Vec::with_capacity(output_count);
-        for (index, step) in self.steps.iter().enumerate() {
+        for (step_index, step) in self.steps.iter().enumerate() {
             let slot = step.slot as usize;
             let Some(r) = self.slots[slot].as_mut() else {
                 continue;
@@ -550,14 +583,12 @@ impl SlotPool {
             r.position += step.beta_count as usize;
             // Attribute equal shares, distributing the integer remainder so
             // per-job totals reconcile exactly with command-buffer time.
-            r.device_us =
-                r.device_us
-                    .saturating_add(device_time_share(device_us, self.steps.len(), index));
+            r.device_us = r.device_us.saturating_add(device_time_share(
+                device_us,
+                self.steps.len(),
+                step_index,
+            ));
             if step.flags & SLOT_WRITE_OUTPUT != 0 {
-                let index = r.next_checkpoint;
-                r.next_checkpoint += 1;
-                r.has_output = true;
-                let last = r.next_checkpoint == r.job.checkpoints.len();
                 // SAFETY: the completed output step initialized this live
                 // slot's region. read_pointer checked the mapping and byte
                 // length. No host mutation or GPU write overlaps this copy.
@@ -571,11 +602,25 @@ impl SlotPool {
                     .min()
                     .map(i64::from)
                     .ok_or_else(|| SampleError::Driver("slot has no energies".into()))?;
+                let observe = step.flags & SLOT_OBSERVE != 0;
+                // An observe readback does not advance next_checkpoint: it is
+                // not a gate, so the next real checkpoint stays exactly where
+                // the cascade schedule put it, and `last` is always false.
+                let (index, last) = if observe {
+                    (r.next_checkpoint, false)
+                } else {
+                    let index = r.next_checkpoint;
+                    r.next_checkpoint += 1;
+                    r.has_output = true;
+                    (index, r.next_checkpoint == r.job.checkpoints.len())
+                };
                 checkpoints.push(Checkpoint {
                     slot,
                     index,
                     last,
                     best,
+                    observe,
+                    position: r.position,
                 });
             }
         }
@@ -700,6 +745,14 @@ impl SlotPool {
             .and_then(Option::as_ref)
             .map_or(0, |r| r.device_us)
     }
+
+    /// Cumulative sweeps completed by a live job. Lets a test drive a job up
+    /// to an exact observe or checkpoint boundary without guessing how many
+    /// `commit_step` calls the device's own dispatch budget will need.
+    #[cfg(test)]
+    pub(crate) fn position(&self, slot: SlotId) -> usize {
+        self.slots[slot].as_ref().expect("slot is live").position
+    }
 }
 
 impl Drop for SlotPool {
@@ -723,6 +776,16 @@ pub(crate) struct SlotStep {
 }
 
 pub(crate) const SLOT_WRITE_OUTPUT: u32 = 1;
+/// Set together with [`SLOT_WRITE_OUTPUT`] on a step that stopped at an
+/// observe boundary rather than a real cascade checkpoint. The device
+/// kernel only inspects bit 0 (`SLOT_WRITE_OUTPUT`); this bit is a
+/// host-side annotation read back in [`SlotPool::take_checkpoints`].
+pub(crate) const SLOT_OBSERVE: u32 = 2;
+/// Longest gap, in sweeps, between output write-backs for a job admitted
+/// with `SlotJob::observe` set. Deep cascade stages can otherwise go up
+/// to `CHAIN_GATES.full_sweeps` sweeps between real checkpoints; this
+/// bounds how stale a live unit's best energy and live-target check can be.
+pub(crate) const OBSERVE_INTERVAL: usize = 65_536;
 
 pub(crate) fn slot_seed(seed: u64) -> u32 {
     ((seed ^ (seed >> 32)) as u32).max(1)
@@ -803,6 +866,14 @@ mod tests {
             schedule: schedule.into(),
             checkpoints,
             seed,
+            observe: false,
+        }
+    }
+
+    fn observing_job(seed: u64, sweeps: usize, checkpoints: Vec<usize>) -> SlotJob {
+        SlotJob {
+            observe: true,
+            ..job(seed, sweeps, checkpoints)
         }
     }
 
@@ -937,6 +1008,7 @@ mod tests {
             schedule: Arc::clone(schedule),
             checkpoints: vec![32],
             seed,
+            observe: false,
         };
         let run = |pool: &mut SlotPool, job: SlotJob| {
             assert_eq!(pool.admit(job).unwrap(), 0);
@@ -1395,6 +1467,7 @@ mod tests {
             schedule: schedule.clone().into(),
             checkpoints: vec![first, total],
             seed: 99,
+            observe: false,
         })
         .unwrap();
         let mut position = 0;
@@ -1454,6 +1527,134 @@ mod tests {
             &pool.slots[0].as_ref().unwrap().job.schedule[..],
             &schedule[..]
         );
+    }
+
+    #[test]
+    fn observe_points_write_output_without_becoming_checkpoints() {
+        let Some(device) = device() else {
+            return;
+        };
+        // Far enough past two OBSERVE_INTERVAL boundaries that the job must
+        // stop for an observe readback before it ever reaches the one real
+        // checkpoint at the end of the schedule.
+        let checkpoint = 2 * OBSERVE_INTERVAL + 17;
+        let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
+        pool.admit(observing_job(7, checkpoint, vec![checkpoint]))
+            .unwrap();
+        let mut observed = 0;
+        let mut next_boundary = OBSERVE_INTERVAL;
+        loop {
+            let checkpoints = finish_step(&mut pool, checkpoint);
+            let position = pool.position(0);
+            // The device's own dispatch budget (msa_step_limit) can require
+            // several commit_step calls to cross one OBSERVE_INTERVAL: most
+            // of those calls write no output at all.
+            if checkpoints.is_empty() {
+                assert!(position < checkpoint);
+                continue;
+            }
+            assert_eq!(checkpoints.len(), 1);
+            let cp = &checkpoints[0];
+            if position < checkpoint {
+                // An observe stop is not a checkpoint: the next real
+                // checkpoint (index 0, the only one in this schedule) has
+                // not advanced, and it is never reported as the last one.
+                assert!(cp.observe);
+                assert_eq!(cp.index, 0);
+                assert!(!cp.last);
+                assert_eq!(cp.position, position);
+                assert_eq!(
+                    position, next_boundary,
+                    "an observe stop lands exactly on the next OBSERVE_INTERVAL boundary"
+                );
+                next_boundary += OBSERVE_INTERVAL;
+                observed += 1;
+                continue;
+            }
+            assert_eq!(position, checkpoint);
+            assert!(!cp.observe);
+            assert_eq!((cp.index, cp.last), (0, true));
+            break;
+        }
+        assert_eq!(
+            observed, 2,
+            "expected one observe readback per OBSERVE_INTERVAL boundary before the checkpoint"
+        );
+        pool.release(0).unwrap();
+
+        // A plain (non-observe) job with the same schedule sees no output
+        // writes at all until the one real checkpoint: no observe points
+        // are ever created for it.
+        let mut plain = SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
+        plain
+            .admit(job(7, checkpoint, vec![checkpoint]))
+            .unwrap();
+        loop {
+            let checkpoints = finish_step(&mut plain, checkpoint);
+            if plain.position(0) < checkpoint {
+                assert!(checkpoints.is_empty());
+                continue;
+            }
+            assert_eq!(checkpoints.len(), 1);
+            assert!(!checkpoints[0].observe);
+            break;
+        }
+    }
+
+    #[test]
+    fn observe_points_do_not_change_the_final_energies_or_spins() {
+        let Some(device) = device() else {
+            return;
+        };
+        // The anneal must be bit-identical with or without observe points:
+        // they only add output write-backs at extra step boundaries, which
+        // the kernel already tolerates (every step resumes spins and RNG
+        // from device memory regardless of where the previous one stopped).
+        let checkpoint = 2 * OBSERVE_INTERVAL + 17;
+        let graph = advantage2_system1(11);
+        let schedule: Arc<[f32]> = build_beta_schedule(&graph, checkpoint, 1, None).0.into();
+
+        let mut observed_pool = SlotPool::new(&device, &graph, READS, 1, checkpoint).unwrap();
+        observed_pool
+            .admit(SlotJob {
+                graph: graph.clone(),
+                schedule: Arc::clone(&schedule),
+                checkpoints: vec![checkpoint],
+                seed: 11,
+                observe: true,
+            })
+            .unwrap();
+        loop {
+            let checkpoints = finish_step(&mut observed_pool, checkpoint);
+            if checkpoints.iter().any(|c| !c.observe) {
+                break;
+            }
+        }
+        let observed_reads = observed_pool.reads(0, READS).unwrap();
+
+        let mut plain_pool = SlotPool::new(&device, &graph, READS, 1, checkpoint).unwrap();
+        plain_pool
+            .admit(SlotJob {
+                graph,
+                schedule,
+                checkpoints: vec![checkpoint],
+                seed: 11,
+                observe: false,
+            })
+            .unwrap();
+        loop {
+            let checkpoints = finish_step(&mut plain_pool, checkpoint);
+            if !checkpoints.is_empty() {
+                break;
+            }
+        }
+        let plain_reads = plain_pool.reads(0, READS).unwrap();
+
+        assert_eq!(observed_reads.len(), plain_reads.len());
+        for (a, b) in observed_reads.iter().zip(&plain_reads) {
+            assert_eq!(a.energy_milli, b.energy_milli);
+            assert_eq!(a.spins, b.spins);
+        }
     }
 
     #[test]
