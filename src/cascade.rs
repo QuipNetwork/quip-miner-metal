@@ -826,22 +826,25 @@ pub(crate) struct ScheduleCache {
 }
 
 impl ScheduleCache {
+    /// `degrees`, when given, are the [`node_degrees`] of exactly
+    /// `job.graph.edges`, and spare each job the edge walk.
     pub(crate) fn prepare(
         &mut self,
         job: &StreamJob,
         settings: CascadeSettings,
         gated: bool,
         screen: bool,
+        degrees: Option<&[u32]>,
     ) -> Result<PreparedSchedule, crate::sampler::SampleError> {
         let stages = if screen {
             settings.effective(gated).stages
         } else {
             [0; MAX_STAGES]
         };
-        let (hot, cold) = job
-            .params
-            .beta_range
-            .unwrap_or_else(|| resident_beta_range(&job.graph));
+        let (hot, cold) = job.params.beta_range.unwrap_or_else(|| match degrees {
+            Some(degrees) => resident_beta_range_from(&job.graph, degrees),
+            None => resident_beta_range(&job.graph),
+        });
         let key = ScheduleKey {
             hot: hot.to_bits(),
             cold: cold.to_bits(),
@@ -910,27 +913,46 @@ impl PreparedSchedule {
 // Count incident terms instead of tracking Option<f64> minima per endpoint.
 // Keep the library path for every other coefficient domain.
 fn resident_beta_range(graph: &IsingGraph) -> (f64, f64) {
+    resident_beta_range_from(graph, &node_degrees(graph.num_nodes(), &graph.edges))
+}
+
+/// In-range edge endpoints per node, the topology part of
+/// [`resident_beta_range`]. A self-loop counts twice.
+pub(crate) fn node_degrees(nodes: usize, edges: &[(usize, usize)]) -> Vec<u32> {
+    let mut degrees = vec![0u32; nodes];
+    for &(u, v) in edges {
+        if u < nodes && v < nodes {
+            degrees[u] += 1;
+            degrees[v] += 1;
+        }
+    }
+    degrees
+}
+
+/// [`resident_beta_range`] with the topology's [`node_degrees`] precomputed,
+/// so a job pays one pass over its nodes instead of one over its edges.
+/// `degrees` must come from exactly `graph.edges`.
+fn resident_beta_range_from(graph: &IsingGraph, degrees: &[u32]) -> (f64, f64) {
     if graph.j.len() != graph.edges.len()
+        || degrees.len() != graph.num_nodes()
         || graph.j.iter().any(|j| j.abs() != 1.0)
         || graph.h.iter().any(|&h| h != 0.0 && h.abs() != 1.0)
     {
         return default_ising_beta_range(graph);
     }
-    let n = graph.num_nodes();
-    let mut terms: Vec<usize> = graph.h.iter().map(|&h| usize::from(h != 0.0)).collect();
-    for &(u, v) in &graph.edges {
-        if u < n && v < n {
-            terms[u] += 1;
-            terms[v] += 1;
-        }
-    }
-    let max_eff = terms.iter().copied().max().unwrap_or(0) as f64;
-    if max_eff == 0.0 {
+    let terms = graph
+        .h
+        .iter()
+        .zip(degrees)
+        .map(|(&h, &degree)| u32::from(h != 0.0) + degree);
+    let (max_eff, gaps) = terms.fold((0u32, 0usize), |(max, gaps), count| {
+        (max.max(count), gaps + usize::from(count != 0))
+    });
+    if max_eff == 0 {
         return (0.1, 1.0);
     }
-    let hot = std::f64::consts::LN_2 / (2.0 * max_eff);
-    let gaps = terms.iter().filter(|&&count| count != 0).count() as f64;
-    let cold = (gaps / 0.01).ln() / 2.0;
+    let hot = std::f64::consts::LN_2 / (2.0 * f64::from(max_eff));
+    let cold = (gaps as f64 / 0.01).ln() / 2.0;
     (hot, cold.max(hot))
 }
 
@@ -1027,11 +1049,17 @@ mod tests {
                     .collect(),
                 edges.clone(),
             );
+            let degrees = node_degrees(graph.num_nodes(), &graph.edges);
             for nonunit in [false, true] {
                 if nonunit {
                     graph.j[seed] = [0.0, 0.5, -2.0, 127.0][seed % 4];
                 }
                 let actual = resident_beta_range(&graph);
+                let cached = resident_beta_range_from(&graph, &degrees);
+                assert_eq!(
+                    (actual.0.to_bits(), actual.1.to_bits()),
+                    (cached.0.to_bits(), cached.1.to_bits())
+                );
                 let expected = default_ising_beta_range(&graph);
                 assert_eq!(
                     (actual.0.to_bits(), actual.1.to_bits()),
@@ -1546,13 +1574,15 @@ mod tests {
         let settings = CascadeSettings::default();
         let mut cache = ScheduleCache::default();
         let mut other_worker = cache.clone();
-        let first = cache.prepare(&job(0, 1000), settings, false, true).unwrap();
+        let first = cache
+            .prepare(&job(0, 1000), settings, false, true, None)
+            .unwrap();
         let second = other_worker
-            .prepare(&job(1, 1000), settings, false, true)
+            .prepare(&job(1, 1000), settings, false, true, None)
             .unwrap();
         assert!(Arc::ptr_eq(&first.betas, &second.betas));
         let unscreened = cache
-            .prepare(&job(1, 1000), settings, false, false)
+            .prepare(&job(1, 1000), settings, false, false, None)
             .unwrap();
         assert_eq!(unscreened.checkpoints, vec![1000]);
         assert!(!Arc::ptr_eq(&first.betas, &unscreened.betas));
@@ -1560,14 +1590,18 @@ mod tests {
         assert_eq!(&second.betas[..], &reference.betas[..]);
         assert_eq!(second.checkpoints, reference.checkpoints);
         let longer = other_worker
-            .prepare(&job(2, 2000), settings, false, true)
+            .prepare(&job(2, 2000), settings, false, true, None)
             .unwrap();
         assert!(!Arc::ptr_eq(&first.betas, &longer.betas));
         assert_eq!(longer.betas.len(), 2000);
-        let shared_longer = cache.prepare(&job(3, 2000), settings, false, true).unwrap();
+        let shared_longer = cache
+            .prepare(&job(3, 2000), settings, false, true, None)
+            .unwrap();
         assert!(Arc::ptr_eq(&longer.betas, &shared_longer.betas));
         assert_eq!(&first.betas[..], &reference.betas[..]);
-        let gated = cache.prepare(&job(2, 2000), settings, true, true).unwrap();
+        let gated = cache
+            .prepare(&job(2, 2000), settings, true, true, None)
+            .unwrap();
         assert_eq!(gated.checkpoints, vec![8, 16, 64, 256, 512, 1024, 2000]);
     }
 

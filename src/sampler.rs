@@ -827,30 +827,32 @@ impl Drop for EncodedBatch {
 }
 
 /// True GPU execution time of a completed command buffer, in microseconds,
-/// from `GPUEndTime - GPUStartTime` (`CFTimeInterval` seconds). metal-rs 0.33
-/// exposes no accessor, so read the properties via `objc`. Returns 0 if the
-/// timestamps are unavailable / non-positive.
+/// from `GPUEndTime - GPUStartTime` (`CFTimeInterval` seconds). Returns 0 if
+/// the timestamps are unavailable / non-positive.
+pub(crate) fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "guarded finite and positive; GPU spans are far below u64::MAX microseconds"
+    )]
+    gpu_span(cmd).map_or(0, |(start, end)| ((end - start) * 1_000_000.0) as u64)
+}
+
+/// `(GPUStartTime, GPUEndTime)` of a completed command buffer, in seconds on
+/// the host's absolute clock, or `None` if unavailable or non-positive.
+/// metal-rs 0.33 exposes no accessor, so read the properties via `objc`.
 #[expect(
     unexpected_cfgs,
     reason = "objc 0.2 msg_send! expands to cfg(cargo-clippy) the compiler no longer recognizes"
 )]
-pub(crate) fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
+pub(crate) fn gpu_span(cmd: &metal::CommandBufferRef) -> Option<(f64, f64)> {
     use objc::{msg_send, sel, sel_impl};
     // SAFETY: `GPUStartTime`/`GPUEndTime` are `CFTimeInterval` (f64) properties
     // on a completed `MTLCommandBuffer`; `cmd` implements `objc::Message`.
     let (start, end): (f64, f64) =
         unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
     let dur = end - start;
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "guarded finite and positive; GPU spans are far below u64::MAX microseconds"
-    )]
-    if dur.is_finite() && dur > 0.0 {
-        (dur * 1_000_000.0) as u64
-    } else {
-        0
-    }
+    (dur.is_finite() && dur > 0.0).then_some((start, end))
 }
 
 fn set_bytes_i32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: i32) {

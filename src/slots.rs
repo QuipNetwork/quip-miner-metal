@@ -161,6 +161,15 @@ fn checked_read_pointer<T>(
     Ok(contents.cast())
 }
 
+/// One completed step command: its absolute GPU interval, in seconds, and
+/// how many slots it advanced.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StepSpan {
+    pub(crate) start: f64,
+    pub(crate) end: f64,
+    pub(crate) slots: usize,
+}
+
 pub(crate) struct Checkpoint {
     pub(crate) slot: SlotId,
     pub(crate) index: usize,
@@ -197,6 +206,8 @@ pub(crate) struct SlotPool {
     verified: Option<Edges>,
     steps: Vec<SlotStep>,
     command: Option<metal::CommandBuffer>,
+    /// The span of the last command `take_checkpoints` retired.
+    span: Option<StepSpan>,
     faulted: bool,
     num_reads: usize,
     words: usize,
@@ -273,6 +284,7 @@ impl SlotPool {
             verified: None,
             steps: Vec::with_capacity(capacity),
             command: None,
+            span: None,
             faulted: false,
             num_reads,
             words,
@@ -310,6 +322,10 @@ impl SlotPool {
 
     pub(crate) fn capacity(&self) -> usize {
         self.slots.len()
+    }
+    /// The span of the last retired step command, once.
+    pub(crate) fn take_span(&mut self) -> Option<StepSpan> {
+        self.span.take()
     }
     pub(crate) fn live(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
@@ -569,6 +585,11 @@ impl SlotPool {
             ));
         }
         let device_us = sampler::gpu_time_us(command);
+        self.span = sampler::gpu_span(command).map(|(start, end)| StepSpan {
+            start,
+            end,
+            slots: self.steps.len(),
+        });
         let energies = self.read_pointer::<i32>(11, self.capacity() * self.num_reads)?;
         self.command = None;
         let output_count = self
@@ -1542,7 +1563,8 @@ mod tests {
         // stop for an observe readback before it ever reaches the one real
         // checkpoint at the end of the schedule.
         let checkpoint = 2 * OBSERVE_INTERVAL + 17;
-        let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
+        let mut pool =
+            SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
         pool.admit(observing_job(7, checkpoint, vec![checkpoint]))
             .unwrap();
         let mut observed = 0;
@@ -1589,10 +1611,9 @@ mod tests {
         // A plain (non-observe) job with the same schedule sees no output
         // writes at all until the one real checkpoint: no observe points
         // are ever created for it.
-        let mut plain = SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
-        plain
-            .admit(job(7, checkpoint, vec![checkpoint]))
-            .unwrap();
+        let mut plain =
+            SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
+        plain.admit(job(7, checkpoint, vec![checkpoint])).unwrap();
         loop {
             let checkpoints = finish_step(&mut plain, checkpoint);
             if plain.position(0) < checkpoint {
@@ -1614,7 +1635,8 @@ mod tests {
         // the observe stop is this slot's very first output write — no real
         // checkpoint has ever fired for it yet.
         let checkpoint = OBSERVE_INTERVAL + 17;
-        let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
+        let mut pool =
+            SlotPool::new(&device, &advantage2_system1(7), READS, 1, checkpoint).unwrap();
         pool.admit(observing_job(7, checkpoint, vec![checkpoint]))
             .unwrap();
         loop {

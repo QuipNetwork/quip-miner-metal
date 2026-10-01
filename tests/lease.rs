@@ -16,7 +16,10 @@ use quip_solver_core::quip_protocol::lease::verify_lease_result;
 use quip_solver_core::quip_protocol::wire::encode_i32_le;
 use std::collections::HashSet;
 use std::time::Duration;
-use support::{aglais, lease, miner_binary, permissive_target, ring, target, Session};
+use support::{
+    aglais, lease, miner_binary, permissive_target, ring, target, Session, AGLAIS_HASH,
+    AGLAIS_TARGET_MILLI,
+};
 
 /// How many of a lease's best-finishing screens the miner streams back with
 /// reads instead of merely screening. Mirrors `resident::LEASE_TOP_N`
@@ -42,8 +45,14 @@ async fn every_salt_is_counted_once() {
     s.send(coord_msg::Msg::Topology(topology)).await;
     s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 64)))
         .await;
-    s.send(coord_msg::Msg::Job(lease(b"lease-measure", 3, RING_A, 0, 200)))
-        .await;
+    s.send(coord_msg::Msg::Job(lease(
+        b"lease-measure",
+        3,
+        RING_A,
+        0,
+        200,
+    )))
+    .await;
     s.until("measured lease done", LONG, |log| {
         log.done(b"lease-measure").is_some()
     })
@@ -139,10 +148,8 @@ async fn screened_salts_never_send_one_result_per_salt() {
     let job = lease(b"lease-none", 3, RING_A, 0, salt_count);
     let spec = generator(&job);
     s.send(coord_msg::Msg::Job(job)).await;
-    s.until("lease done", LONG, |log| {
-        log.done(b"lease-none").is_some()
-    })
-    .await;
+    s.until("lease done", LONG, |log| log.done(b"lease-none").is_some())
+        .await;
 
     let done = s.log.done(b"lease-none").expect("LeaseDone");
     assert_eq!(done.salts_done, salt_count, "every salt is counted once");
@@ -231,7 +238,10 @@ async fn cancel_ends_a_live_lease_with_one_summary() {
     .await;
 
     let done = s.log.done(b"lease-cancel").expect("LeaseDone");
-    assert!(done.salts_done < 1_000_000, "the cancel cut the lease short");
+    assert!(
+        done.salts_done < 1_000_000,
+        "the cancel cut the lease short"
+    );
     assert_eq!(s.log.done_count(b"lease-cancel"), 1, "one summary");
     assert_eq!(s.log.refunds(), 1, "the cancelled lease refunds its credit");
     assert_eq!(s.shutdown(2_000).await, 0);
@@ -408,4 +418,108 @@ async fn a_topology_change_between_leases_uses_the_new_graph() {
             .expect("second-lease winners use the 96-node ring");
     }
     assert_eq!(s.shutdown(2_000).await, 0);
+}
+
+/// Salts per second over `measure` salts, after `warmup` salts have finished.
+async fn steady_rate(s: &mut Session, warmup: u64, measure: u64) -> f64 {
+    s.wait_for_salts(warmup, LONG).await;
+    let start = s.jobs_done().await;
+    let started = std::time::Instant::now();
+    s.wait_for_salts(start + measure, LONG).await;
+    let end = s.jobs_done().await;
+    (end - start) as f64 / started.elapsed().as_secs_f64()
+}
+
+/// Lease throughput on the Aglais topology under the chain gates.
+///
+/// Prints the steady rate of one lease, of four leases sent together, and the
+/// rate across five back-to-back leases (first salt to last salt finished,
+/// so a deep survivor's tail does not count) against the one-lease rate. Needs a
+/// quiet GPU: run alone, `--release --ignored --nocapture --test-threads=1`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "GPU throughput measurement; needs a quiet machine"]
+#[expect(clippy::print_stderr, reason = "the measurement is the output")]
+async fn lease_throughput() {
+    let (topology, _) = aglais();
+    let chain = || target(AGLAIS_TARGET_MILLI, 14_336);
+
+    let mut s = Session::start(&msa(), 8, "").await;
+    s.send(coord_msg::Msg::Topology(topology.clone())).await;
+    s.send(coord_msg::Msg::SetTarget(chain())).await;
+    s.send(coord_msg::Msg::Job(lease(
+        b"one",
+        3,
+        AGLAIS_HASH,
+        0,
+        1_000_000,
+    )))
+    .await;
+    let one = steady_rate(&mut s, 30_000, 200_000).await;
+    eprintln!("one lease: {one:.0} salts/s");
+    drop(s);
+
+    let mut s = Session::start(&msa(), 8, "").await;
+    s.send(coord_msg::Msg::Topology(topology.clone())).await;
+    s.send(coord_msg::Msg::SetTarget(chain())).await;
+    for (i, id) in [b"four-0", b"four-1", b"four-2", b"four-3"]
+        .iter()
+        .enumerate()
+    {
+        let start = i as u64 * 1_000_000;
+        s.send(coord_msg::Msg::Job(lease(
+            *id,
+            3,
+            AGLAIS_HASH,
+            start,
+            1_000_000,
+        )))
+        .await;
+    }
+    let four = steady_rate(&mut s, 30_000, 200_000).await;
+    eprintln!("four leases: {four:.0} salts/s");
+    drop(s);
+
+    const PER: u64 = 60_000;
+    const WARMUP: u64 = 30_000;
+    // Distinct sizes tell the leases apart in the miner's debug log.
+    let sizes: Vec<u64> = (0..5).map(|i| PER + i).collect();
+    let ids: Vec<Vec<u8>> = (0..5).map(|i| format!("seq-{i}").into_bytes()).collect();
+    let mut s = Session::start(&msa(), 8, "").await;
+    s.send(coord_msg::Msg::Topology(topology)).await;
+    s.send(coord_msg::Msg::SetTarget(chain())).await;
+    s.send(coord_msg::Msg::Job(lease(
+        b"warmup",
+        3,
+        AGLAIS_HASH,
+        0,
+        WARMUP,
+    )))
+    .await;
+    let mut start = WARMUP;
+    for (id, &size) in ids.iter().zip(&sizes) {
+        s.send(coord_msg::Msg::Job(lease(id, 3, AGLAIS_HASH, start, size)))
+            .await;
+        start += size;
+    }
+    let total: u64 = sizes.iter().sum();
+    s.wait_for_salts(WARMUP, LONG).await;
+    let first = s.jobs_done().await;
+    let started = std::time::Instant::now();
+    s.wait_for_salts(WARMUP + total, LONG).await;
+    let rate = (WARMUP + total - first) as f64 / started.elapsed().as_secs_f64();
+    s.until("five leases done", Duration::from_secs(600), |log| {
+        ids.iter().all(|id| log.done(id).is_some())
+    })
+    .await;
+    let order: Vec<&String> = s
+        .log
+        .order
+        .iter()
+        .filter(|e| e.starts_with("done:"))
+        .collect();
+    eprintln!(
+        "five leases of {PER}: {rate:.0} salts/s, {:.1}% of one-lease rate; done order {order:?}",
+        100.0 * rate / one
+    );
+    drop(s);
 }

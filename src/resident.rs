@@ -500,6 +500,8 @@ pub(crate) struct PreparedData {
 struct PreparedTopology {
     topology: SelfFeedingTopology,
     edges: Edges,
+    /// [`crate::cascade::node_degrees`] of `edges`, for the beta range.
+    degrees: Vec<u32>,
     /// Whether this is the chain topology.
     chain: bool,
 }
@@ -530,7 +532,7 @@ impl Preparer {
         let lookup = |cached: Option<&Arc<PreparedTopology>>| {
             cached.and_then(|cached| {
                 PreparedInputs::new(&job.graph, &cached.topology, &cached.edges)
-                    .map(|inputs| (inputs, cached.chain))
+                    .map(|inputs| (inputs, Arc::clone(cached)))
             })
         };
         let cached = self
@@ -538,7 +540,7 @@ impl Preparer {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let (inputs, chain) = match lookup(cached.as_ref()) {
+        let (inputs, prepared) = match lookup(cached.as_ref()) {
             Some(hit) => hit,
             None => {
                 // Build under the lock, so workers that miss together share
@@ -569,22 +571,31 @@ impl Preparer {
                             edges = job.graph.edges.len(),
                             "cascade topology prepared"
                         );
-                        *shared = Some(Arc::new(PreparedTopology {
+                        let prepared = Arc::new(PreparedTopology {
                             topology,
+                            degrees: crate::cascade::node_degrees(
+                                job.graph.num_nodes(),
+                                &job.graph.edges,
+                            ),
                             edges,
                             chain,
-                        }));
-                        (inputs, chain)
+                        });
+                        *shared = Some(Arc::clone(&prepared));
+                        (inputs, prepared)
                     }
                 }
             }
         };
-        let gated = screen && settings.chain_gated(chain, &job.params);
+        let gated = screen && settings.chain_gated(prepared.chain, &job.params);
         // Open gates measure the budget the job asked for.
         if gated && !settings.open_gates {
             job.params.num_sweeps = CHAIN_GATES.full_sweeps;
         }
-        let schedule = self.schedules.prepare(job, settings, gated, screen)?;
+        // `inputs` verified the job's edges against `prepared.edges`, edge by
+        // edge, so the cached degrees are this job's.
+        let schedule =
+            self.schedules
+                .prepare(job, settings, gated, screen, Some(&prepared.degrees))?;
         Ok(Some(PreparedData { schedule, inputs }))
     }
 }
@@ -608,7 +619,92 @@ struct Work {
 // one bounded reply per job preserves admission order.
 /// How often the runner logs the cascade report.
 const REPORT_PERIOD: Duration = Duration::from_secs(60);
-pub(crate) const PREP_WORKERS: usize = 4;
+/// GPU utilization of the slot runner over a window.
+///
+/// `gpu_busy` is the share of wall time with a step command executing (the
+/// union of command intervals). `occupancy` is the share of a pool's slots
+/// those commands advanced, weighted by GPU time. `util` is slot-weighted GPU
+/// time per wall second; it exceeds `gpu_busy` when the two pools' commands
+/// overlap on the GPU. `runner_wait` is the share of wall time the runner
+/// thread spent blocked on the GPU: near zero means the host, not the GPU,
+/// sets the pace.
+struct Utilization {
+    started: Instant,
+    busy_s: f64,
+    slot_s: f64,
+    span_s: f64,
+    last_end: f64,
+    wait: Duration,
+    steps: u64,
+}
+
+impl Utilization {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            busy_s: 0.0,
+            slot_s: 0.0,
+            span_s: 0.0,
+            last_end: 0.0,
+            wait: Duration::ZERO,
+            steps: 0,
+        }
+    }
+
+    fn record(&mut self, span: crate::slots::StepSpan, capacity: usize) {
+        let duration = span.end - span.start;
+        let start = span.start.max(self.last_end);
+        if span.end > start {
+            self.busy_s += span.end - start;
+        }
+        self.last_end = self.last_end.max(span.end);
+        self.span_s += duration;
+        self.steps += 1;
+        self.slot_s += duration * span.slots as f64 / capacity.max(1) as f64;
+    }
+
+    /// Log and restart the window once `period` has passed.
+    fn report(&mut self, period: Duration, info: bool) {
+        let wall = self.started.elapsed();
+        if wall < period {
+            return;
+        }
+        let wall_s = wall.as_secs_f64();
+        let gpu_busy = self.busy_s / wall_s;
+        let occupancy = self.slot_s / self.span_s.max(f64::EPSILON);
+        let util = self.slot_s / wall_s;
+        let runner_wait = self.wait.as_secs_f64() / wall_s;
+        let steps_per_s = self.steps as f64 / wall_s;
+        let step_us = 1e6 * self.span_s / self.steps.max(1) as f64;
+        if info {
+            tracing::info!(
+                gpu_busy = format_args!("{gpu_busy:.3}"),
+                occupancy = format_args!("{occupancy:.3}"),
+                util = format_args!("{util:.3}"),
+                runner_wait = format_args!("{runner_wait:.3}"),
+                steps_per_s = format_args!("{steps_per_s:.0}"),
+                step_us = format_args!("{step_us:.0}"),
+                "gpu utilization"
+            );
+        } else {
+            tracing::debug!(
+                gpu_busy = format_args!("{gpu_busy:.3}"),
+                occupancy = format_args!("{occupancy:.3}"),
+                util = format_args!("{util:.3}"),
+                runner_wait = format_args!("{runner_wait:.3}"),
+                steps_per_s = format_args!("{steps_per_s:.0}"),
+                step_us = format_args!("{step_us:.0}"),
+                "gpu utilization"
+            );
+        }
+        *self = Self::new();
+    }
+}
+
+/// Host threads drawing and preparing lease salts. On an M4 Max, four kept
+/// the runner waiting on preparation most of the time and capped the GPU near
+/// 60 percent busy; eight keep it waiting on the GPU instead.
+pub(crate) const PREP_WORKERS: usize = 8;
 pub(crate) const PREP_BOUND: usize = 40;
 
 pub(crate) struct Preparation {
@@ -965,6 +1061,7 @@ pub(crate) fn run(
     let mut turn = 0;
     let mut window = Instant::now();
     let mut busy_us = 0u64;
+    let (mut second, mut minute) = (Utilization::new(), Utilization::new());
     let mut fault = None;
 
     'run: loop {
@@ -973,8 +1070,20 @@ pub(crate) fn run(
         }
         preparation.fill(&mut jobs, salts, config, &mut eof, &mut prefer_salt);
         if let Some(pools) = &mut pools {
+            let waited = Instant::now();
+            pools[turn].slots.wait();
+            let waited = waited.elapsed();
+            second.wait += waited;
+            minute.wait += waited;
+            let capacity = pools[turn].slots.capacity();
             match pools[turn].harvest(&mut controller, out, cancel, gov) {
-                Ok(us) => busy_us = busy_us.saturating_add(us),
+                Ok(us) => {
+                    busy_us = busy_us.saturating_add(us);
+                    if let Some(span) = pools[turn].slots.take_span() {
+                        second.record(span, capacity);
+                        minute.record(span, capacity);
+                    }
+                }
                 Err(error) => {
                     fault = Some(error);
                     break;
@@ -995,6 +1104,8 @@ pub(crate) fn run(
                 config = *settings.lock().unwrap_or_else(|p| p.into_inner());
                 controller.refresh(config);
                 controller.report(Instant::now(), REPORT_PERIOD);
+                second.report(Duration::ZERO, false);
+                minute.report(REPORT_PERIOD, true);
                 window = Instant::now();
                 busy_us = 0;
             }
@@ -1217,8 +1328,8 @@ mod tests {
     use quip_solver_core::Sampler;
 
     #[test]
-    fn mixed_intake_pushes_a_gate_screen_that_enters_the_empty_top10_preserves_survivors_and_fails_draw_errors()
-     {
+    fn mixed_intake_pushes_a_gate_screen_that_enters_the_empty_top10_preserves_survivors_and_fails_draw_errors(
+    ) {
         let device = MetalDevice::open(0).unwrap();
         let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
         let topology = Arc::new(quip_solver_core::quip_protocol::lease::TopologyView {
@@ -1383,7 +1494,10 @@ mod tests {
         // on a double release, turning this into `Failed`/`Dropped`)
         // instead of `Screened`.
         match outcomes.try_recv().unwrap() {
-            SaltOutcome::Screened { index, energy_milli } => {
+            SaltOutcome::Screened {
+                index,
+                energy_milli,
+            } => {
                 assert_eq!(index, 0);
                 assert!(
                     (-1000..=1000).contains(&energy_milli),
