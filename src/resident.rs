@@ -147,6 +147,9 @@ pub(crate) struct Salt {
     pub(crate) topology: Arc<TopologyView>,
     pub(crate) nonce: [u8; 32],
     pub(crate) index: u64,
+    /// The miner's lease round when this salt was fed; the cascade report
+    /// covers one round at a time.
+    pub(crate) round: u64,
     pub(crate) params: SampleParams,
     /// Set when the issuing lease ends. Its queued and live units then stop
     /// and answer `Dropped`.
@@ -169,6 +172,7 @@ enum Origin {
     Stream,
     Salt {
         index: u64,
+        round: u64,
         target: LiveTarget,
         top10: LeaseTopK,
         stop: Arc<AtomicBool>,
@@ -957,6 +961,7 @@ impl Preparation {
                             Source::Salt(salt) => {
                                 let origin = Origin::Salt {
                                     index: salt.index,
+                                    round: salt.round,
                                     target: salt.target.clone(),
                                     top10: salt.top10.clone(),
                                     stop: Arc::clone(&salt.stop),
@@ -1409,7 +1414,8 @@ pub(crate) fn run(
             let Some(pools) = &mut pools else { continue };
             let pool = &mut pools[turn];
             // Plain jobs have no target and leave the yield check alone.
-            let initial_target_milli = if let Origin::Salt { target, .. } = &origin {
+            let initial_target_milli = if let Origin::Salt { target, round, .. } = &origin {
+                controller.enter_round(*round);
                 let target_milli = target.get();
                 controller.set_yield_target(target_milli);
                 target_milli
@@ -1566,6 +1572,7 @@ mod tests {
                     topology,
                     nonce: [0; 32],
                     index,
+                    round: 0,
                     params: SampleParams {
                         num_reads: 4,
                         num_sweeps: 16,
@@ -1663,6 +1670,7 @@ mod tests {
                 topology,
                 nonce: [0; 32],
                 index: 0,
+                round: 0,
                 params: SampleParams {
                     num_reads: 4,
                     num_sweeps: 16,
@@ -1816,6 +1824,7 @@ mod tests {
             job: hit_job,
             origin: Origin::Salt {
                 index: 1,
+                round: 0,
                 // Easily beaten: any real energy is below it, so the unit
                 // finishes at the first checkpoint (the chain rule, strict <).
                 target: LiveTarget::new(Some(i64::MAX - 1)),
@@ -1846,6 +1855,7 @@ mod tests {
             job: plain_job,
             origin: Origin::Salt {
                 index: 2,
+                round: 0,
                 target: LiveTarget::new(None),
                 top10: LeaseTopK::new(),
                 stop: Arc::default(),
@@ -1953,6 +1963,7 @@ mod tests {
             job: unit_job,
             origin: Origin::Salt {
                 index: 9,
+                round: 0,
                 target: target.clone(),
                 top10: LeaseTopK::new(),
                 stop: Arc::default(),
@@ -2058,6 +2069,7 @@ mod tests {
             job: unit_job,
             origin: Origin::Salt {
                 index: 5,
+                round: 0,
                 target: target.clone(),
                 top10: LeaseTopK::new(),
                 stop: Arc::default(),
@@ -2182,6 +2194,7 @@ mod tests {
             }),
             nonce: [0; 32],
             index,
+            round: 0,
             params: SampleParams {
                 num_reads: 4,
                 num_sweeps: 16,
@@ -2431,6 +2444,7 @@ mod tests {
             topology: Arc::clone(topology),
             nonce,
             index,
+            round: 0,
             params: SampleParams {
                 num_reads: 64,
                 num_sweeps: CHAIN_GATES.full_sweeps,
@@ -3360,6 +3374,7 @@ mod tests {
             job: live_job,
             origin: Origin::Salt {
                 index: 5,
+                round: 0,
                 target: LiveTarget::new(None),
                 top10: LeaseTopK::new(),
                 stop: Arc::clone(&stop),

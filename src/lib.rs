@@ -247,6 +247,11 @@ pub struct MetalSampler {
     /// Cleared when the resident runner exits, so a lease stops waiting on it.
     runner_live: std::sync::atomic::AtomicBool,
     lease_turns: lease_turn::LeaseTurns,
+    /// Counts lease cancellations, as the miner's view of the coordinator's
+    /// rounds: a reseed cancels every queued lease. A lease bumps it while it
+    /// still holds its place in `lease_turns`, so every lease that feeds after
+    /// a reseed reads the new value.
+    lease_round: std::sync::atomic::AtomicU64,
 }
 
 /// Stores a value into a flag when dropped, on every exit path.
@@ -322,6 +327,7 @@ impl MetalSampler {
             salts_rx: std::sync::Mutex::new(salts_rx),
             runner_live: std::sync::atomic::AtomicBool::new(true),
             lease_turns: lease_turn::LeaseTurns::default(),
+            lease_round: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -414,8 +420,12 @@ impl quip_solver_core::Sampler for MetalSampler {
         let mut turn = self.lease_turns.join();
         let runner_live = || self.runner_live.load(Ordering::Acquire);
         if !turn.wait(|| sink.is_stopped() || !runner_live()) {
+            if sink.is_stopped() {
+                self.lease_round.fetch_add(1, Ordering::AcqRel);
+            }
             return self.require_runner();
         }
+        let round = self.lease_round.load(Ordering::Acquire);
         tracing::debug!(
             turn = turn.id(),
             salts = lease.salt_count(),
@@ -443,12 +453,17 @@ impl quip_solver_core::Sampler for MetalSampler {
                 let _done = StoreOnDrop(feeding, false);
                 for index in 0..lease.salt_count() {
                     if sink.is_stopped() || stop.load(Ordering::Acquire) {
+                        if sink.is_stopped() {
+                            // Still holding the turn; see `lease_round`.
+                            self.lease_round.fetch_add(1, Ordering::AcqRel);
+                        }
                         return;
                     }
                     let salt = resident::Salt {
                         topology: std::sync::Arc::clone(&topology),
                         nonce: lease.nonce(index),
                         index,
+                        round,
                         params: params.clone(),
                         stop: std::sync::Arc::clone(stop),
                         target: target.clone(),

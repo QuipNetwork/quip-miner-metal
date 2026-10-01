@@ -294,6 +294,8 @@ pub(crate) struct Ticket {
     pub(crate) audited: bool,
     pub(crate) topology_epoch: u64,
     pub(crate) yield_epoch: u64,
+    /// The lease round this unit was admitted in.
+    round: u64,
     /// Set by [`Controller::checkpoint`] when a target hit ends the unit early,
     /// to the sweep count of the checkpoint that hit. `None` otherwise.
     pub(crate) finish_sweeps: Option<usize>,
@@ -330,8 +332,10 @@ pub(crate) struct Controller {
     topology_epoch: u64,
     yield_epoch: u64,
     stats: Stats,
-    /// Lowest and highest final energy over every finished model since the
-    /// miner started, as `(best, worst)`.
+    /// The newest lease round admitted; see [`Self::enter_round`].
+    round: u64,
+    /// Lowest and highest final energy over this round's finished models,
+    /// as `(best, worst)`.
     range: Option<(i64, i64)>,
 }
 
@@ -489,11 +493,12 @@ impl Controller {
             topology_epoch: 0,
             yield_epoch: 0,
             stats: Stats::new(Instant::now()),
+            round: 0,
             range: None,
         }
     }
 
-    /// Log the window's rate and pass rates, and the all-time energy range,
+    /// Log the window's rate and pass rates, and this round's energy range,
     /// when `period` has passed, then start a new window.
     pub(crate) fn report(&mut self, now: Instant, period: Duration) {
         let elapsed = now.saturating_duration_since(self.stats.started);
@@ -644,6 +649,7 @@ impl Controller {
             audited: false,
             topology_epoch: self.topology_epoch,
             yield_epoch: self.yield_epoch,
+            round: self.round,
             finish_sweeps: None,
             plan: Arc::clone(&self.plan),
             final_sweeps: job.params.num_sweeps,
@@ -736,14 +742,25 @@ impl Controller {
         }
     }
 
+    /// Start a new report range when a salt from a newer lease round
+    /// arrives. Units from older rounds still finish, outside the range.
+    pub(crate) fn enter_round(&mut self, round: u64) {
+        if round > self.round {
+            self.round = round;
+            self.range = None;
+        }
+    }
+
     /// Called once per job with its final best (None for error or cancel).
     pub(crate) fn finish(&mut self, ticket: &Ticket, best: Option<i64>, delivered: bool) {
         if let Some(best) = best {
             self.stats.models += 1;
-            self.range = Some(
-                self.range
-                    .map_or((best, best), |(b, w)| (b.min(best), w.max(best))),
-            );
+            if ticket.round == self.round {
+                self.range = Some(
+                    self.range
+                        .map_or((best, best), |(b, w)| (b.min(best), w.max(best))),
+                );
+            }
             if ticket.topology_epoch == self.topology_epoch
                 && ticket.stage == ticket.gates
                 && ticket.gates > 0
@@ -1266,6 +1283,33 @@ mod tests {
         let (mut below, _, _) = controller.admit(&candidate);
         assert!(!controller.checkpoint(&mut below, -200, Some(-150)));
         assert_eq!(below.finish_sweeps, Some(16));
+    }
+
+    #[test]
+    fn report_range_covers_one_lease_round() {
+        let mut c = Controller::new(CascadeSettings::default());
+        let (old, _, _) = c.admit(&job(0, 256));
+        let (late, _, _) = c.admit(&job(1, 256));
+        c.finish(&old, Some(-14_702), true);
+        assert_eq!(c.range, Some((-14_702, -14_702)));
+
+        c.enter_round(3);
+        assert_eq!(c.range, None, "a newer round starts an empty range");
+        let (new, _, _) = c.admit(&job(2, 256));
+        c.finish(&new, Some(-14_600), true);
+        c.finish(&late, Some(-14_800), true);
+        assert_eq!(
+            c.range,
+            Some((-14_600, -14_600)),
+            "a unit admitted in the old round stays out of the new range"
+        );
+
+        c.enter_round(2);
+        assert_eq!(
+            c.range,
+            Some((-14_600, -14_600)),
+            "an older round is ignored"
+        );
     }
 
     #[test]
