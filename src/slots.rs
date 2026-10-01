@@ -188,6 +188,8 @@ fn checked_read_pointer<T>(
 /// how many slots it advanced.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StepSpan {
+    /// Host time the command was committed, on the GPU timestamps' clock.
+    pub(crate) committed: f64,
     pub(crate) start: f64,
     pub(crate) end: f64,
     pub(crate) slots: usize,
@@ -231,6 +233,8 @@ pub(crate) struct SlotPool {
     command: Option<metal::CommandBuffer>,
     /// The span of the last command `take_checkpoints` retired.
     span: Option<StepSpan>,
+    /// Host time of the last commit, for [`StepSpan::committed`].
+    committed: f64,
     faulted: bool,
     num_reads: usize,
     words: usize,
@@ -308,6 +312,7 @@ impl SlotPool {
             steps: Vec::with_capacity(capacity),
             command: None,
             span: None,
+            committed: 0.0,
             faulted: false,
             num_reads,
             words,
@@ -584,6 +589,7 @@ impl SlotPool {
             MTLSize::new(self.threads as u64, 1, 1),
         );
         encoder.end_encoding();
+        self.committed = sampler::host_seconds();
         command.commit();
         self.command = Some(command);
         Ok(true)
@@ -613,6 +619,7 @@ impl SlotPool {
         }
         let device_us = sampler::gpu_time_us(command);
         self.span = sampler::gpu_span(command).map(|(start, end)| StepSpan {
+            committed: self.committed,
             start,
             end,
             slots: self.steps.len(),

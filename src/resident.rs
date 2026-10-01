@@ -796,13 +796,17 @@ const REPORT_PERIOD: Duration = Duration::from_secs(60);
 /// time per wall second; it exceeds `gpu_busy` when the two pools' commands
 /// overlap on the GPU. `runner_wait` is the share of wall time the runner
 /// thread spent blocked on the GPU: near zero means the host, not the GPU,
-/// sets the pace.
+/// sets the pace. `host_late` and `launch` split the GPU's idle time between
+/// steps: `host_late` is time before the next step was committed, `launch`
+/// is time after it was committed but before it started.
 struct Utilization {
     started: Instant,
     busy_s: f64,
     slot_s: f64,
     span_s: f64,
     last_end: f64,
+    late_s: f64,
+    launch_s: f64,
     wait: Duration,
     steps: u64,
 }
@@ -815,6 +819,8 @@ impl Utilization {
             slot_s: 0.0,
             span_s: 0.0,
             last_end: 0.0,
+            late_s: 0.0,
+            launch_s: 0.0,
             wait: Duration::ZERO,
             steps: 0,
         }
@@ -822,6 +828,12 @@ impl Utilization {
 
     fn record(&mut self, span: crate::slots::StepSpan, capacity: usize) {
         let duration = span.end - span.start;
+        if self.last_end > 0.0 && span.start > self.last_end {
+            let gap = span.start - self.last_end;
+            let late = (span.committed - self.last_end).clamp(0.0, gap);
+            self.late_s += late;
+            self.launch_s += gap - late;
+        }
         let start = span.start.max(self.last_end);
         if span.end > start {
             self.busy_s += span.end - start;
@@ -845,6 +857,8 @@ impl Utilization {
         let runner_wait = self.wait.as_secs_f64() / wall_s;
         let steps_per_s = self.steps as f64 / wall_s;
         let step_us = 1e6 * self.span_s / self.steps.max(1) as f64;
+        let host_late = self.late_s / wall_s;
+        let launch = self.launch_s / wall_s;
         if info {
             tracing::info!(
                 gpu_busy = format_args!("{gpu_busy:.3}"),
@@ -853,6 +867,8 @@ impl Utilization {
                 runner_wait = format_args!("{runner_wait:.3}"),
                 steps_per_s = format_args!("{steps_per_s:.0}"),
                 step_us = format_args!("{step_us:.0}"),
+                host_late = format_args!("{host_late:.3}"),
+                launch = format_args!("{launch:.3}"),
                 "gpu utilization"
             );
         } else {
@@ -863,6 +879,8 @@ impl Utilization {
                 runner_wait = format_args!("{runner_wait:.3}"),
                 steps_per_s = format_args!("{steps_per_s:.0}"),
                 step_us = format_args!("{step_us:.0}"),
+                host_late = format_args!("{host_late:.3}"),
+                launch = format_args!("{launch:.3}"),
                 "gpu utilization"
             );
         }
@@ -1251,6 +1269,14 @@ pub(crate) fn run(
                 Ok(us) => {
                     busy_us = busy_us.saturating_add(us);
                     if let Some(span) = pools[turn].slots.take_span() {
+                        tracing::trace!(
+                            pool = turn,
+                            committed = span.committed,
+                            start = span.start,
+                            end = span.end,
+                            slots = span.slots,
+                            "step span"
+                        );
                         second.record(span, capacity);
                         minute.record(span, capacity);
                     }

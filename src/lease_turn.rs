@@ -81,11 +81,6 @@ impl Turn<'_> {
         }
     }
 
-    /// Whether [`Turn::release`] has run.
-    pub(crate) fn released(&self) -> bool {
-        self.released
-    }
-
     /// Leave the queue and wake the leases behind this one. Idempotent.
     pub(crate) fn release(&mut self) {
         if self.released {

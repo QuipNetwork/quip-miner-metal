@@ -325,6 +325,54 @@ impl MetalSampler {
         }
     }
 
+    /// Report a lease's outcomes until every queued salt has one, the
+    /// feeder has stopped, or the lease stops.
+    fn report_lease(
+        &self,
+        sink: &quip_solver_core::LeaseSink,
+        outcomes: &std::sync::mpsc::Receiver<resident::SaltOutcome>,
+        live_target: &resident::LiveTarget,
+        fed: &std::sync::atomic::AtomicU64,
+        feeding: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), quip_solver_core::SampleError> {
+        use std::sync::atomic::Ordering;
+        let mut reported = 0u64;
+        while !sink.is_stopped() {
+            self.require_runner()?;
+            live_target.set(sink.target_energy_milli());
+            // `feeding` is cleared after the last increment of `fed`.
+            if !feeding.load(Ordering::Acquire) && reported == fed.load(Ordering::Acquire) {
+                break;
+            }
+            let Ok(first) = outcomes.recv_timeout(std::time::Duration::from_millis(1)) else {
+                continue;
+            };
+            for outcome in std::iter::once(first).chain(outcomes.try_iter()) {
+                reported += 1;
+                let sent = match outcome {
+                    resident::SaltOutcome::Screened {
+                        index,
+                        energy_milli,
+                    } => sink.screen(index, energy_milli),
+                    resident::SaltOutcome::Survived { index, reads } => sink.push(index, reads),
+                    resident::SaltOutcome::Dropped { index } => {
+                        tracing::debug!(index, "lease salt dropped before reporting");
+                        Ok(())
+                    }
+                    resident::SaltOutcome::Failed { index, error } => {
+                        return Err(quip_solver_core::SampleError::DeviceFault(format!(
+                            "lease salt {index}: {error}"
+                        )));
+                    }
+                };
+                if sent.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn require_runner(&self) -> Result<(), quip_solver_core::SampleError> {
         if self.runner_live.load(std::sync::atomic::Ordering::Acquire) {
             Ok(())
@@ -351,6 +399,7 @@ impl quip_solver_core::Sampler for MetalSampler {
         params: &SampleParams,
         sink: &quip_solver_core::LeaseSink,
     ) -> Result<(), quip_solver_core::SampleError> {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         if self.kernel != Kernel::Msa {
             return Err(quip_solver_core::SampleError::DeviceFault(
                 "local lease generation needs the MSA kernel".into(),
@@ -359,11 +408,11 @@ impl quip_solver_core::Sampler for MetalSampler {
         let topology = std::sync::Arc::new(topology.clone());
         let (reply, outcomes) = std::sync::mpsc::channel();
         // Queued, preparing, and live units of this lease stop once it returns.
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
         let _stop = StoreOnDrop(&stop, true);
         // One lease feeds at a time; see `lease_turn`.
         let mut turn = self.lease_turns.join();
-        let runner_live = || self.runner_live.load(std::sync::atomic::Ordering::Acquire);
+        let runner_live = || self.runner_live.load(Ordering::Acquire);
         if !turn.wait(|| sink.is_stopped() || !runner_live()) {
             return self.require_runner();
         }
@@ -374,78 +423,53 @@ impl quip_solver_core::Sampler for MetalSampler {
         );
         // Shared with every unit of this lease. quip-solver-core keeps the
         // session target in a live `watch` channel (LeaseSink::target_energy_milli,
-        // a cheap borrow); this loop already runs continuously for as long as
-        // the lease is open, so it refreshes this cell on every pass instead
-        // of units each capturing a target snapshot at enqueue time. The
-        // resident runner only reads it, at each checkpoint.
+        // a cheap borrow); the reporting loop below refreshes this cell on
+        // every pass instead of units each capturing a target snapshot at
+        // enqueue time. The resident runner only reads it, at each checkpoint.
         let live_target = resident::LiveTarget::new(sink.target_energy_milli());
         // Shared with every unit of this lease. A new lease starts empty;
         // see `resident::LeaseTopK`.
         let top10 = resident::LeaseTopK::new();
-        let (mut next, mut open) = (0u64, 0u64);
-        // A salt the full intake channel refused, retried on the next pass.
-        let mut refused = None;
-        while !sink.is_stopped() && (next < lease.salt_count() || open > 0) {
-            self.require_runner()?;
-            live_target.set(sink.target_energy_milli());
-            // Feed until the intake channel is full. Its bound, with the
-            // runner's preparation bound and slot count, limits what is open.
-            while next < lease.salt_count() {
-                let salt = refused.take().unwrap_or_else(|| resident::Salt {
-                    topology: std::sync::Arc::clone(&topology),
-                    nonce: lease.nonce(next),
-                    index: next,
-                    params: params.clone(),
-                    stop: std::sync::Arc::clone(&stop),
-                    target: live_target.clone(),
-                    top10: top10.clone(),
-                    reply: reply.clone(),
-                });
-                match self.salts_tx.try_send(salt) {
-                    Ok(()) => {
-                        next += 1;
-                        open += 1;
+        // Salts queued so far, and whether the feeder may queue more.
+        let (fed, feeding) = (AtomicU64::new(0), AtomicBool::new(true));
+        std::thread::scope(|scope| {
+            // The feeder only queues salts, blocking while the intake channel
+            // is full, so the runner never waits on this lease's reporting.
+            // It hands the turn to the next lease once its last salt is queued.
+            let (fed, feeding, stop) = (&fed, &feeding, &stop);
+            let (target, top10, unit_reply) = (live_target.clone(), top10.clone(), reply.clone());
+            let topology = std::sync::Arc::clone(&topology);
+            scope.spawn(move || {
+                let _done = StoreOnDrop(feeding, false);
+                for index in 0..lease.salt_count() {
+                    if sink.is_stopped() || stop.load(Ordering::Acquire) {
+                        return;
                     }
-                    Err(std::sync::mpsc::TrySendError::Full(salt)) => {
-                        refused = Some(salt);
-                        break;
-                    }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Ok(()),
-                }
-            }
-            if next == lease.salt_count() && !turn.released() {
-                // Every salt is queued: the next lease may feed while this
-                // one's open units finish.
-                turn.release();
-                tracing::debug!(turn = turn.id(), open, "lease fed");
-            }
-            let Ok(first) = outcomes.recv_timeout(std::time::Duration::from_millis(1)) else {
-                continue;
-            };
-            for outcome in std::iter::once(first).chain(outcomes.try_iter()) {
-                open -= 1;
-                let reported = match outcome {
-                    resident::SaltOutcome::Screened {
+                    let salt = resident::Salt {
+                        topology: std::sync::Arc::clone(&topology),
+                        nonce: lease.nonce(index),
                         index,
-                        energy_milli,
-                    } => sink.screen(index, energy_milli),
-                    resident::SaltOutcome::Survived { index, reads } => sink.push(index, reads),
-                    resident::SaltOutcome::Dropped { index } => {
-                        tracing::debug!(index, "lease salt dropped before reporting");
-                        Ok(())
+                        params: params.clone(),
+                        stop: std::sync::Arc::clone(stop),
+                        target: target.clone(),
+                        top10: top10.clone(),
+                        reply: unit_reply.clone(),
+                    };
+                    if self.salts_tx.send(salt).is_err() {
+                        return;
                     }
-                    resident::SaltOutcome::Failed { index, error } => {
-                        return Err(quip_solver_core::SampleError::DeviceFault(format!(
-                            "lease salt {index}: {error}"
-                        )));
-                    }
-                };
-                if reported.is_err() {
-                    return Ok(());
+                    fed.fetch_add(1, Ordering::Release);
                 }
-            }
-        }
-        Ok(())
+                turn.release();
+                tracing::debug!(turn = turn.id(), "lease fed");
+            });
+            drop(reply);
+            let reported = self.report_lease(sink, &outcomes, &live_target, fed, feeding);
+            // Stop the feeder before the scope joins it: queued salts of a
+            // stopped lease drain without running.
+            stop.store(true, Ordering::Release);
+            reported
+        })
     }
 
     fn sample(

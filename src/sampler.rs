@@ -838,6 +838,33 @@ pub(crate) fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
     gpu_span(cmd).map_or(0, |(start, end)| ((end - start) * 1_000_000.0) as u64)
 }
 
+/// Host time in seconds, on the clock `MTLCommandBuffer.GPUStartTime` and
+/// `GPUEndTime` report.
+pub(crate) fn host_seconds() -> f64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let scale = *SCALE.get_or_init(|| {
+        let mut info = Timebase { numer: 0, denom: 0 };
+        // SAFETY: `info` is a valid, writable `mach_timebase_info_data_t`.
+        let status = unsafe { mach_timebase_info(&mut info) };
+        if status == 0 && info.denom != 0 {
+            f64::from(info.numer) / f64::from(info.denom) * 1e-9
+        } else {
+            1e-9
+        }
+    });
+    // SAFETY: `mach_absolute_time` takes no arguments and cannot fail.
+    unsafe { mach_absolute_time() as f64 * scale }
+}
+
 /// `(GPUStartTime, GPUEndTime)` of a completed command buffer, in seconds on
 /// the host's absolute clock, or `None` if unavailable or non-positive.
 /// metal-rs 0.33 exposes no accessor, so read the properties via `objc`.
