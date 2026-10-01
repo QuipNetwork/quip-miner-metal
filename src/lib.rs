@@ -51,6 +51,7 @@ pub mod sampler;
 mod cascade;
 mod combined;
 mod cutoff;
+mod draw;
 mod lease_turn;
 mod model_checks;
 mod resident;

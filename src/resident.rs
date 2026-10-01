@@ -719,7 +719,7 @@ impl Preparer {
             return (job, data);
         };
         let prepared = &known.prepared;
-        let (fields, j_units) = match quip_solver_core::quip_protocol::chacha8::draw_ising(
+        let (fields, j_units) = match crate::draw::draw_units(
             salt.nonce,
             view.num_nodes,
             view.edges.len(),
@@ -2508,7 +2508,7 @@ mod tests {
         let cached = Arc::clone(&known.prepared);
 
         let steps = [
-            "draw into i8 units (quip-protocol)",
+            "draw into i8 units (crate::draw)",
             "f64 graph, shared edges",
             "PreparedInputs::from_units",
             "schedule (unit beta range, cache hit)",
@@ -2526,15 +2526,14 @@ mod tests {
                 spent[step] += now - *clock;
                 *clock = now;
             };
-            let (fields, j_units) =
-                std::hint::black_box(quip_solver_core::quip_protocol::chacha8::draw_ising(
-                    salt.nonce,
-                    topology.num_nodes,
-                    topology.edges.len(),
-                    &allowed_h,
-                    &allowed_j,
-                ))
-                .unwrap();
+            let (fields, j_units) = std::hint::black_box(crate::draw::draw_units(
+                salt.nonce,
+                topology.num_nodes,
+                topology.edges.len(),
+                &allowed_h,
+                &allowed_j,
+            ))
+            .unwrap();
             lap(0, &mut clock);
             let to_f64 =
                 |values: &[i8]| -> Vec<f64> { values.iter().map(|&v| f64::from(v)).collect() };
