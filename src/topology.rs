@@ -357,6 +357,31 @@ pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>,
     fill_h_j_inspecting_edges(topology, graph, |_, _| {})
 }
 
+/// [`fill_h_j`] from integer milli coefficients, `j_milli` in the
+/// establishing edge order.
+///
+/// # Precondition
+///
+/// The caller verified once that the establishing edges have no self-loop and
+/// no out-of-range endpoint, and that every value is a whole unit (a multiple
+/// of 1,000) in `i8` range. Under those conditions the result equals
+/// [`fill_h_j`] of the same values divided by 1,000.
+pub(crate) fn fill_h_j_milli(
+    topology: &SelfFeedingTopology,
+    h_milli: &[i32],
+    j_milli: &[i32],
+) -> (Vec<i8>, Vec<i8>) {
+    debug_assert_eq!(j_milli.len(), topology.edge_pos.len());
+    let mut j_csr = vec![0i8; topology.nnz];
+    for (&(pos_ij, pos_ji), &value) in topology.edge_pos.iter().zip(j_milli) {
+        let value = (value / 1000) as i8;
+        j_csr[pos_ij as usize] = value;
+        j_csr[pos_ji as usize] = value;
+    }
+    let h_i8 = h_milli.iter().map(|&value| (value / 1000) as i8).collect();
+    (j_csr, h_i8)
+}
+
 /// Compare the exact ordered edges during coefficient construction, avoiding
 /// a separate topology walk. No coefficients escape on a mismatch.
 pub(crate) fn fill_h_j_matching(

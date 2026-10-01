@@ -3,8 +3,8 @@
 
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, BufferPool, CachedTopology, Kernel, SampleError, MSA_THREADS};
-use crate::topology::fill_h_j_matching;
 use crate::topology::SelfFeedingTopology;
+use crate::topology::{fill_h_j_matching, fill_h_j_milli};
 use crate::{IsingGraph, SampleParams, SamplerResult};
 use metal::{MTLCommandBufferStatus, MTLSize};
 use std::sync::{Arc, OnceLock};
@@ -109,10 +109,11 @@ pub(crate) fn validate_schedule(
 /// its edges.
 pub(crate) type Edges = Arc<[(usize, usize)]>;
 
-/// Host allocations only. Construction binds coefficients to the exact graph.
+/// Host allocations only. The coefficients belong to the job they were
+/// prepared from; admission pairs them with that job's graph.
 pub(crate) struct PreparedInputs {
-    graph: IsingGraph,
-    /// The edge list construction verified `graph` against, edge by edge.
+    nodes: usize,
+    /// The edge list the job's edges were verified against.
     edges: Edges,
     couplings: Vec<i8>,
     fields: Vec<i8>,
@@ -126,15 +127,38 @@ impl PreparedInputs {
     ) -> Option<Self> {
         let (couplings, fields) = fill_h_j_matching(topology, edges, graph)?;
         Some(Self {
-            graph: graph.clone(),
+            nodes: graph.num_nodes(),
             edges: Arc::clone(edges),
             couplings,
             fields,
         })
     }
 
+    /// Inputs from a lease draw's milli values. The caller verified once
+    /// that `edges` is the lease topology and that [`fill_h_j_milli`]'s
+    /// preconditions hold for every value the draw can select.
+    pub(crate) fn from_milli(
+        topology: &SelfFeedingTopology,
+        edges: &Edges,
+        h_milli: &[i32],
+        j_milli: &[i32],
+    ) -> Self {
+        let (couplings, fields) = fill_h_j_milli(topology, h_milli, j_milli);
+        Self {
+            nodes: h_milli.len(),
+            edges: Arc::clone(edges),
+            couplings,
+            fields,
+        }
+    }
+
     pub(crate) fn edges(&self) -> &Edges {
         &self.edges
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coefficients(&self) -> (&[i8], &[i8]) {
+        (&self.couplings, &self.fields)
     }
 }
 
@@ -399,9 +423,11 @@ impl SlotPool {
     }
 
     /// Validation and quantization have already run on a preparation worker.
+    /// `graph` is the graph of the job `inputs` were prepared from.
     pub(crate) fn admit_prepared(
         &mut self,
         inputs: PreparedInputs,
+        graph: IsingGraph,
         schedule: Arc<[f32]>,
         checkpoints: Vec<usize>,
         seed: u64,
@@ -411,14 +437,16 @@ impl SlotPool {
         if schedule.len() > self.sched_stride {
             return Err(SampleError::TooLarge("schedule exceeds slot stride".into()));
         }
-        let nodes = inputs.graph.num_nodes();
-        if !self.matches_prepared(&inputs.edges, nodes, self.num_reads) {
+        if graph.num_nodes() != inputs.nodes
+            || graph.edges.len() != inputs.edges.len()
+            || !self.matches_prepared(&inputs.edges, inputs.nodes, self.num_reads)
+        {
             return Err(SampleError::Driver(
                 "job topology differs from slot pool".into(),
             ));
         }
         let job = SlotJob {
-            graph: inputs.graph,
+            graph,
             schedule,
             checkpoints,
             seed,

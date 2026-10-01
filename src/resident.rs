@@ -12,6 +12,7 @@ use crate::sampler::{self, Kernel, SampleError};
 use crate::slots::{Edges, PreparedInputs, SlotPool};
 use crate::streaming::{batch_size_for_reads, scale_budget, GpuGovernor};
 use crate::topology::SelfFeedingTopology;
+use quip_solver_core::quip_protocol::lease::TopologyView;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
@@ -143,7 +144,7 @@ pub(crate) enum SaltOutcome {
 }
 
 pub(crate) struct Salt {
-    pub(crate) topology: Arc<quip_solver_core::quip_protocol::lease::TopologyView>,
+    pub(crate) topology: Arc<TopologyView>,
     pub(crate) nonce: [u8; 32],
     pub(crate) index: u64,
     pub(crate) params: SampleParams,
@@ -248,25 +249,26 @@ fn answer(
     }
 }
 
-fn salt_job(salt: &Salt) -> Result<StreamJob, SampleError> {
-    let (h, j) = salt
-        .topology
-        .draw(salt.nonce)
-        .map_err(|error| SampleError::Driver(format!("lease draw: {error}")))?;
-    let to_units = |values: Vec<i32>| {
+/// The stream job for a salt whose draw gave `h_milli` and `j_milli`.
+fn drawn_job(salt: &Salt, h_milli: &[i32], j_milli: &[i32]) -> StreamJob {
+    let to_units = |values: &[i32]| {
         values
-            .into_iter()
-            .map(|value| f64::from(value) / 1000.0)
+            .iter()
+            .map(|&value| f64::from(value) / 1000.0)
             .collect()
     };
     let mut params = salt.params.clone();
     params.seed = salt_seed(salt.nonce);
-    Ok(StreamJob {
+    StreamJob {
         job_id: salt.index.to_le_bytes().to_vec(),
-        graph: IsingGraph::new(to_units(h), to_units(j), salt.topology.edges.clone()),
+        graph: IsingGraph::new(
+            to_units(h_milli),
+            to_units(j_milli),
+            salt.topology.edges.clone(),
+        ),
         params,
         watermark: None,
-    })
+    }
 }
 
 /// The nonce is unique to the lease and salt, so concurrent leases never share a seed.
@@ -508,10 +510,61 @@ struct PreparedTopology {
 
 type SharedTopology = Arc<Mutex<Option<Arc<PreparedTopology>>>>;
 
+/// What one worker learned about the current lease topology from the
+/// allowed values, so its salts skip the per-salt checks.
+struct SaltTopology {
+    /// Held, so pointer equality identifies the lease's view.
+    view: Arc<TopologyView>,
+    prepared: Arc<PreparedTopology>,
+    /// Every draw has exact device energies and meets
+    /// [`crate::topology::fill_h_j_milli`]'s preconditions.
+    exact: bool,
+    /// Every draw has couplings ±1 and fields 0 or ±1.
+    unit: bool,
+}
+
+impl SaltTopology {
+    /// `None` when `prepared` is not `view`'s topology.
+    fn learn(view: &Arc<TopologyView>, prepared: Arc<PreparedTopology>) -> Option<Self> {
+        let n = view.num_nodes;
+        if n != prepared.topology.n || !view.edges.iter().eq(prepared.edges.iter()) {
+            return None;
+        }
+        let whole = |values: &[i32]| {
+            values
+                .iter()
+                .all(|&v| v % 1000 == 0 && (-128..=127).contains(&(v / 1000)))
+        };
+        let largest = |values: &[i32]| {
+            values
+                .iter()
+                .map(|&v| f64::from(v.unsigned_abs() / 1000))
+                .fold(0.0, f64::max)
+        };
+        let units = n as f64 * largest(&view.allowed_h_milli)
+            + view.edges.len() as f64 * largest(&view.allowed_j_milli);
+        let simple_edges = view.edges.iter().all(|&(u, v)| u != v && u < n && v < n);
+        Some(Self {
+            view: Arc::clone(view),
+            prepared,
+            exact: simple_edges
+                && whole(&view.allowed_h_milli)
+                && whole(&view.allowed_j_milli)
+                && units <= sampler::DEVICE_ENERGY_MAX_UNITS,
+            unit: view.allowed_j_milli.iter().all(|&j| j.abs() == 1000)
+                && view
+                    .allowed_h_milli
+                    .iter()
+                    .all(|&h| h == 0 || h.abs() == 1000),
+        })
+    }
+}
+
 #[derive(Default)]
 struct Preparer {
     topology: SharedTopology,
     schedules: ScheduleCache,
+    salt: Option<SaltTopology>,
 }
 
 impl Preparer {
@@ -593,9 +646,69 @@ impl Preparer {
         }
         // `inputs` verified the job's edges against `prepared.edges`, edge by
         // edge, so the cached degrees are this job's.
-        let schedule =
-            self.schedules
-                .prepare(job, settings, gated, screen, Some(&prepared.degrees))?;
+        let beta_range = job
+            .params
+            .beta_range
+            .is_none()
+            .then(|| crate::cascade::resident_beta_range_from(&job.graph, &prepared.degrees));
+        let schedule = self
+            .schedules
+            .prepare(job, settings, gated, screen, beta_range)?;
+        Ok(Some(PreparedData { schedule, inputs }))
+    }
+
+    /// Prepare a salt of the lease topology `view` whose draw gave `h_milli`
+    /// and `j_milli`; `job` is [`drawn_job`] of them. The first salt of a
+    /// lease takes [`Self::prepare`] and teaches this worker the topology;
+    /// later salts fill coefficients straight from the milli values.
+    fn prepare_salt(
+        &mut self,
+        job: &mut StreamJob,
+        view: &Arc<TopologyView>,
+        h_milli: &[i32],
+        j_milli: &[i32],
+        settings: CascadeSettings,
+        screen: bool,
+    ) -> Result<Option<PreparedData>, SampleError> {
+        let known = self
+            .salt
+            .as_ref()
+            .filter(|known| Arc::ptr_eq(&known.view, view) && known.exact);
+        let Some(known) = known.filter(|_| job.params.num_sweeps != 0) else {
+            let data = self.prepare(job, settings, screen);
+            if matches!(data, Ok(Some(_)))
+                && !self
+                    .salt
+                    .as_ref()
+                    .is_some_and(|k| Arc::ptr_eq(&k.view, view))
+            {
+                let cached = self
+                    .topology
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                self.salt = cached.and_then(|prepared| SaltTopology::learn(view, prepared));
+            }
+            return data;
+        };
+        validate(job)?;
+        let prepared = &known.prepared;
+        let inputs =
+            PreparedInputs::from_milli(&prepared.topology, &prepared.edges, h_milli, j_milli);
+        let gated = screen && settings.chain_gated(prepared.chain, &job.params);
+        if gated && !settings.open_gates {
+            job.params.num_sweeps = CHAIN_GATES.full_sweeps;
+        }
+        let beta_range = job.params.beta_range.is_none().then(|| {
+            if known.unit {
+                crate::cascade::unit_beta_range(h_milli.iter().map(|&h| h != 0), &prepared.degrees)
+            } else {
+                crate::cascade::resident_beta_range_from(&job.graph, &prepared.degrees)
+            }
+        });
+        let schedule = self
+            .schedules
+            .prepare(job, settings, gated, screen, beta_range)?;
         Ok(Some(PreparedData { schedule, inputs }))
     }
 }
@@ -707,6 +820,15 @@ impl Utilization {
 pub(crate) const PREP_WORKERS: usize = 8;
 pub(crate) const PREP_BOUND: usize = 40;
 
+/// Run one preparation, turning a panic into an error so the worker still
+/// returns its job to the runner exactly once.
+fn unwind_safe(
+    prepare: impl FnOnce() -> Result<Option<PreparedData>, SampleError>,
+) -> Result<Option<PreparedData>, SampleError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare))
+        .unwrap_or_else(|_| Err(SampleError::Driver("job preparation panicked".into())))
+}
+
 pub(crate) struct Preparation {
     requests: Vec<mpsc::SyncSender<Work>>,
     next_worker: usize,
@@ -736,6 +858,7 @@ impl Preparation {
                     let mut preparer = Preparer {
                         topology,
                         schedules,
+                        salt: None,
                     };
                     loop {
                         let request = rx.recv();
@@ -750,8 +873,13 @@ impl Preparation {
                         };
                         // Keep ownership of the job outside unwinding so a failed
                         // worker still returns it to the runner exactly once.
-                        let (mut job, origin, screen, initial_data) = match source {
-                            Source::Job(job) => (job, Origin::Stream, work_screen, None),
+                        let (job, origin, data) = match source {
+                            Source::Job(mut job) => {
+                                let data = unwind_safe(|| {
+                                    preparer.prepare(&mut job, settings, work_screen)
+                                });
+                                (job, Origin::Stream, data)
+                            }
                             Source::Salt(salt) => {
                                 let origin = Origin::Salt {
                                     index: salt.index,
@@ -760,8 +888,21 @@ impl Preparation {
                                     stop: Arc::clone(&salt.stop),
                                     reply: salt.reply.clone(),
                                 };
-                                match salt_job(&salt) {
-                                    Ok(job) => (job, origin, work_screen, None),
+                                match salt.topology.draw(salt.nonce) {
+                                    Ok((h_milli, j_milli)) => {
+                                        let mut job = drawn_job(&salt, &h_milli, &j_milli);
+                                        let data = unwind_safe(|| {
+                                            preparer.prepare_salt(
+                                                &mut job,
+                                                &salt.topology,
+                                                &h_milli,
+                                                &j_milli,
+                                                settings,
+                                                work_screen,
+                                            )
+                                        });
+                                        (job, origin, data)
+                                    }
                                     Err(error) => (
                                         StreamJob {
                                             job_id: salt.index.to_le_bytes().to_vec(),
@@ -774,20 +915,11 @@ impl Preparation {
                                             watermark: None,
                                         },
                                         origin,
-                                        work_screen,
-                                        Some(Err(error)),
+                                        Err(SampleError::Driver(format!("lease draw: {error}"))),
                                     ),
                                 }
                             }
                         };
-                        let data = initial_data.unwrap_or_else(|| {
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                preparer.prepare(&mut job, settings, screen)
-                            }))
-                            .unwrap_or_else(|_| {
-                                Err(SampleError::Driver("job preparation panicked".into()))
-                            })
-                        });
                         let _ = reply.send(Prepared { job, origin, data });
                     }
                 })
@@ -1135,7 +1267,11 @@ pub(crate) fn run(
             let Some(prepared) = pending.take() else {
                 break;
             };
-            let Prepared { job, origin, data } = prepared;
+            let Prepared {
+                mut job,
+                origin,
+                data,
+            } = prepared;
             if abandoned(cancel, &job, &origin) {
                 let _ = answer(out, origin, job, Answer::Cancelled, 0);
                 continue;
@@ -1225,8 +1361,15 @@ pub(crate) fn run(
             // Only salts carry a live target, so only they can finish early
             // at an observe point. Stream jobs never get observe points.
             let observe = matches!(origin, Origin::Salt { .. });
+            // The slot keeps the graph for the device energy audit; the live
+            // entry needs only the job's identity and parameters.
+            let graph = std::mem::replace(
+                &mut job.graph,
+                IsingGraph::new(Vec::new(), Vec::new(), Vec::new()),
+            );
             let admitted = pool.slots.admit_prepared(
                 data.inputs,
+                graph,
                 data.schedule.betas,
                 data.schedule.checkpoints,
                 job.params.seed,
@@ -1993,8 +2136,8 @@ mod tests {
         let mut second = salt(3, &reply);
         second.nonce = [1; 32];
         assert_ne!(
-            salt_job(&first).unwrap().params.seed,
-            salt_job(&second).unwrap().params.seed
+            drawn_job(&first, &[0, 0], &[-1000]).params.seed,
+            drawn_job(&second, &[0, 0], &[-1000]).params.seed
         );
     }
 
@@ -2235,6 +2378,78 @@ mod tests {
         }
     }
 
+    /// Prepare `salt` the way a worker does.
+    fn prepare_drawn(
+        preparer: &mut Preparer,
+        salt: &Salt,
+        settings: CascadeSettings,
+    ) -> (StreamJob, Option<PreparedData>) {
+        let (h_milli, j_milli) = salt.topology.draw(salt.nonce).unwrap();
+        let mut job = drawn_job(salt, &h_milli, &j_milli);
+        let data = preparer
+            .prepare_salt(&mut job, &salt.topology, &h_milli, &j_milli, settings, true)
+            .unwrap();
+        (job, data)
+    }
+
+    /// The milli fast path gives the generic path's coefficients, schedule
+    /// and parameters, on unit, non-unit and inexact topologies.
+    #[test]
+    fn salt_fast_path_matches_generic_preparation() {
+        let (reply, _outcomes) = mpsc::channel();
+        let settings = CascadeSettings::default();
+        let ring = |allowed_h_milli: Vec<i32>, allowed_j_milli: Vec<i32>| {
+            Arc::new(TopologyView {
+                num_nodes: 64,
+                edges: (0..64).map(|i| (i, (i + 1) % 64)).collect(),
+                allowed_h_milli,
+                allowed_j_milli,
+            })
+        };
+        for (view, fast) in [
+            (aglais_view(), true),
+            (ring(vec![-1000, 0, 1000], vec![-1000, 1000]), true),
+            (ring(vec![-2000, 3000], vec![-2000, 1000, 5000]), true),
+            (ring(vec![0], vec![-1500, 1000]), false),
+        ] {
+            let mut fast_worker = Preparer::default();
+            for index in 0..40 {
+                let mut salt = aglais_salt(&view, index, &reply);
+                salt.params.num_reads = 8;
+                let (job, data) = prepare_drawn(&mut fast_worker, &salt, settings);
+                let (h_milli, j_milli) = salt.topology.draw(salt.nonce).unwrap();
+                let mut reference = drawn_job(&salt, &h_milli, &j_milli);
+                let expected = Preparer::default()
+                    .prepare(&mut reference, settings, true)
+                    .unwrap();
+                if !fast {
+                    assert!(
+                        expected.is_none() && data.is_none(),
+                        "an inexact draw falls back"
+                    );
+                    continue;
+                }
+                let (data, expected) = (data.unwrap(), expected.unwrap());
+                assert_eq!(data.inputs.coefficients(), expected.inputs.coefficients());
+                assert_eq!(data.schedule.betas, expected.schedule.betas);
+                assert_eq!(data.schedule.checkpoints, expected.schedule.checkpoints);
+                assert_eq!(job.params.num_sweeps, reference.params.num_sweeps);
+                assert_eq!(job.params.beta_range, reference.params.beta_range);
+                assert_eq!(job.params.seed, reference.params.seed);
+                assert_eq!(
+                    (&job.graph.h, &job.graph.j, &job.graph.edges),
+                    (
+                        &reference.graph.h,
+                        &reference.graph.j,
+                        &reference.graph.edges
+                    )
+                );
+            }
+            let known = fast_worker.salt.as_ref();
+            assert_eq!(known.is_some_and(|k| k.exact), fast);
+        }
+    }
+
     /// Per-salt host cost of each preparation step on the Aglais lease
     /// topology, one thread, warm caches, then the eight-worker stage rate.
     #[test]
@@ -2246,23 +2461,26 @@ mod tests {
         let (reply, _outcomes) = mpsc::channel();
         let settings = CascadeSettings::default();
         let mut preparer = Preparer::default();
-        let mut warm = salt_job(&aglais_salt(&topology, u64::MAX, &reply)).unwrap();
-        preparer.prepare(&mut warm, settings, true).unwrap();
-        let cached = preparer.topology.lock().unwrap().clone().unwrap();
+        prepare_drawn(
+            &mut preparer,
+            &aglais_salt(&topology, u64::MAX, &reply),
+            settings,
+        );
+        let known = preparer.salt.as_ref().unwrap();
+        assert!(known.exact && known.unit);
+        let cached = Arc::clone(&known.prepared);
 
         let steps = [
             "draw (quip-protocol)",
-            "h, j to f64 units",
-            "edge list clone",
+            "drawn_job (f64 units, edge list)",
             "validate",
-            "device_energy_exact",
-            "fill_h_j_matching",
-            "graph clone in PreparedInputs",
-            "schedule (beta range, cache hit)",
+            "PreparedInputs::from_milli",
+            "schedule (unit beta range, cache hit)",
             "free per-salt buffers",
-            "whole Preparer::prepare",
+            "whole prepare_salt",
+            "whole generic Preparer::prepare",
         ];
-        let mut spent = [Duration::ZERO; 10];
+        let mut spent = [Duration::ZERO; 8];
         for index in 0..SALTS {
             let salt = aglais_salt(&topology, index, &reply);
             let mut clock = Instant::now();
@@ -2273,63 +2491,56 @@ mod tests {
             };
             let (h, j) = std::hint::black_box(salt.topology.draw(salt.nonce).unwrap());
             lap(0, &mut clock);
-            let to_units = |values: Vec<i32>| -> Vec<f64> {
-                values
-                    .into_iter()
-                    .map(|value| f64::from(value) / 1000.0)
-                    .collect()
-            };
-            let (h, j) = std::hint::black_box((to_units(h), to_units(j)));
+            let mut job = std::hint::black_box(drawn_job(&salt, &h, &j));
             lap(1, &mut clock);
-            let edges = std::hint::black_box(salt.topology.edges.clone());
-            lap(2, &mut clock);
-            let mut job = StreamJob {
-                job_id: salt.index.to_le_bytes().to_vec(),
-                graph: IsingGraph::new(h, j, edges),
-                params: salt.params.clone(),
-                watermark: None,
-            };
             validate(&job).unwrap();
+            lap(2, &mut clock);
+            let inputs = std::hint::black_box(PreparedInputs::from_milli(
+                &cached.topology,
+                &cached.edges,
+                &h,
+                &j,
+            ));
             lap(3, &mut clock);
-            assert!(std::hint::black_box(sampler::device_energy_exact(
-                &job.graph
-            )));
-            lap(4, &mut clock);
-            let filled = std::hint::black_box(
-                crate::topology::fill_h_j_matching(&cached.topology, &cached.edges, &job.graph)
-                    .unwrap(),
-            );
-            lap(5, &mut clock);
-            let copy = std::hint::black_box(job.graph.clone());
-            lap(6, &mut clock);
             let gated = settings.chain_gated(cached.chain, &job.params);
+            let range = crate::cascade::unit_beta_range(h.iter().map(|&h| h != 0), &cached.degrees);
             std::hint::black_box(
                 preparer
                     .schedules
-                    .prepare(&job, settings, gated, true, Some(&cached.degrees))
+                    .prepare(&job, settings, gated, true, Some(range))
                     .unwrap(),
             );
-            lap(7, &mut clock);
-            drop((filled, copy));
-            lap(8, &mut clock);
+            lap(4, &mut clock);
+            drop(inputs);
+            lap(5, &mut clock);
+            let prepared = std::hint::black_box(
+                preparer
+                    .prepare_salt(&mut job, &salt.topology, &h, &j, settings, true)
+                    .unwrap(),
+            );
+            lap(6, &mut clock);
+            drop(prepared);
+            lap(5, &mut clock);
             let prepared =
                 std::hint::black_box(preparer.prepare(&mut job, settings, true).unwrap());
-            lap(9, &mut clock);
-            drop((prepared, job));
-            lap(8, &mut clock);
+            lap(7, &mut clock);
+            drop((prepared, job, h, j));
+            lap(5, &mut clock);
         }
         let per_salt = |d: Duration| d.as_secs_f64() * 1e6 / SALTS as f64;
-        let draw_and_parts: f64 = spent[..9].iter().map(|&d| per_salt(d)).sum();
+        let parts: f64 = spent[..6].iter().map(|&d| per_salt(d)).sum();
         eprintln!("one thread, {SALTS} Aglais salts (4,577 nodes, 41,514 edges):");
-        for (step, &d) in steps.iter().zip(&spent).take(9) {
+        for (step, &d) in steps.iter().zip(&spent).take(6) {
             eprintln!(
-                "  {step:34} {:8.1} us/salt {:5.1}%",
+                "  {step:38} {:8.1} us/salt {:5.1}%",
                 per_salt(d),
-                100.0 * per_salt(d) / draw_and_parts
+                100.0 * per_salt(d) / parts
             );
         }
-        eprintln!("  {:34} {:8.1} us/salt", steps[9], per_salt(spent[9]));
-        eprintln!("  sum of steps 1-9 {draw_and_parts:.1} us/salt");
+        eprintln!("  sum of steps 1-6 {parts:.1} us/salt");
+        for (step, &d) in steps.iter().zip(&spent).skip(6) {
+            eprintln!("  {step:38} {:8.1} us/salt", per_salt(d));
+        }
 
         let total = 20_000u64;
         let mut preparation = Preparation::new().unwrap();

@@ -453,7 +453,7 @@ fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
 
 /// Largest `sum |h| + sum |J|` in whole units for which the kernel's `int`
 /// energy cannot overflow: every term is at most 1000 in magnitude per unit.
-const DEVICE_ENERGY_MAX_UNITS: f64 = (i32::MAX / 1000) as f64;
+pub(crate) const DEVICE_ENERGY_MAX_UNITS: f64 = (i32::MAX / 1000) as f64;
 
 /// Whether the multi-spin kernel's energy equals consensus `energy_milli` for
 /// `graph`. The kernel truncates each coefficient to `i8` and sums in `int`,

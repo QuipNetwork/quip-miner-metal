@@ -826,25 +826,26 @@ pub(crate) struct ScheduleCache {
 }
 
 impl ScheduleCache {
-    /// `degrees`, when given, are the [`node_degrees`] of exactly
-    /// `job.graph.edges`, and spare each job the edge walk.
+    /// `beta_range`, when given, is the caller's [`resident_beta_range`] of
+    /// `job.graph`, used when the job's parameters set none.
     pub(crate) fn prepare(
         &mut self,
         job: &StreamJob,
         settings: CascadeSettings,
         gated: bool,
         screen: bool,
-        degrees: Option<&[u32]>,
+        beta_range: Option<(f64, f64)>,
     ) -> Result<PreparedSchedule, crate::sampler::SampleError> {
         let stages = if screen {
             settings.effective(gated).stages
         } else {
             [0; MAX_STAGES]
         };
-        let (hot, cold) = job.params.beta_range.unwrap_or_else(|| match degrees {
-            Some(degrees) => resident_beta_range_from(&job.graph, degrees),
-            None => resident_beta_range(&job.graph),
-        });
+        let (hot, cold) = job
+            .params
+            .beta_range
+            .or(beta_range)
+            .unwrap_or_else(|| resident_beta_range(&job.graph));
         let key = ScheduleKey {
             hot: hot.to_bits(),
             cold: cold.to_bits(),
@@ -932,7 +933,7 @@ pub(crate) fn node_degrees(nodes: usize, edges: &[(usize, usize)]) -> Vec<u32> {
 /// [`resident_beta_range`] with the topology's [`node_degrees`] precomputed,
 /// so a job pays one pass over its nodes instead of one over its edges.
 /// `degrees` must come from exactly `graph.edges`.
-fn resident_beta_range_from(graph: &IsingGraph, degrees: &[u32]) -> (f64, f64) {
+pub(crate) fn resident_beta_range_from(graph: &IsingGraph, degrees: &[u32]) -> (f64, f64) {
     if graph.j.len() != graph.edges.len()
         || degrees.len() != graph.num_nodes()
         || graph.j.iter().any(|j| j.abs() != 1.0)
@@ -940,11 +941,18 @@ fn resident_beta_range_from(graph: &IsingGraph, degrees: &[u32]) -> (f64, f64) {
     {
         return default_ising_beta_range(graph);
     }
-    let terms = graph
-        .h
-        .iter()
+    unit_beta_range(graph.h.iter().map(|&h| h != 0.0), degrees)
+}
+
+/// The beta range of a graph whose couplings are all ±1 and whose fields are
+/// all 0 or ±1, from which fields are nonzero and the node degrees.
+pub(crate) fn unit_beta_range(
+    field_set: impl Iterator<Item = bool>,
+    degrees: &[u32],
+) -> (f64, f64) {
+    let terms = field_set
         .zip(degrees)
-        .map(|(&h, &degree)| u32::from(h != 0.0) + degree);
+        .map(|(set, &degree)| u32::from(set) + degree);
     let (max_eff, gaps) = terms.fold((0u32, 0usize), |(max, gaps), count| {
         (max.max(count), gaps + usize::from(count != 0))
     });
