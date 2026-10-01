@@ -2189,6 +2189,173 @@ mod tests {
         eprintln!("Advantage2 preparation stage: {:.1} jobs/s ({PREP_WORKERS} workers, 4000 jobs, includes graph copies and cache startup)", completed as f64 / start.elapsed().as_secs_f64());
     }
 
+    /// The Aglais lease topology: the Advantage2 fixture without edge (880, 2695).
+    fn aglais_view() -> Arc<quip_solver_core::quip_protocol::lease::TopologyView> {
+        let edges = include_str!("../tests/fixtures/advantage2-system1.edges")
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let mut words = line.split_whitespace();
+                (
+                    words.next().unwrap().parse().unwrap(),
+                    words.next().unwrap().parse().unwrap(),
+                )
+            })
+            .filter(|&edge| edge != (880, 2695))
+            .collect::<Vec<_>>();
+        assert_eq!(edges.len(), 41_514);
+        Arc::new(quip_solver_core::quip_protocol::lease::TopologyView {
+            num_nodes: 4577,
+            edges,
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![-1000, 1000],
+        })
+    }
+
+    fn aglais_salt(
+        topology: &Arc<quip_solver_core::quip_protocol::lease::TopologyView>,
+        index: u64,
+        reply: &mpsc::Sender<SaltOutcome>,
+    ) -> Salt {
+        let mut nonce = [7u8; 32];
+        nonce[..8].copy_from_slice(&index.to_le_bytes());
+        Salt {
+            topology: Arc::clone(topology),
+            nonce,
+            index,
+            params: SampleParams {
+                num_reads: 64,
+                num_sweeps: CHAIN_GATES.full_sweeps,
+                ..Default::default()
+            },
+            stop: Arc::default(),
+            target: LiveTarget::new(None),
+            top10: LeaseTopK::new(),
+            reply: reply.clone(),
+        }
+    }
+
+    /// Per-salt host cost of each preparation step on the Aglais lease
+    /// topology, one thread, warm caches, then the eight-worker stage rate.
+    #[test]
+    #[ignore = "measurement; run with --release --ignored --nocapture"]
+    #[expect(clippy::print_stderr, reason = "the measurement is the output")]
+    fn salt_preparation_profile() {
+        const SALTS: u64 = 2_000;
+        let topology = aglais_view();
+        let (reply, _outcomes) = mpsc::channel();
+        let settings = CascadeSettings::default();
+        let mut preparer = Preparer::default();
+        let mut warm = salt_job(&aglais_salt(&topology, u64::MAX, &reply)).unwrap();
+        preparer.prepare(&mut warm, settings, true).unwrap();
+        let cached = preparer.topology.lock().unwrap().clone().unwrap();
+
+        let steps = [
+            "draw (quip-protocol)",
+            "h, j to f64 units",
+            "edge list clone",
+            "validate",
+            "device_energy_exact",
+            "fill_h_j_matching",
+            "graph clone in PreparedInputs",
+            "schedule (beta range, cache hit)",
+            "free per-salt buffers",
+            "whole Preparer::prepare",
+        ];
+        let mut spent = [Duration::ZERO; 10];
+        for index in 0..SALTS {
+            let salt = aglais_salt(&topology, index, &reply);
+            let mut clock = Instant::now();
+            let mut lap = |step: usize, clock: &mut Instant| {
+                let now = Instant::now();
+                spent[step] += now - *clock;
+                *clock = now;
+            };
+            let (h, j) = std::hint::black_box(salt.topology.draw(salt.nonce).unwrap());
+            lap(0, &mut clock);
+            let to_units = |values: Vec<i32>| -> Vec<f64> {
+                values
+                    .into_iter()
+                    .map(|value| f64::from(value) / 1000.0)
+                    .collect()
+            };
+            let (h, j) = std::hint::black_box((to_units(h), to_units(j)));
+            lap(1, &mut clock);
+            let edges = std::hint::black_box(salt.topology.edges.clone());
+            lap(2, &mut clock);
+            let mut job = StreamJob {
+                job_id: salt.index.to_le_bytes().to_vec(),
+                graph: IsingGraph::new(h, j, edges),
+                params: salt.params.clone(),
+                watermark: None,
+            };
+            validate(&job).unwrap();
+            lap(3, &mut clock);
+            assert!(std::hint::black_box(sampler::device_energy_exact(
+                &job.graph
+            )));
+            lap(4, &mut clock);
+            let filled = std::hint::black_box(
+                crate::topology::fill_h_j_matching(&cached.topology, &cached.edges, &job.graph)
+                    .unwrap(),
+            );
+            lap(5, &mut clock);
+            let copy = std::hint::black_box(job.graph.clone());
+            lap(6, &mut clock);
+            let gated = settings.chain_gated(cached.chain, &job.params);
+            std::hint::black_box(
+                preparer
+                    .schedules
+                    .prepare(&job, settings, gated, true, Some(&cached.degrees))
+                    .unwrap(),
+            );
+            lap(7, &mut clock);
+            drop((filled, copy));
+            lap(8, &mut clock);
+            let prepared =
+                std::hint::black_box(preparer.prepare(&mut job, settings, true).unwrap());
+            lap(9, &mut clock);
+            drop((prepared, job));
+            lap(8, &mut clock);
+        }
+        let per_salt = |d: Duration| d.as_secs_f64() * 1e6 / SALTS as f64;
+        let draw_and_parts: f64 = spent[..9].iter().map(|&d| per_salt(d)).sum();
+        eprintln!("one thread, {SALTS} Aglais salts (4,577 nodes, 41,514 edges):");
+        for (step, &d) in steps.iter().zip(&spent).take(9) {
+            eprintln!(
+                "  {step:34} {:8.1} us/salt {:5.1}%",
+                per_salt(d),
+                100.0 * per_salt(d) / draw_and_parts
+            );
+        }
+        eprintln!("  {:34} {:8.1} us/salt", steps[9], per_salt(spent[9]));
+        eprintln!("  sum of steps 1-9 {draw_and_parts:.1} us/salt");
+
+        let total = 20_000u64;
+        let mut preparation = Preparation::new().unwrap();
+        let start = Instant::now();
+        let (mut submitted, mut completed) = (0u64, 0u64);
+        loop {
+            while submitted < total && preparation.len() < PREP_BOUND {
+                preparation.submit(
+                    Source::Salt(aglais_salt(&topology, submitted, &reply)),
+                    settings,
+                );
+                submitted += 1;
+            }
+            let Some(prepared) = preparation.next() else {
+                break;
+            };
+            std::hint::black_box(prepared.data.unwrap());
+            completed += 1;
+        }
+        assert_eq!(completed, total);
+        eprintln!(
+            "{PREP_WORKERS} workers, {total} salts through Preparation: {:.0} salts/s",
+            completed as f64 / start.elapsed().as_secs_f64()
+        );
+    }
+
     #[test]
     fn preparation_cache_never_bypasses_changed_topology_or_scalar_limits() {
         let mut preparer = Preparer::default();
