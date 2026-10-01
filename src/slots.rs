@@ -4,7 +4,7 @@
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, BufferPool, CachedTopology, Kernel, SampleError, MSA_THREADS};
 use crate::topology::SelfFeedingTopology;
-use crate::topology::{fill_h_j_matching, fill_h_j_milli};
+use crate::topology::{fill_couplings, fill_h_j_matching};
 use crate::{IsingGraph, SampleParams, SamplerResult};
 use metal::{MTLCommandBufferStatus, MTLSize};
 use std::sync::{Arc, OnceLock};
@@ -134,20 +134,19 @@ impl PreparedInputs {
         })
     }
 
-    /// Inputs from a lease draw's milli values. The caller verified once
-    /// that `edges` is the lease topology and that [`fill_h_j_milli`]'s
-    /// preconditions hold for every value the draw can select.
-    pub(crate) fn from_milli(
+    /// Inputs from a lease draw in whole device units. The caller verified
+    /// once that `edges` is the lease topology and that it meets
+    /// [`fill_couplings`]'s precondition.
+    pub(crate) fn from_units(
         topology: &SelfFeedingTopology,
         edges: &Edges,
-        h_milli: &[i32],
-        j_milli: &[i32],
+        fields: Vec<i8>,
+        j_units: &[i8],
     ) -> Self {
-        let (couplings, fields) = fill_h_j_milli(topology, h_milli, j_milli);
         Self {
-            nodes: h_milli.len(),
+            nodes: fields.len(),
             edges: Arc::clone(edges),
-            couplings,
+            couplings: fill_couplings(topology, j_units),
             fields,
         }
     }
@@ -879,13 +878,15 @@ mod tests {
         let graph = advantage2_system1(7);
         let topology = SelfFeedingTopology::build_with_advantage2_coloring(&graph);
         let host_topology = SelfFeedingTopology::build(&graph);
-        let edges = Edges::from(graph.edges.as_slice());
+        let edges = Arc::clone(&graph.edges);
         let inputs = PreparedInputs::new(&graph, &host_topology, &edges).unwrap();
         let (couplings, fields) = fill_h_j_matching(&topology, &graph.edges, &graph).unwrap();
         assert_eq!(inputs.couplings, couplings);
         assert_eq!(inputs.fields, fields);
         let mut other = graph;
-        other.edges.swap(0, 1);
+        let mut swapped = other.edges.to_vec();
+        swapped.swap(0, 1);
+        other.edges = swapped.into();
         assert!(PreparedInputs::new(&other, &topology, &edges).is_none());
     }
     use crate::metal_device::MetalDevice;
@@ -960,12 +961,12 @@ mod tests {
         let mut pool = SlotPool::new(&device, &graphs[0], READS, 3, 64).unwrap();
         assert_eq!(pool.capacity(), 3);
         let nodes = graphs[1].num_nodes();
-        let edges = Edges::from(graphs[1].edges.as_slice());
+        let edges = Arc::clone(&graphs[1].edges);
         assert!(pool.matches_prepared(&edges, nodes, READS));
         // The second query takes the verified-storage path.
         assert!(pool.matches_prepared(&edges, nodes, READS));
         assert!(!pool.matches_prepared(&edges, nodes, READS + 1));
-        let mut swapped = graphs[1].edges.clone();
+        let mut swapped = graphs[1].edges.to_vec();
         swapped.swap(0, 1);
         assert!(!pool.matches_prepared(&Edges::from(swapped.as_slice()), nodes, READS));
         for j in jobs {

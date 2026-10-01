@@ -42,7 +42,7 @@ impl RawJob {
         Self {
             h: graph.h.clone(),
             j: graph.j.clone(),
-            edges: graph.edges.clone(),
+            edges: graph.edges.to_vec(),
             num_reads: params.num_reads,
             num_sweeps: params.num_sweeps,
             sweeps_per_beta: params.sweeps_per_beta,
@@ -56,7 +56,7 @@ impl RawJob {
             IsingGraph {
                 h: self.h,
                 j: self.j,
-                edges: self.edges,
+                edges: self.edges.into(),
             },
             SampleParams {
                 num_reads: self.num_reads,
@@ -264,7 +264,7 @@ mod tests {
         let (graph_copy, params_copy) = RawJob::from_parts(&graph, &params).into_parts();
         assert_eq!(graph_copy.h, vec![-1.0, 1.0]);
         assert_eq!(graph_copy.j, vec![1.0]);
-        assert_eq!(graph_copy.edges, vec![(0, 1)]);
+        assert_eq!(*graph_copy.edges, [(0, 1)]);
         assert_eq!(
             (
                 params_copy.num_reads,

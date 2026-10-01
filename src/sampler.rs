@@ -518,7 +518,7 @@ pub(crate) fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
 #[derive(Debug)]
 pub(crate) struct CachedTopology {
     pub(crate) n: usize,
-    pub(crate) edges: Vec<(usize, usize)>,
+    pub(crate) edges: std::sync::Arc<[(usize, usize)]>,
     pub(crate) four_color: bool,
     pub(crate) topo: SelfFeedingTopology,
     pub(crate) colors: Vec<metal::Buffer>,
@@ -582,7 +582,7 @@ fn build_cached_topology(
     let col = device.new_buffer_from_slice(base_col);
     CachedTopology {
         n: graph.num_nodes(),
-        edges: graph.edges.clone(),
+        edges: std::sync::Arc::clone(&graph.edges),
         four_color,
         topo,
         colors,
@@ -924,7 +924,7 @@ struct DispatchBuffers {
 fn max_csr_degree(graph: &IsingGraph) -> usize {
     let n = graph.num_nodes();
     let mut degree = vec![0usize; n];
-    for &(u, v) in &graph.edges {
+    for &(u, v) in graph.edges.iter() {
         if u >= n || v >= n {
             continue;
         }
@@ -2111,7 +2111,9 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&first, &again));
         // Same node count, one edge moved: the cache must rebuild.
         let mut moved = chain(50);
-        moved.edges[0] = (0, 2);
+        let mut edges = moved.edges.to_vec();
+        edges[0] = (0, 2);
+        moved.edges = edges.into();
         let rewired = dev.topology_cache.get_or_build(&dev, &moved, false);
         assert!(!std::sync::Arc::ptr_eq(&first, &rewired));
         let other = dev.topology_cache.get_or_build(&dev, &b, false);

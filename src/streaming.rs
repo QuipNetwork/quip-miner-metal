@@ -272,7 +272,7 @@ impl<'a> BatchKey<'a> {
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.beta_range == job.params.beta_range
-            && self.edges == job.graph.edges.as_slice()
+            && self.edges == &*job.graph.edges
     }
 }
 
@@ -1008,7 +1008,7 @@ mod tests {
         let j = job(b"a", ring4(), 16, 64, 1);
         let key = BatchKey::from_job(&j);
         let mut other = job(b"b", ring4(), 16, 64, 1);
-        other.graph.edges = vec![(0, 1), (1, 2), (2, 3)]; // drop one edge
+        other.graph.edges = vec![(0, 1), (1, 2), (2, 3)].into(); // drop one edge
         assert!(!key.matches(&other));
     }
 

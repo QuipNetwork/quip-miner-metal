@@ -1335,21 +1335,21 @@ mod tests {
             [true, true]
         );
         let (u, v) = j.graph.edges[0];
-        j.graph.edges.push((v, u));
+        let original = Arc::clone(&j.graph.edges);
+        j.graph.edges = [&original[..], &[(v, u)]].concat().into();
         j.graph.j.push(1.0);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
-        j.graph.edges.pop();
         j.graph.j.pop();
-        j.graph.edges.push((u, u));
+        j.graph.edges = [&original[..], &[(u, u)]].concat().into();
         j.graph.j.push(0.0);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
-        j.graph.edges.pop();
+        j.graph.edges = original;
         j.graph.j.pop();
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),

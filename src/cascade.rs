@@ -592,7 +592,7 @@ impl Controller {
             == CHAIN_GATES.fingerprint;
         let gated = self.settings.chain_gated(chain, &job.params);
         let mut schedule = PreparedSchedule::new(job, self.settings, gated, true);
-        let edges = Edges::from(job.graph.edges.as_slice());
+        let edges = Arc::clone(&job.graph.edges);
         let ticket = self.admit_prepared(job, &mut schedule, &edges).unwrap();
         (ticket, schedule.betas.to_vec(), schedule.checkpoints)
     }
@@ -1112,7 +1112,7 @@ mod tests {
             stages: stage_array(&[1]),
             ..old
         });
-        let edges = Edges::from(job.graph.edges.as_slice());
+        let edges = Arc::clone(&job.graph.edges);
         assert!(matches!(
             controller.admit_prepared(&job, &mut schedule, &edges),
             Err(crate::sampler::SampleError::Driver(_))
@@ -1190,7 +1190,7 @@ mod tests {
             let mut prepared = PreparedSchedule::new(&job, old, false, true);
             let mut controller = Controller::new(old);
             controller.refresh(new);
-            let edges = Edges::from(job.graph.edges.as_slice());
+            let edges = Arc::clone(&job.graph.edges);
             let ticket = controller
                 .admit_prepared(&job, &mut prepared, &edges)
                 .unwrap();

@@ -357,29 +357,22 @@ pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>,
     fill_h_j_inspecting_edges(topology, graph, |_, _| {})
 }
 
-/// [`fill_h_j`] from integer milli coefficients, `j_milli` in the
-/// establishing edge order.
+/// [`fill_h_j`]'s couplings from whole-unit `j_units` in the establishing
+/// edge order.
 ///
 /// # Precondition
 ///
 /// The caller verified once that the establishing edges have no self-loop and
-/// no out-of-range endpoint, and that every value is a whole unit (a multiple
-/// of 1,000) in `i8` range. Under those conditions the result equals
-/// [`fill_h_j`] of the same values divided by 1,000.
-pub(crate) fn fill_h_j_milli(
-    topology: &SelfFeedingTopology,
-    h_milli: &[i32],
-    j_milli: &[i32],
-) -> (Vec<i8>, Vec<i8>) {
-    debug_assert_eq!(j_milli.len(), topology.edge_pos.len());
+/// no out-of-range endpoint. Under that condition the result equals
+/// [`fill_h_j`]'s couplings for the same values.
+pub(crate) fn fill_couplings(topology: &SelfFeedingTopology, j_units: &[i8]) -> Vec<i8> {
+    debug_assert_eq!(j_units.len(), topology.edge_pos.len());
     let mut j_csr = vec![0i8; topology.nnz];
-    for (&(pos_ij, pos_ji), &value) in topology.edge_pos.iter().zip(j_milli) {
-        let value = (value / 1000) as i8;
+    for (&(pos_ij, pos_ji), &value) in topology.edge_pos.iter().zip(j_units) {
         j_csr[pos_ij as usize] = value;
         j_csr[pos_ji as usize] = value;
     }
-    let h_i8 = h_milli.iter().map(|&value| (value / 1000) as i8).collect();
-    (j_csr, h_i8)
+    j_csr
 }
 
 /// Compare the exact ordered edges during coefficient construction, avoiding
@@ -439,12 +432,17 @@ mod tests {
             fill_h_j(&topology, &graph)
         );
         let mut changed = graph.clone();
-        changed.edges.swap(0, 1);
+        let mut swapped = changed.edges.to_vec();
+        swapped.swap(0, 1);
+        changed.edges = swapped.into();
         assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
         changed = graph.clone();
-        changed.edges[0] = (0, 2);
+        let mut edges = changed.edges.to_vec();
+        edges[0] = (0, 2);
+        changed.edges = edges.clone().into();
         assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
-        changed.edges.pop();
+        edges.pop();
+        changed.edges = edges.into();
         assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
         changed = graph.clone();
         changed.h.pop();
@@ -496,7 +494,7 @@ mod tests {
         assert_eq!(candidate.colors.num_colors, 4);
         assert_eq!(candidate.colors.counts, [1148, 1145, 1145, 1139]);
         let colors = labels(&candidate.colors);
-        for &(u, v) in &graph.edges {
+        for &(u, v) in graph.edges.iter() {
             assert_ne!(colors[u], colors[v], "edge ({u}, {v})");
         }
         assert!(graph.edges.contains(&(880, 2695)));
@@ -510,10 +508,12 @@ mod tests {
         let expected = advantage2_color(&graph).unwrap();
         graph.j.fill(0.0);
         graph.h.fill(-1.0);
-        graph.edges.reverse();
-        for edge in &mut graph.edges {
+        let mut edges = graph.edges.to_vec();
+        edges.reverse();
+        for edge in &mut edges {
             *edge = (edge.1, edge.0);
         }
+        graph.edges = edges.into();
         assert_eq!(advantage2_color(&graph), Some(expected));
     }
 
@@ -524,7 +524,7 @@ mod tests {
         let other = (1..colors.len())
             .find(|&node| colors[node] == colors[0])
             .unwrap();
-        graph.edges.push((0, other));
+        graph.edges = [&graph.edges[..], &[(0, other)]].concat().into();
         graph.j.push(0.0);
         assert_eq!(advantage2_color(&graph), None);
         assert_eq!(
@@ -541,7 +541,7 @@ mod tests {
         );
         for edge in [(0, 0), (0, 4577), (usize::MAX, 0)] {
             let mut graph = advantage2_fixture();
-            graph.edges.push(edge);
+            graph.edges = [&graph.edges[..], &[edge]].concat().into();
             graph.j.push(1.0);
             assert_eq!(advantage2_color(&graph), None);
             assert_eq!(
