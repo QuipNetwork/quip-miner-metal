@@ -13,8 +13,12 @@ use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-/// How often a waiting lease re-checks whether it should stop waiting.
-const POLL: Duration = Duration::from_millis(5);
+/// How often a waiting lease re-checks whether it should stop waiting. A
+/// session holds about 165 waiting leases, each a parked thread, so this sets
+/// their wakeup load. Turn changes still wake them at once; only noticing a
+/// cancellation waits for the poll, well inside quip-solver-core's one-second
+/// grace for a stopped lease to retire.
+const POLL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 pub(crate) struct LeaseTurns {
