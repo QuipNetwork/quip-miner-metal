@@ -746,9 +746,9 @@ dependencies = [
 
 [[package]]
 name = "quip-proto"
-version = "0.0.2-rc4"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7da060fa69258bc4d77eddd6ac65d0674a223bbde09ef15fe63ea025c819fe5e"
+checksum = "b23623cac848ac57fb00ae389f4ada328f09ff89631f30c955b7285a4d88879c"
 dependencies = [
  "prost",
  "tonic",
@@ -756,9 +756,9 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.2-rc4"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "523a8ffb2b6ee59d0531ab6f40e93f7ed67fe8e781958cf6bae2632dfea8201f"
+checksum = "2685030cd72ce49aeb91a3ece54b91733cd30d64922277f907459b231441b46f"
 dependencies = [
  "blake3",
  "quip-proto",
@@ -766,9 +766,9 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-conformance"
-version = "0.0.2-rc4"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96d8160e29cdf5c5d022d5d5f11ab7868b923b8310fde6f557144b0eeffe1bbe"
+checksum = "8d47a4535d28590887754ac6beeeeca10924a68895d0ae0ccf64feb15d6ba862"
 dependencies = [
  "hyper-util",
  "prost",
@@ -784,9 +784,9 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-core"
-version = "0.0.2-rc4"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdb4b5a68d8702e60b8ba9acaa56c4130d09cbc8ea80a33e1eb6b03d983dd045"
+checksum = "97610f7de2d194bb3a1c43802bffd223ecfc8ec93d3f49e08fdbeeaae5fd2850"
 dependencies = [
  "base64",
  "clap",
