@@ -302,22 +302,29 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(device: &MetalDevice, job: &StreamJob, capacity: usize) -> Result<Self, SampleError> {
+    /// `stride` is the longest schedule a slot holds: a job's prepared
+    /// schedule, whose fresh legs together run longer than its sweep budget.
+    fn new(
+        device: &MetalDevice,
+        job: &StreamJob,
+        capacity: usize,
+        stride: usize,
+    ) -> Result<Self, SampleError> {
         let reads = job.params.num_reads.clamp(1, sampler::MAX_READS);
         Ok(Self {
-            slots: SlotPool::new(device, &job.graph, reads, capacity, job.params.num_sweeps)?,
+            slots: SlotPool::new(device, &job.graph, reads, capacity, stride)?,
             live: (0..capacity).map(|_| None).collect(),
             reads,
-            stride: job.params.num_sweeps,
+            stride,
         })
     }
 
-    fn fits(&mut self, job: &StreamJob, edges: &Edges) -> bool {
+    fn fits(&mut self, job: &StreamJob, edges: &Edges, schedule_len: usize) -> bool {
         self.slots.matches_prepared(
             edges,
             job.graph.num_nodes(),
             job.params.num_reads.clamp(1, sampler::MAX_READS),
-        ) && job.params.num_sweeps <= self.stride
+        ) && schedule_len <= self.stride
     }
 
     fn harvest(
@@ -1385,7 +1392,11 @@ pub(crate) fn run(
                 }
             };
             let edges = Arc::clone(data.inputs.edges());
-            if pools.as_mut().is_none_or(|ps| !ps[turn].fits(&job, &edges)) {
+            let schedule_len = data.schedule.betas.len();
+            if pools
+                .as_mut()
+                .is_none_or(|ps| !ps[turn].fits(&job, &edges, schedule_len))
+            {
                 if !empty {
                     pending = Some(Prepared {
                         job,
@@ -1399,8 +1410,8 @@ pub(crate) fn run(
                     job.params.num_reads.clamp(1, sampler::MAX_READS),
                 );
                 // Both pools are empty, so changing storage cannot discard work.
-                let rebuilt = Pool::new(device, &job, capacity)
-                    .and_then(|a| Pool::new(device, &job, capacity).map(|b| [a, b]));
+                let rebuilt = Pool::new(device, &job, capacity, schedule_len)
+                    .and_then(|a| Pool::new(device, &job, capacity, schedule_len).map(|b| [a, b]));
                 match rebuilt {
                     Ok(rebuilt) => {
                         pools = Some(rebuilt);
@@ -1536,6 +1547,12 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pool stride long enough for any stage plan of `job`: at most
+    /// `MAX_STAGES` checkpoint legs plus the full-budget leg.
+    fn any_plan(job: &StreamJob) -> usize {
+        (crate::cascade::MAX_STAGES + 1) * job.params.num_sweeps
+    }
     use crate::cascade::stage_array;
     use crate::slots::SlotJob;
     use crate::{IsingGraph, MetalSampler, SampleParams};
@@ -1806,7 +1823,7 @@ mod tests {
         };
         let mut controller = Controller::new(settings);
         let hit_job = job(2000, 256);
-        let mut pool = Pool::new(&device, &hit_job, 2).unwrap();
+        let mut pool = Pool::new(&device, &hit_job, 2, any_plan(&hit_job)).unwrap();
 
         let (hit_reply, hit_outcomes) = mpsc::channel();
         let (hit_ticket, hit_schedule, hit_checkpoints) = controller.admit(&hit_job);
@@ -1942,7 +1959,7 @@ mod tests {
         };
         let mut controller = Controller::new(settings);
         let unit_job = job(3000, 256);
-        let mut pool = Pool::new(&device, &unit_job, 1).unwrap();
+        let mut pool = Pool::new(&device, &unit_job, 1, any_plan(&unit_job)).unwrap();
 
         let (reply, outcomes) = mpsc::channel();
         let (ticket, schedule, checkpoints) = controller.admit(&unit_job);
@@ -2049,11 +2066,11 @@ mod tests {
         let mut controller = Controller::new(settings);
         let sweeps = 8 + 2 * crate::slots::OBSERVE_INTERVAL;
         let unit_job = job(4000, sweeps);
-        let mut pool = Pool::new(&device, &unit_job, 1).unwrap();
+        let mut pool = Pool::new(&device, &unit_job, 1, any_plan(&unit_job)).unwrap();
 
         let (reply, outcomes) = mpsc::channel();
         let (ticket, schedule, checkpoints) = controller.admit(&unit_job);
-        assert_eq!(checkpoints, vec![8, sweeps]);
+        assert_eq!(checkpoints, vec![8, 8 + sweeps]);
         let slot = pool
             .slots
             .admit(SlotJob {
@@ -2316,7 +2333,7 @@ mod tests {
         assert_eq!(chain.params.num_sweeps, CHAIN_GATES.full_sweeps);
         assert_eq!(
             data.schedule.checkpoints.last(),
-            Some(&CHAIN_GATES.full_sweeps)
+            Some(&(CHAIN_GATES.stages.iter().sum::<usize>() + CHAIN_GATES.full_sweeps))
         );
         let open = CascadeSettings {
             open_gates: true,
@@ -3252,7 +3269,7 @@ mod tests {
             controller.checkpoint(&mut ticket, 0, None);
             controller.finish(&ticket, None, false);
         }
-        let mut pool = Pool::new(&device, &live_job, 1).unwrap();
+        let mut pool = Pool::new(&device, &live_job, 1, any_plan(&live_job)).unwrap();
         let (ticket, schedule, checkpoints) = controller.admit(&live_job);
         let slot = pool
             .slots
@@ -3356,7 +3373,7 @@ mod tests {
             ..CascadeSettings::default()
         });
         let live_job = job(1000, 256);
-        let mut pool = Pool::new(&device, &live_job, 1).unwrap();
+        let mut pool = Pool::new(&device, &live_job, 1, any_plan(&live_job)).unwrap();
         let (ticket, schedule, checkpoints) = controller.admit(&live_job);
         let slot = pool
             .slots

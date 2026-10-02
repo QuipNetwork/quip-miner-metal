@@ -89,12 +89,11 @@ Other kernels and the Apple Neural Engine use separate paths.
 
 | key | default | purpose |
 |-----|---------|---------|
-| `cascade_stages` | `[32, 256]` | cumulative sweep counts for probe checkpoints |
+| `cascade_stages` | `[32, 256]` | sweep budget of each probe anneal |
 | `cascade_keep` | `2000` | probe-to-full denominator |
 | `cascade_keep_min` | `1000` | floor for the probe-to-full keep |
 | `cascade_keep_max` | `30000` | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | audit lane denominator |
-| `cascade_reheat_beta` | `0.25` | starting beta for later segments |
 | `cascade_yield_per_million` | none | expected nonces per million below target |
 
 These keys enter through `backend_toml`.

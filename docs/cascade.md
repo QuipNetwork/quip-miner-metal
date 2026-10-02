@@ -36,18 +36,17 @@ kept job stays in its slot.
 
 ## Segment schedule
 
-`cascade_stages` gives the sweep count from the start of a job to each probe
-checkpoint. Each probe must fall below the job's sweep budget. The final
-checkpoint is the full sweep budget. The runner advances each slot by at most
-the first stage's sweep count per step, stopping at the next checkpoint.
+`cascade_stages` gives the sweep budget of each probe checkpoint. Each probe
+must fall below the job's sweep budget. The final checkpoint is the full sweep
+budget. The runner advances each slot by at most the first stage's sweep count
+per step, stopping at the next checkpoint.
 
-The schedule computes one beta range per job. With a valid
-`cascade_reheat_beta`, the first segment follows the standard schedule from
-the hot beta to the cold beta. Later segments start at the reheat beta and
-follow a geometric schedule to the cold beta. The reheat beta must be greater
-than the hot beta and less than the cold beta. A value outside that range logs
-a warning. The job then uses one standard schedule across the full budget. The
-checkpoints remain in place.
+Each checkpoint is a fresh anneal of its full budget. A job kept at a
+checkpoint starts over from new random spins and a new random stream. It then
+runs the standard schedule from the hot beta to the cold beta over the next
+checkpoint's sweeps. With stages `[32, 256]` and a budget of 1,000 sweeps, a
+job that passes both probes runs anneals of 32, 256, and 1,000 sweeps. The
+schedule computes one beta range per job and uses it for every anneal.
 
 ## Controller lifetime
 
@@ -65,18 +64,16 @@ their own update rules. Jobs already in slots keep their admitted plans.
 
 These keys enter through `backend_toml` from the coordinator. If stages, keep
 values, audit values, or yield values fail their checks, the old values stay
-in place. A warning names the failed check. The reheat beta uses the range
-check for each job. The [calibration
+in place. A warning names the failed check. The [calibration
 report](perf/2026-09-23-cascade-calibration.md) explains the defaults.
 
 | key | default | valid range | notes |
 |-----|---------|-------------|-------|
-| `cascade_stages` | `[32, 256]` | 1 to 3 increasing positive integers | cumulative sweep counts |
+| `cascade_stages` | `[32, 256]` | 1 to 3 increasing positive integers | sweep budget of each probe anneal |
 | `cascade_keep` | `2000` | unsigned 32-bit integer, subject to group rule | probe-to-full denominator |
 | `cascade_keep_min` | `1000` | unsigned 32-bit integer, subject to group rule | floor for the probe-to-full keep |
 | `cascade_keep_max` | `30000` | unsigned 32-bit integer, subject to group rule | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | unsigned 32-bit integer, at least 2 | audit lane denominator |
-| `cascade_reheat_beta` | `0.25` | greater than hot beta and less than cold beta | otherwise use the standard schedule |
 | `cascade_yield_per_million` | none | finite and greater than 0 | expected nonces per million below target |
 
 The keep values pass as one group when `2 <= cascade_keep_min <= cascade_keep

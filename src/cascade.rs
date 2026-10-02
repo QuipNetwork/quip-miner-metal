@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::sampler::build_beta_schedule;
 use crate::slots::Edges;
 use crate::{IsingGraph, SampleParams};
-use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::beta::default_ising_beta_range;
 use quip_solver_core::StreamJob;
 
 use crate::cutoff::{Cutoff, CutoffConfig};
@@ -29,7 +29,6 @@ pub(crate) fn stage_array(stages: &[usize]) -> [usize; MAX_STAGES] {
 /// Times describe a 64-read job: a + b * sweeps (unchanged from G4).
 pub(crate) struct Calibration {
     pub(crate) stages: &'static [usize],
-    pub(crate) reheat_beta: f64,
     /// Audit-lane miss rate r0 for each probe-to-next-stage transition.
     pub(crate) false_negative: &'static [((usize, usize), f64)],
     pub(crate) skew: &'static [f64],
@@ -55,7 +54,6 @@ pub(crate) struct Calibration {
 
 pub(crate) const CALIBRATION: Calibration = Calibration {
     stages: &[32, 256],
-    reheat_beta: 0.25,
     false_negative: &[((32, 256), 0.0353), ((256, 14_336), 0.0051)],
     skew: &[-0.123, -0.056],
     excess_kurtosis: &[0.014, 0.002],
@@ -92,7 +90,6 @@ pub(crate) struct CascadeSettings {
     pub(crate) keep_min: f64,
     pub(crate) keep_max: f64,
     pub(crate) audit: u32,
-    pub(crate) reheat_beta: f64,
     pub(crate) yield_per_million: Option<f64>,
 }
 
@@ -106,15 +103,18 @@ impl Default for CascadeSettings {
             keep_min: 1_000.0,
             keep_max: 30_000.0,
             audit: 200,
-            reheat_beta: CALIBRATION.reheat_beta,
             yield_per_million: None,
         }
     }
 }
 
 /// Gates for the chain topology `cbec1eb4` (4,577 nodes, 41,514 edges, h = 0,
-/// J = ±1) on the resident schedule at 64 reads, one sweep per beta, and
-/// reheat 0.25 (`tests/gate_trace.rs`). The four screening gates are the
+/// J = ±1), measured at 64 reads and one sweep per beta on the earlier
+/// continuing schedule, where each leg reheated the previous leg's spins to
+/// beta 0.25 (`tests/gate_trace.rs`, removed in 44a4126). Legs are now fresh
+/// anneals of each checkpoint's full budget (see [`segment_schedule`]), which
+/// end deeper than a reheated tail of the same length on average, so these
+/// gates are expected to keep at least as much until they are measured again. The four screening gates are the
 /// shallowest checkpoint best over 30 seeds of the chain's 100 deepest winners
 /// (-14,742 to -14,708), plus 10. The deep gates, one per doubling from 512 to
 /// 524,288, are the shallowest best among 10 seeds of the same winners that
@@ -179,7 +179,6 @@ impl CascadeSettings {
     /// the chain gates were measured at.
     pub(crate) fn chain_gated(&self, chain_topology: bool, params: &SampleParams) -> bool {
         chain_topology
-            && self.reheat_beta.to_bits() == CALIBRATION.reheat_beta.to_bits()
             && params.num_reads >= CHAIN_GATES.min_reads
             && params.sweeps_per_beta == 1
             && params.beta_range.is_none()
@@ -212,7 +211,6 @@ pub(crate) struct CascadeToml {
     pub(crate) cascade_keep_min: Option<u32>,
     pub(crate) cascade_keep_max: Option<u32>,
     pub(crate) cascade_audit: Option<u32>,
-    pub(crate) cascade_reheat_beta: Option<f64>,
     pub(crate) cascade_yield_per_million: Option<f64>,
 }
 
@@ -257,9 +255,6 @@ impl CascadeSettings {
             } else {
                 tracing::warn!(audit, "invalid cascade_audit; retaining previous value");
             }
-        }
-        if let Some(beta) = cfg.cascade_reheat_beta {
-            self.reheat_beta = beta;
         }
         if let Some(value) = cfg.cascade_yield_per_million {
             if value.is_finite() && value > 0.0 {
@@ -611,9 +606,7 @@ impl Controller {
     ) -> Result<Ticket, crate::sampler::SampleError> {
         // Only settings changes rebuild on the runner. Queued jobs must use
         // the current gate plan.
-        if schedule.settings.stages != self.settings.stages
-            || schedule.settings.reheat_beta.to_bits() != self.settings.reheat_beta.to_bits()
-        {
+        if schedule.settings.stages != self.settings.stages {
             let rebuilt =
                 PreparedSchedule::new(job, self.settings, schedule.gated, schedule.screen);
             crate::slots::validate_schedule(&rebuilt.betas, &rebuilt.checkpoints)?;
@@ -826,7 +819,6 @@ struct ScheduleKey {
     sweeps: usize,
     per_beta: usize,
     stages: [usize; MAX_STAGES],
-    reheat: u64,
 }
 
 struct CachedSchedule {
@@ -869,7 +861,6 @@ impl ScheduleCache {
             sweeps: job.params.num_sweeps,
             per_beta: job.params.sweeps_per_beta,
             stages,
-            reheat: settings.reheat_beta.to_bits(),
         };
         // Compute the graph-dependent range before locking. Cache hits only
         // compare the key and clone shared storage under the lock.
@@ -881,8 +872,7 @@ impl ScheduleCache {
                     beta_range: Some((hot, cold)),
                     ..job.params.clone()
                 };
-                let (betas, checkpoints) =
-                    segment_schedule(&job.graph, &params, &key.stages, settings.reheat_beta);
+                let (betas, checkpoints) = segment_schedule(&job.graph, &params, &key.stages);
                 crate::slots::validate_schedule(&betas, &checkpoints)?;
                 cached.insert(CachedSchedule {
                     key,
@@ -915,8 +905,7 @@ impl PreparedSchedule {
         } else {
             [0; MAX_STAGES]
         };
-        let (betas, checkpoints) =
-            segment_schedule(&job.graph, &job.params, &stages, settings.reheat_beta);
+        let (betas, checkpoints) = segment_schedule(&job.graph, &job.params, &stages);
         Self {
             settings,
             gated,
@@ -981,55 +970,41 @@ pub(crate) fn unit_beta_range(
     (hot, cold.max(hot))
 }
 
+/// One fresh anneal per leg, laid end to end. Leg `k` is a complete
+/// standard schedule of `stages[k]` sweeps, the last leg one of
+/// `params.num_sweeps`, and each checkpoint is the schedule position where a
+/// leg ends. The slot runner starts every leg after the first from new random
+/// spins and a new RNG stream (`slots::SLOT_RESTART`), so a checkpoint reports
+/// an independent anneal of exactly that checkpoint's sweep budget.
 pub(crate) fn segment_schedule(
     graph: &IsingGraph,
     params: &SampleParams,
     stages: &[usize],
-    reheat_beta: f64,
 ) -> (Vec<f32>, Vec<usize>) {
-    let mut checkpoints: Vec<_> = stages
+    let legs: Vec<usize> = stages
         .iter()
         .copied()
         .take_while(|&s| s > 0 && s < params.num_sweeps)
+        .chain(std::iter::once(params.num_sweeps))
         .collect();
-    checkpoints.push(params.num_sweeps);
     let (hot, cold) = params
         .beta_range
         .unwrap_or_else(|| resident_beta_range(graph));
-    let valid_reheat = reheat_beta > hot && reheat_beta < cold;
-    if !valid_reheat {
-        tracing::warn!(
-            reheat_beta,
-            hot,
-            cold,
-            "cascade reheat beta outside graph range; using standard schedule"
-        );
-    }
-    let first = if valid_reheat {
-        checkpoints[0]
-    } else {
-        params.num_sweeps
-    };
-    let (standard, repeats) =
-        build_beta_schedule(graph, first, params.sweeps_per_beta, Some((hot, cold)));
-    let mut schedule = Vec::with_capacity(params.num_sweeps);
-    for beta in &standard {
-        schedule.extend(std::iter::repeat_n(
-            *beta,
-            repeats.min(first - schedule.len()),
-        ));
-    }
-    // A non-divisible sweep count holds the final standard rung for the remainder.
-    schedule.resize(first, standard.last().copied().unwrap_or(cold as f32));
-    if valid_reheat {
-        for pair in checkpoints.windows(2) {
-            let len = pair[1] - pair[0];
-            schedule.extend(
-                geometric_beta_schedule(reheat_beta, cold, len)
-                    .into_iter()
-                    .map(|b| b as f32),
-            );
+    let mut schedule = Vec::with_capacity(legs.iter().sum());
+    let mut checkpoints = Vec::with_capacity(legs.len());
+    for sweeps in legs {
+        let (standard, repeats) =
+            build_beta_schedule(graph, sweeps, params.sweeps_per_beta, Some((hot, cold)));
+        let end = schedule.len() + sweeps;
+        for beta in &standard {
+            schedule.extend(std::iter::repeat_n(
+                *beta,
+                repeats.min(end - schedule.len()),
+            ));
         }
+        // A non-divisible sweep count holds the final standard rung for the remainder.
+        schedule.resize(end, standard.last().copied().unwrap_or(cold as f32));
+        checkpoints.push(end);
     }
     (schedule, checkpoints)
 }
@@ -1111,7 +1086,6 @@ mod tests {
     fn settings_change_rejects_invalid_rebuilt_schedule() {
         let old = CascadeSettings {
             stages: stage_array(&[2]),
-            reheat_beta: -1.5,
             ..Default::default()
         };
         let mut params = params(4, 1);
@@ -1141,42 +1115,41 @@ mod tests {
     }
 
     #[test]
-    fn segment_schedule_preserves_legacy_bits() {
+    fn segment_schedule_is_one_standard_anneal_per_leg() {
         let graph = ring();
         for range in [None, Some((0.1, 6.0))] {
             for sweeps in [1, 31, 32, 33, 1000] {
                 for repeats in [1, 4, 64] {
                     let mut params = params(sweeps, repeats);
                     params.beta_range = range;
-                    for reheat in [0.25, 10.0] {
-                        let (actual, checkpoints) =
-                            segment_schedule(&graph, &params, &[32, 256], reheat);
-                        let (hot, cold) = range.unwrap_or_else(|| default_ising_beta_range(&graph));
-                        let reheated = reheat > hot && reheat < cold;
-                        let first = if reheated { checkpoints[0] } else { sweeps };
-                        // Legacy construction passes the original optional range,
-                        // including a second default-range computation for None.
-                        let (standard, repeat) = build_beta_schedule(&graph, first, repeats, range);
-                        let mut expected: Vec<_> = standard
+                    let (actual, checkpoints) = segment_schedule(&graph, &params, &[32, 256]);
+                    let (_, cold) = range.unwrap_or_else(|| default_ising_beta_range(&graph));
+                    let legs: Vec<usize> = [32, 256]
+                        .into_iter()
+                        .filter(|&s| s < sweeps)
+                        .chain(std::iter::once(sweeps))
+                        .collect();
+                    // Each leg is the standard schedule a lone job of that
+                    // many sweeps would run, so a job with no checkpoint
+                    // keeps exactly its legacy schedule.
+                    let mut expected = Vec::new();
+                    let mut ends = Vec::new();
+                    for leg in legs {
+                        let (standard, repeat) = build_beta_schedule(&graph, leg, repeats, range);
+                        let mut part: Vec<_> = standard
                             .iter()
                             .flat_map(|b| std::iter::repeat_n(*b, repeat))
-                            .take(first)
+                            .take(leg)
                             .collect();
-                        expected.resize(first, standard.last().copied().unwrap_or(cold as f32));
-                        if reheated {
-                            for pair in checkpoints.windows(2) {
-                                expected.extend(
-                                    geometric_beta_schedule(reheat, cold, pair[1] - pair[0])
-                                        .into_iter()
-                                        .map(|b| b as f32),
-                                );
-                            }
-                        }
-                        assert_eq!(
-                            actual.iter().map(|b| b.to_bits()).collect::<Vec<_>>(),
-                            expected.iter().map(|b| b.to_bits()).collect::<Vec<_>>()
-                        );
+                        part.resize(leg, standard.last().copied().unwrap_or(cold as f32));
+                        expected.extend(part);
+                        ends.push(expected.len());
                     }
+                    assert_eq!(checkpoints, ends);
+                    assert_eq!(
+                        actual.iter().map(|b| b.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|b| b.to_bits()).collect::<Vec<_>>()
+                    );
                 }
             }
         }
@@ -1194,16 +1167,11 @@ mod tests {
             stages: stage_array(&[32, 256]),
             ..Default::default()
         };
-        for new in [
-            CascadeSettings {
+        {
+            let new = CascadeSettings {
                 stages: stage_array(&[16, 128, 512]),
                 ..old
-            },
-            CascadeSettings {
-                reheat_beta: 0.5,
-                ..old
-            },
-        ] {
+            };
             let mut prepared = PreparedSchedule::new(&job, old, false, true);
             let mut controller = Controller::new(old);
             controller.refresh(new);
@@ -1341,16 +1309,16 @@ mod tests {
 
     #[test]
     fn short_budget_has_one_segment() {
-        let (s, c) = segment_schedule(&ring(), &params(32, 1), &[32, 256], 0.25);
+        let (s, c) = segment_schedule(&ring(), &params(32, 1), &[32, 256]);
         assert_eq!(s.len(), 32);
         assert_eq!(c, vec![32]);
     }
 
     #[test]
     fn sweeps_per_beta_expands_rungs() {
-        let (s, c) = segment_schedule(&ring(), &params(1000, 4), &[32, 256], 0.25);
-        assert_eq!(s.len(), 1000);
-        assert_eq!(c, vec![32, 256, 1000]);
+        let (s, c) = segment_schedule(&ring(), &params(1000, 4), &[32, 256]);
+        assert_eq!(s.len(), 32 + 256 + 1000);
+        assert_eq!(c, vec![32, 288, 1288]);
         let standard = build_beta_schedule(&ring(), 32, 4, None).0;
         for (chunk, beta) in s[..32].chunks(4).zip(standard) {
             assert_eq!(chunk, &[beta; 4]);
@@ -1358,36 +1326,23 @@ mod tests {
     }
 
     #[test]
-    fn every_segment_ends_cold_and_tails_start_at_the_reheat_beta() {
-        let (s, _) = segment_schedule(&ring(), &params(1000, 1), &[32, 256], 0.25);
-        let cold = default_ising_beta_range(&ring()).1 as f32;
-        for i in [31, 255, 999] {
-            assert_eq!(s[i], cold);
-        }
-        for i in [32, 256] {
-            assert_eq!(s[i], 0.25);
-        }
-    }
-
-    #[test]
-    fn prefix_equals_the_standard_probe_schedule() {
-        let (s, _) = segment_schedule(&ring(), &params(1000, 1), &[32, 256], 0.25);
-        assert_eq!(s[..32], build_beta_schedule(&ring(), 32, 1, None).0);
-    }
-
-    #[test]
-    fn invalid_reheat_uses_one_standard_schedule_with_the_same_checkpoints() {
+    fn every_leg_starts_hot_and_ends_cold() {
+        let (s, c) = segment_schedule(&ring(), &params(1000, 1), &[32, 256]);
         let (hot, cold) = default_ising_beta_range(&ring());
-        for reheat in [hot, cold, -1.0, f64::NAN, f64::INFINITY] {
-            let (s, c) = segment_schedule(&ring(), &params(1000, 4), &[32, 256], reheat);
-            let expected: Vec<_> = build_beta_schedule(&ring(), 1000, 4, None)
-                .0
-                .into_iter()
-                .flat_map(|b| [b; 4])
-                .collect();
-            assert_eq!(s, expected);
-            assert_eq!(c, vec![32, 256, 1000]);
+        for start in [0, 32, 288] {
+            assert_eq!(s[start], hot as f32);
         }
+        for end in c {
+            assert_eq!(s[end - 1], cold as f32);
+        }
+    }
+
+    #[test]
+    fn each_leg_equals_a_lone_anneal_of_its_budget() {
+        let (s, _) = segment_schedule(&ring(), &params(1000, 1), &[32, 256]);
+        assert_eq!(s[..32], build_beta_schedule(&ring(), 32, 1, None).0);
+        assert_eq!(s[32..288], build_beta_schedule(&ring(), 256, 1, None).0);
+        assert_eq!(s[288..], build_beta_schedule(&ring(), 1000, 1, None).0);
     }
 
     #[test]
@@ -1539,7 +1494,7 @@ mod tests {
             ..CascadeSettings::default()
         });
         let (mut kept, _, checkpoints) = c.admit(&job(0, 100));
-        assert_eq!(checkpoints, vec![8, 16, 100]);
+        assert_eq!(checkpoints, vec![8, 24, 124]);
         assert!(c.checkpoint(&mut kept, -10, None));
         assert!(c.checkpoint(&mut kept, -20, None));
         assert_eq!(kept.stage, 2);
@@ -1603,11 +1558,6 @@ mod tests {
         for other in [fewer, slower, ranged] {
             assert!(!settings.chain_gated(true, &other));
         }
-        let reheated = CascadeSettings {
-            reheat_beta: 0.3,
-            ..settings
-        };
-        assert!(!reheated.chain_gated(true, &measured));
         let gated = settings.effective(true);
         assert_eq!(gated.stages, stage_array(CHAIN_GATES.stages));
         let expected: Vec<_> = CHAIN_GATES.gates.iter().copied().map(Some).collect();
@@ -1645,7 +1595,7 @@ mod tests {
             .prepare(&job(2, 2000), settings, false, true, None)
             .unwrap();
         assert!(!Arc::ptr_eq(&first.betas, &longer.betas));
-        assert_eq!(longer.betas.len(), 2000);
+        assert_eq!(longer.betas.len(), 32 + 256 + 2000);
         let shared_longer = cache
             .prepare(&job(3, 2000), settings, false, true, None)
             .unwrap();
@@ -1654,7 +1604,7 @@ mod tests {
         let gated = cache
             .prepare(&job(2, 2000), settings, true, true, None)
             .unwrap();
-        assert_eq!(gated.checkpoints, vec![8, 16, 64, 256, 512, 1024, 2000]);
+        assert_eq!(gated.checkpoints, vec![8, 24, 88, 344, 856, 1880, 3880]);
     }
 
     #[test]
@@ -1770,7 +1720,7 @@ mod tests {
         settings.merge(&cfg.cascade);
         let mut controller = Controller::new(settings);
         let (mut ticket, _, checkpoints) = controller.admit(&job(0, 1024));
-        assert_eq!(checkpoints, vec![32, 256, 1024]);
+        assert_eq!(checkpoints, vec![32, 288, 1312]);
         assert!(!controller.checkpoint(&mut ticket, 0, None));
     }
 
@@ -1796,7 +1746,7 @@ mod tests {
             ..CascadeSettings::default()
         });
         assert!(!Arc::ptr_eq(&t.plan, &c.plan));
-        assert_eq!(checkpoints, vec![32, 256, 14_336]);
+        assert_eq!(checkpoints, vec![32, 288, 14_624]);
         assert!(c.checkpoint(&mut t, -1, None));
         assert!(c.checkpoint(&mut t, -1, None));
         c.finish(&t, Some(-1), true);
@@ -1806,16 +1756,16 @@ mod tests {
         assert_eq!(c.plan.lock().unwrap().cutoffs[0].moments().count(), 0);
         let (t, _, checkpoints) = c.admit(&job(1, 1024));
         assert_eq!(t.gates, 1);
-        assert_eq!(checkpoints, vec![64, 1024]);
+        assert_eq!(checkpoints, vec![64, 1088]);
     }
 
     #[test]
     fn live_settings_change_stages_on_one_stream() {
         let mut c = Controller::new(CascadeSettings::default());
         for (stages, expected) in [
-            (stage_array(&[32, 256]), vec![32, 256, 1000]),
-            (stage_array(&[64]), vec![64, 1000]),
-            (stage_array(&[16, 64]), vec![16, 64, 1000]),
+            (stage_array(&[32, 256]), vec![32, 288, 1288]),
+            (stage_array(&[64]), vec![64, 1064]),
+            (stage_array(&[16, 64]), vec![16, 80, 1080]),
         ] {
             c.refresh(CascadeSettings {
                 stages,
@@ -1961,7 +1911,6 @@ mod tests {
     fn configured_stage_roots_and_effective_budgets_preserve_the_original_job() {
         let settings = CascadeSettings {
             stages: stage_array(&[32, 128, 256]),
-            reheat_beta: 1.0,
             ..CascadeSettings::default()
         };
         let mut c = Controller::new(settings);
@@ -1970,7 +1919,7 @@ mod tests {
         original.params.sweeps_per_beta = 2;
         let (mut t, s, checkpoints) = c.admit(&original);
         assert_eq!(t.gates, 1);
-        assert_eq!(checkpoints, vec![32, 128]);
+        assert_eq!(checkpoints, vec![32, 160]);
         assert_eq!(original.params.seed, 42);
         assert_eq!(original.params.num_sweeps, 128);
         assert_eq!(original.params.beta_range, Some((0.5, 4.0)));
@@ -2048,18 +1997,20 @@ mod tests {
 
     #[test]
     fn remainder_and_one_sweep_segments_have_exact_lengths() {
-        let (s, checkpoints) = segment_schedule(&ring(), &params(34, 3), &[32, 33], 0.25);
-        assert_eq!(s.len(), 34);
-        assert_eq!(checkpoints, vec![32, 33, 34]);
+        let (s, checkpoints) = segment_schedule(&ring(), &params(34, 3), &[32, 33]);
+        assert_eq!(s.len(), 32 + 33 + 34);
+        assert_eq!(checkpoints, vec![32, 65, 99]);
         let cold = default_ising_beta_range(&ring()).1 as f32;
-        assert_eq!(s[31..], [cold; 3]);
-        let (s, checkpoints) = segment_schedule(&ring(), &params(0, 0), &[32, 256], 0.25);
+        for end in checkpoints {
+            assert_eq!(s[end - 1], cold);
+        }
+        let (s, checkpoints) = segment_schedule(&ring(), &params(0, 0), &[32, 256]);
         assert!(s.is_empty());
         assert_eq!(checkpoints, vec![0]);
     }
 
     #[test]
-    fn arm_d_constants_and_default_reheat_match_the_report() {
+    fn arm_d_constants_match_the_report() {
         assert_eq!(CALIBRATION.stages, &[32, 256]);
         assert_eq!(CALIBRATION.skew, &[-0.123, -0.056]);
         assert_eq!(CALIBRATION.excess_kurtosis, &[0.014, 0.002]);
@@ -2070,8 +2021,6 @@ mod tests {
         assert_eq!(CALIBRATION.cost_a_us, 124.0);
         assert_eq!(CALIBRATION.cost_b_us, 2.284);
         assert_eq!(CALIBRATION.k0, 1.0);
-        assert_eq!(CALIBRATION.reheat_beta, 0.25);
-        assert_eq!(CascadeSettings::default().reheat_beta, 0.25);
     }
 
     #[test]
@@ -2107,25 +2056,16 @@ mod tests {
     }
 
     #[test]
-    fn custom_beta_range_controls_reheat_validation_and_tails() {
+    fn a_custom_beta_range_shapes_every_leg() {
         let mut params = params(1000, 2);
         params.beta_range = Some((0.5, 4.0));
-        let (fallback, checkpoints) = segment_schedule(&ring(), &params, &[32, 256], 0.25);
-        let expected: Vec<_> = build_beta_schedule(&ring(), 1000, 2, params.beta_range)
-            .0
-            .into_iter()
-            .flat_map(|b| [b; 2])
-            .collect();
-        assert_eq!(fallback, expected);
-        assert_eq!(checkpoints, vec![32, 256, 1000]);
-        let (reheated, reheated_checkpoints) = segment_schedule(&ring(), &params, &[32, 256], 1.0);
-        assert_eq!(reheated_checkpoints, checkpoints);
-        assert_eq!(reheated.len(), 1000);
-        for i in [32, 256] {
-            assert_eq!(reheated[i], 1.0);
+        let (s, checkpoints) = segment_schedule(&ring(), &params, &[32, 256]);
+        assert_eq!(checkpoints, vec![32, 288, 1288]);
+        for start in [0, 32, 288] {
+            assert_eq!(s[start], 0.5);
         }
-        for i in [31, 255, 999] {
-            assert_eq!(reheated[i], 4.0);
+        for end in checkpoints {
+            assert_eq!(s[end - 1], 4.0);
         }
     }
 }

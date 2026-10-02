@@ -204,7 +204,7 @@ pub(crate) struct Checkpoint {
     /// checkpoint and must not be treated as one. No gate, no stage advance,
     /// no controller stats.
     pub(crate) observe: bool,
-    /// Cumulative sweeps completed by the job as of this readback.
+    /// Sweeps completed in the current leg as of this readback.
     pub(crate) position: usize,
 }
 
@@ -214,6 +214,14 @@ struct ResidentJob {
     next_checkpoint: usize,
     has_output: bool,
     device_us: u64,
+}
+
+impl ResidentJob {
+    /// Schedule position where leg `leg` starts: each checkpoint ends one leg.
+    fn leg_start(&self, leg: usize) -> usize {
+        leg.checked_sub(1)
+            .map_or(0, |prev| self.job.checkpoints[prev])
+    }
 }
 
 pub(crate) struct SlotPool {
@@ -251,9 +259,11 @@ impl SlotPool {
         sched_stride: usize,
     ) -> Result<Self, SampleError> {
         let decode = decode_pool()?;
+        // Graph checks only: a schedule of fresh legs is longer than any one
+        // anneal, and the 32-bit region checks below bound `sched_stride`.
         let params = SampleParams {
             num_reads,
-            num_sweeps: sched_stride,
+            num_sweeps: 1,
             ..Default::default()
         };
         sampler::validate_batch(&[graph], &params, Kernel::Msa)?;
@@ -526,6 +536,8 @@ impl SlotPool {
             // that often even when the next real checkpoint is far away.
             // This only ever shrinks the step; it never changes which betas
             // run or their order, so the anneal itself is unaffected.
+            let leg = r.next_checkpoint;
+            let leg_start = r.leg_start(leg);
             let checkpoint_room = checkpoint - r.position;
             let mut room = checkpoint_room;
             let mut observe_stop = false;
@@ -538,19 +550,22 @@ impl SlotPool {
                 }
             }
             let count = slice.min(room);
-            let flags = if count == checkpoint_room {
+            let mut flags = if count == checkpoint_room {
                 SLOT_WRITE_OUTPUT
             } else if observe_stop && count == room {
                 SLOT_WRITE_OUTPUT | SLOT_OBSERVE
             } else {
                 0
             };
+            if leg > 0 && r.position == leg_start {
+                flags |= SLOT_RESTART;
+            }
             self.steps.push(SlotStep {
                 slot: slot as u32,
                 beta_start: r.position as i32,
                 beta_count: count as i32,
                 num_betas: r.job.schedule.len() as i32,
-                seed: slot_seed(r.job.seed),
+                seed: slot_seed(leg_seed(r.job.seed, leg)),
                 flags,
             });
         }
@@ -679,7 +694,7 @@ impl SlotPool {
                     last,
                     best,
                     observe,
-                    position: r.position,
+                    position: r.position - r.leg_start(index),
                 });
             }
         }
@@ -837,9 +852,13 @@ pub(crate) struct SlotStep {
 pub(crate) const SLOT_WRITE_OUTPUT: u32 = 1;
 /// Set together with [`SLOT_WRITE_OUTPUT`] on a step that stopped at an
 /// observe boundary rather than a real cascade checkpoint. The device
-/// kernel only inspects bit 0 (`SLOT_WRITE_OUTPUT`); this bit is a
-/// host-side annotation read back in [`SlotPool::take_checkpoints`].
+/// kernel ignores this bit; it is a host-side annotation read back in
+/// [`SlotPool::take_checkpoints`].
 pub(crate) const SLOT_OBSERVE: u32 = 2;
+/// Set on the first step of every leg after the first. The device draws new
+/// spins and a new RNG stream from the step's seed, as at position 0, so each
+/// leg is a fresh anneal rather than a continuation of the previous one.
+pub(crate) const SLOT_RESTART: u32 = 4;
 /// Longest gap, in sweeps, between output write-backs for a job admitted
 /// with `SlotJob::observe` set. Deep cascade stages can otherwise go up
 /// to `CHAIN_GATES.full_sweeps` sweeps between real checkpoints; this
@@ -848,6 +867,18 @@ pub(crate) const OBSERVE_INTERVAL: usize = 65_536;
 
 pub(crate) fn slot_seed(seed: u64) -> u32 {
     ((seed ^ (seed >> 32)) as u32).max(1)
+}
+
+/// The job seed of leg `leg`: the job's own seed for the first leg, and an
+/// independent `SplitMix64` draw for each later one.
+pub(crate) fn leg_seed(seed: u64, leg: usize) -> u64 {
+    if leg == 0 {
+        return seed;
+    }
+    let mut z = seed ^ (leg as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -1226,6 +1257,59 @@ mod tests {
     }
 
     #[test]
+    fn each_leg_after_a_checkpoint_is_a_fresh_anneal() {
+        let Some(device) = device() else {
+            return;
+        };
+        let graph = advantage2_system1(7);
+        let first = build_beta_schedule(&graph, 16, 1, None).0;
+        let second = build_beta_schedule(&graph, 48, 1, None).0;
+        let legs: Vec<f32> = first.iter().chain(&second).copied().collect();
+        let mut pool = SlotPool::new(&device, &graph, 64, 2, legs.len()).unwrap();
+        let two_legs = pool
+            .admit(SlotJob {
+                graph: graph.clone(),
+                schedule: legs.into(),
+                checkpoints: vec![16, 64],
+                seed: 7,
+                observe: false,
+            })
+            .unwrap();
+        // The second leg alone, as its own job with that leg's seed.
+        let alone = pool
+            .admit(SlotJob {
+                graph,
+                schedule: second.into(),
+                checkpoints: vec![48],
+                seed: leg_seed(7, 1),
+                observe: false,
+            })
+            .unwrap();
+        let mut finished = std::collections::HashMap::new();
+        while pool.live() > 0 {
+            for checkpoint in finish_step(&mut pool, 8) {
+                if checkpoint.last {
+                    assert_eq!(checkpoint.position, 48, "positions count within the leg");
+                    let reads = pool.reads(checkpoint.slot, 64).unwrap();
+                    pool.release(checkpoint.slot).unwrap();
+                    finished.insert(checkpoint.slot, reads);
+                }
+            }
+        }
+        for (a, b) in finished[&two_legs].iter().zip(&finished[&alone]) {
+            assert_eq!(a.spins, b.spins);
+            assert_eq!(a.energy_milli, b.energy_milli);
+        }
+    }
+
+    #[test]
+    fn leg_seeds_are_distinct_and_keep_the_job_seed_first() {
+        assert_eq!(leg_seed(42, 0), 42);
+        let seeds: std::collections::HashSet<_> = (0..16).map(|leg| leg_seed(42, leg)).collect();
+        assert_eq!(seeds.len(), 16);
+    }
+
+    #[test]
     fn reads_many_preserves_requested_slot_and_read_order() {
         let Some(device) = device() else {
             return;
@@ -1538,12 +1622,17 @@ mod tests {
             let start = if index == 0 { 0 } else { first };
             let mut reference_step = step(
                 0,
-                99,
+                leg_seed(99, index),
                 start as i32,
                 (checkpoint - start) as i32,
                 total as i32,
             );
-            reference_step.flags = SLOT_WRITE_OUTPUT;
+            // The second leg starts over from its own seed.
+            reference_step.flags = if index == 0 {
+                SLOT_WRITE_OUTPUT
+            } else {
+                SLOT_WRITE_OUTPUT | SLOT_RESTART
+            };
             reference_steps.push(vec![reference_step]);
             loop {
                 let checkpoints = finish_step(&mut pool, first);

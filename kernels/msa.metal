@@ -218,7 +218,7 @@ static inline void msa_body(
     device const int* color_block_counts,
     device const int* color_node_indices,
     int N, int num_reads, int num_colors, int sweeps_per_beta,
-    int beta_start, int beta_end, uint init_seed,
+    int beta_start, int beta_end, uint init_seed, bool fresh,
     bool write_output, bool write_samples,
     uint w, uint tid, uint gsz,
 #ifdef QUIP_MSA_DIAGNOSTICS
@@ -240,8 +240,8 @@ static inline void msa_body(
     int packed_size = (n + 7) / 8;
 
     RngState rng;
-    if (beta_start == 0) {
-        // First chunk: seed per (threadgroup, thread) and draw random words.
+    if (fresh) {
+        // A new anneal: seed per (threadgroup, thread) and draw random words.
         rng = seed_rng(init_seed);
         for (uint var = tid; var < uint(n); var += gsz) {
             state[var] = xoshiro128starstar(rng);
@@ -469,7 +469,7 @@ kernel void msa_anneal(
              &final_samples[problem_id * uint(num_reads) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
              N, num_reads, num_colors, sweeps_per_beta, beta_start, beta_end, init_seed,
-             beta_end >= num_betas, true, w, tid, gsz,
+             beta_start == 0, beta_end >= num_betas, true, w, tid, gsz,
 #ifdef QUIP_MSA_DIAGNOSTICS
              &diag_accept_counts[tg * gsz + tid],
              &diag_energy_partials[(tg * gsz + tid) * MSA_LANES],
@@ -483,8 +483,9 @@ struct SlotStep {
     int  beta_start;  // 0 = initialise spins and RNG from seed
     int  beta_count;  // rungs this step
     int  num_betas;   // this slot's schedule length
-    uint seed;        // job seed folded to 32 bits, never 0
+    uint seed;        // this leg's seed folded to 32 bits, never 0
     uint flags;       // bit 0: write energies and packed samples
+                      // bit 2: start a fresh anneal at beta_start
 };
 
 kernel void msa_anneal_slots(
@@ -541,6 +542,7 @@ kernel void msa_anneal_slots(
     int beta_end = min(st.beta_start + st.beta_count, st.num_betas);
     uint init_seed = st.seed ^ (w * 2654435761u) ^ (tid * 2246822519u);
     bool write_output = (st.flags & 1u) != 0;
+    bool fresh = st.beta_start == 0 || (st.flags & 4u) != 0;
     msa_body(csr_row_ptr, csr_col_ind, &csr_J_vals[st.slot * uint(j_stride)],
              &csr_h_vals[st.slot * uint(N)], &beta_schedule[st.slot * uint(sched_stride)],
              &persistent_state[g * uint(N)], &persistent_state[g * uint(N)],
@@ -548,7 +550,7 @@ kernel void msa_anneal_slots(
              &final_energies[st.slot * uint(num_reads)],
              &final_samples[st.slot * uint(num_reads) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
-             N, num_reads, num_colors, 1, st.beta_start, beta_end, init_seed,
+             N, num_reads, num_colors, 1, st.beta_start, beta_end, init_seed, fresh,
              write_output, write_output, w, tid, gsz, state, lane_total);
 }
 #endif
