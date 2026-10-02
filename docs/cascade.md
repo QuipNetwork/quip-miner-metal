@@ -41,12 +41,17 @@ must fall below the job's sweep budget. The final checkpoint is the full sweep
 budget. The runner advances each slot by at most the first stage's sweep count
 per step, stopping at the next checkpoint.
 
-Each checkpoint is a fresh anneal of its full budget. A job kept at a
-checkpoint starts over from new random spins and a new random stream. It then
-runs the standard schedule from the hot beta to the cold beta over the next
-checkpoint's sweeps. With stages `[32, 256]` and a budget of 1,000 sweeps, a
-job that passes both probes runs anneals of 32, 256, and 1,000 sweeps. The
-schedule computes one beta range per job and uses it for every anneal.
+Checkpoints of up to 256 sweeps share one anneal. The first runs the
+standard schedule from the hot beta to the cold beta. Each later one reheats
+the same spins to beta 0.25 and cools them to the cold beta again, so its
+checkpoint falls at its stage's sweep count. Every longer checkpoint, the
+full budget included, is a fresh anneal of its whole budget. A job kept for
+it starts over from new random spins and a new random stream, and runs the
+standard schedule over those sweeps. With stages `[32, 256]` and a budget of
+1,000 sweeps, a job that passes both probes runs one 256-sweep anneal. That
+anneal reheats at 32 sweeps. The job then runs a fresh 1,000-sweep anneal. The schedule computes one beta
+range per job. If beta 0.25 falls outside it, the shared anneal follows one
+standard schedule instead.
 
 ## Controller lifetime
 

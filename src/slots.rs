@@ -60,6 +60,9 @@ pub(crate) struct SlotJob {
     /// holds it skips the upload.
     pub(crate) schedule: Arc<[f32]>,
     pub(crate) checkpoints: Vec<usize>,
+    /// Index of the first leg that starts a fresh anneal. Earlier legs
+    /// continue the previous leg's spins.
+    pub(crate) fresh_from: usize,
     pub(crate) seed: u64,
     /// Whether this job gets observe-only readback points between its
     /// cascade checkpoints (see [`OBSERVE_INTERVAL`]). Every salt sets this,
@@ -204,7 +207,7 @@ pub(crate) struct Checkpoint {
     /// checkpoint and must not be treated as one. No gate, no stage advance,
     /// no controller stats.
     pub(crate) observe: bool,
-    /// Sweeps completed in the current leg as of this readback.
+    /// Sweeps of the current anneal completed as of this readback.
     pub(crate) position: usize,
 }
 
@@ -221,6 +224,15 @@ impl ResidentJob {
     fn leg_start(&self, leg: usize) -> usize {
         leg.checked_sub(1)
             .map_or(0, |prev| self.job.checkpoints[prev])
+    }
+
+    /// Schedule position where the anneal that leg `leg` belongs to started.
+    fn anneal_start(&self, leg: usize) -> usize {
+        if leg >= self.job.fresh_from {
+            self.leg_start(leg)
+        } else {
+            0
+        }
     }
 }
 
@@ -442,12 +454,17 @@ impl SlotPool {
         &mut self,
         inputs: PreparedInputs,
         graph: IsingGraph,
-        schedule: Arc<[f32]>,
-        checkpoints: Vec<usize>,
+        schedule: crate::cascade::PreparedSchedule,
         seed: u64,
         observe: bool,
     ) -> Result<SlotId, SampleError> {
         self.idle()?;
+        let crate::cascade::PreparedSchedule {
+            betas: schedule,
+            checkpoints,
+            fresh_from,
+            ..
+        } = schedule;
         if schedule.len() > self.sched_stride {
             return Err(SampleError::TooLarge("schedule exceeds slot stride".into()));
         }
@@ -463,6 +480,7 @@ impl SlotPool {
             graph,
             schedule,
             checkpoints,
+            fresh_from,
             seed,
             observe,
         };
@@ -557,7 +575,7 @@ impl SlotPool {
             } else {
                 0
             };
-            if leg > 0 && r.position == leg_start {
+            if leg > 0 && leg >= r.job.fresh_from && r.position == leg_start {
                 flags |= SLOT_RESTART;
             }
             self.steps.push(SlotStep {
@@ -694,7 +712,7 @@ impl SlotPool {
                     last,
                     best,
                     observe,
-                    position: r.position - r.leg_start(index),
+                    position: r.position - r.anneal_start(index),
                 });
             }
         }
@@ -855,9 +873,10 @@ pub(crate) const SLOT_WRITE_OUTPUT: u32 = 1;
 /// kernel ignores this bit; it is a host-side annotation read back in
 /// [`SlotPool::take_checkpoints`].
 pub(crate) const SLOT_OBSERVE: u32 = 2;
-/// Set on the first step of every leg after the first. The device draws new
-/// spins and a new RNG stream from the step's seed, as at position 0, so each
-/// leg is a fresh anneal rather than a continuation of the previous one.
+/// Set on the first step of every fresh leg after the first (see
+/// [`SlotJob::fresh_from`]). The device draws new spins and a new RNG stream
+/// from the step's seed, as at position 0, instead of continuing the previous
+/// leg's spins.
 pub(crate) const SLOT_RESTART: u32 = 4;
 /// Longest gap, in sweeps, between output write-backs for a job admitted
 /// with `SlotJob::observe` set. Deep cascade stages can otherwise go up
@@ -884,6 +903,9 @@ pub(crate) fn leg_seed(seed: u64, leg: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SlotJob::fresh_from` for a job whose legs all continue one anneal.
+    const CONTINUING: usize = usize::MAX;
 
     #[test]
     fn slot_unpack_matches_every_byte_and_partial_tail() {
@@ -957,6 +979,7 @@ mod tests {
             graph,
             schedule: schedule.into(),
             checkpoints,
+            fresh_from: CONTINUING,
             seed,
             observe: false,
         }
@@ -1099,6 +1122,7 @@ mod tests {
             graph: graph.clone(),
             schedule: Arc::clone(schedule),
             checkpoints: vec![32],
+            fresh_from: CONTINUING,
             seed,
             observe: false,
         };
@@ -1271,6 +1295,7 @@ mod tests {
                 graph: graph.clone(),
                 schedule: legs.into(),
                 checkpoints: vec![16, 64],
+                fresh_from: 1,
                 seed: 7,
                 observe: false,
             })
@@ -1281,6 +1306,7 @@ mod tests {
                 graph,
                 schedule: second.into(),
                 checkpoints: vec![48],
+                fresh_from: 1,
                 seed: leg_seed(7, 1),
                 observe: false,
             })
@@ -1611,6 +1637,7 @@ mod tests {
             graph: graph.clone(),
             schedule: schedule.clone().into(),
             checkpoints: vec![first, total],
+            fresh_from: CONTINUING,
             seed: 99,
             observe: false,
         })
@@ -1622,17 +1649,12 @@ mod tests {
             let start = if index == 0 { 0 } else { first };
             let mut reference_step = step(
                 0,
-                leg_seed(99, index),
+                99,
                 start as i32,
                 (checkpoint - start) as i32,
                 total as i32,
             );
-            // The second leg starts over from its own seed.
-            reference_step.flags = if index == 0 {
-                SLOT_WRITE_OUTPUT
-            } else {
-                SLOT_WRITE_OUTPUT | SLOT_RESTART
-            };
+            reference_step.flags = SLOT_WRITE_OUTPUT;
             reference_steps.push(vec![reference_step]);
             loop {
                 let checkpoints = finish_step(&mut pool, first);
@@ -1802,6 +1824,7 @@ mod tests {
                 graph: graph.clone(),
                 schedule: Arc::clone(&schedule),
                 checkpoints: vec![checkpoint],
+                fresh_from: CONTINUING,
                 seed: 11,
                 observe: true,
             })
@@ -1820,6 +1843,7 @@ mod tests {
                 graph,
                 schedule,
                 checkpoints: vec![checkpoint],
+                fresh_from: CONTINUING,
                 seed: 11,
                 observe: false,
             })

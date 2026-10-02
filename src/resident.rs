@@ -1452,8 +1452,7 @@ pub(crate) fn run(
             let admitted = pool.slots.admit_prepared(
                 data.inputs,
                 graph,
-                data.schedule.betas,
-                data.schedule.checkpoints,
+                data.schedule,
                 job.params.seed,
                 observe,
             );
@@ -1826,13 +1825,14 @@ mod tests {
         let mut pool = Pool::new(&device, &hit_job, 2, any_plan(&hit_job)).unwrap();
 
         let (hit_reply, hit_outcomes) = mpsc::channel();
-        let (hit_ticket, hit_schedule, hit_checkpoints) = controller.admit(&hit_job);
+        let (hit_ticket, hit_prepared) = controller.admit_schedule(&hit_job);
         let hit_slot = pool
             .slots
             .admit(SlotJob {
                 graph: hit_job.graph.clone(),
-                schedule: hit_schedule.into(),
-                checkpoints: hit_checkpoints,
+                schedule: Arc::clone(&hit_prepared.betas),
+                checkpoints: hit_prepared.checkpoints.clone(),
+                fresh_from: hit_prepared.fresh_from,
                 seed: hit_job.params.seed,
                 observe: true,
             })
@@ -1857,13 +1857,14 @@ mod tests {
 
         let plain_job = job(2001, 256);
         let (plain_reply, plain_outcomes) = mpsc::channel();
-        let (plain_ticket, plain_schedule, plain_checkpoints) = controller.admit(&plain_job);
+        let (plain_ticket, plain_prepared) = controller.admit_schedule(&plain_job);
         let plain_slot = pool
             .slots
             .admit(SlotJob {
                 graph: plain_job.graph.clone(),
-                schedule: plain_schedule.into(),
-                checkpoints: plain_checkpoints,
+                schedule: Arc::clone(&plain_prepared.betas),
+                checkpoints: plain_prepared.checkpoints.clone(),
+                fresh_from: plain_prepared.fresh_from,
                 seed: plain_job.params.seed,
                 observe: true,
             })
@@ -1962,13 +1963,14 @@ mod tests {
         let mut pool = Pool::new(&device, &unit_job, 1, any_plan(&unit_job)).unwrap();
 
         let (reply, outcomes) = mpsc::channel();
-        let (ticket, schedule, checkpoints) = controller.admit(&unit_job);
+        let (ticket, prepared) = controller.admit_schedule(&unit_job);
         let slot = pool
             .slots
             .admit(SlotJob {
                 graph: unit_job.graph.clone(),
-                schedule: schedule.into(),
-                checkpoints,
+                schedule: Arc::clone(&prepared.betas),
+                checkpoints: prepared.checkpoints.clone(),
+                fresh_from: prepared.fresh_from,
                 seed: unit_job.params.seed,
                 observe: true,
             })
@@ -2069,14 +2071,16 @@ mod tests {
         let mut pool = Pool::new(&device, &unit_job, 1, any_plan(&unit_job)).unwrap();
 
         let (reply, outcomes) = mpsc::channel();
-        let (ticket, schedule, checkpoints) = controller.admit(&unit_job);
+        let (ticket, prepared) = controller.admit_schedule(&unit_job);
+        let checkpoints = prepared.checkpoints.clone();
         assert_eq!(checkpoints, vec![8, 8 + sweeps]);
         let slot = pool
             .slots
             .admit(SlotJob {
                 graph: unit_job.graph.clone(),
-                schedule: schedule.into(),
-                checkpoints,
+                schedule: Arc::clone(&prepared.betas),
+                checkpoints: prepared.checkpoints.clone(),
+                fresh_from: prepared.fresh_from,
                 seed: unit_job.params.seed,
                 observe: true,
             })
@@ -2333,7 +2337,15 @@ mod tests {
         assert_eq!(chain.params.num_sweeps, CHAIN_GATES.full_sweeps);
         assert_eq!(
             data.schedule.checkpoints.last(),
-            Some(&(CHAIN_GATES.stages.iter().sum::<usize>() + CHAIN_GATES.full_sweeps))
+            Some(
+                &(CHAIN_GATES
+                    .stages
+                    .iter()
+                    .filter(|&&s| s > crate::cascade::REHEAT_THROUGH)
+                    .sum::<usize>()
+                    + crate::cascade::REHEAT_THROUGH
+                    + CHAIN_GATES.full_sweeps)
+            )
         );
         let open = CascadeSettings {
             open_gates: true,
@@ -3270,13 +3282,14 @@ mod tests {
             controller.finish(&ticket, None, false);
         }
         let mut pool = Pool::new(&device, &live_job, 1, any_plan(&live_job)).unwrap();
-        let (ticket, schedule, checkpoints) = controller.admit(&live_job);
+        let (ticket, prepared) = controller.admit_schedule(&live_job);
         let slot = pool
             .slots
             .admit(SlotJob {
                 graph: live_job.graph.clone(),
-                schedule: schedule.into(),
-                checkpoints,
+                schedule: Arc::clone(&prepared.betas),
+                checkpoints: prepared.checkpoints.clone(),
+                fresh_from: prepared.fresh_from,
                 seed: live_job.params.seed,
                 observe: false,
             })
@@ -3374,13 +3387,14 @@ mod tests {
         });
         let live_job = job(1000, 256);
         let mut pool = Pool::new(&device, &live_job, 1, any_plan(&live_job)).unwrap();
-        let (ticket, schedule, checkpoints) = controller.admit(&live_job);
+        let (ticket, prepared) = controller.admit_schedule(&live_job);
         let slot = pool
             .slots
             .admit(SlotJob {
                 graph: live_job.graph.clone(),
-                schedule: schedule.into(),
-                checkpoints,
+                schedule: Arc::clone(&prepared.betas),
+                checkpoints: prepared.checkpoints.clone(),
+                fresh_from: prepared.fresh_from,
                 seed: live_job.params.seed,
                 observe: true,
             })
