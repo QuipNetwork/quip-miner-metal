@@ -529,16 +529,24 @@ impl SlotPool {
     }
 
     /// Advance every live job, stopping each at its next checkpoint. Release
-    /// jobs at their final checkpoint before submitting another step.
-    pub(crate) fn commit_step(&mut self, slice: usize) -> Result<bool, SampleError> {
+    /// jobs at their final checkpoint before submitting another step. A job
+    /// in a fresh leg (see [`SlotJob::fresh_from`]) advances up to
+    /// `deep_slice` sweeps, every other job up to `slice`.
+    pub(crate) fn commit_step(
+        &mut self,
+        slice: usize,
+        deep_slice: usize,
+    ) -> Result<bool, SampleError> {
         self.idle()?;
         if self.live() == 0 {
             return Ok(false);
         }
-        if slice == 0 {
+        if slice == 0 || deep_slice == 0 {
             return Err(SampleError::Driver("slot slice must be nonzero".into()));
         }
-        let slice = sampler::msa_step_limit(self.cached.n, self.live() * self.words, slice);
+        let groups = self.live() * self.words;
+        let slice = sampler::msa_step_limit(self.cached.n, groups, slice);
+        let deep_slice = sampler::msa_step_limit(self.cached.n, groups, deep_slice);
         self.steps.clear();
         for (slot, resident) in self.slots.iter().enumerate() {
             let Some(r) = resident else {
@@ -567,7 +575,12 @@ impl SlotPool {
                     observe_stop = true;
                 }
             }
-            let count = slice.min(room);
+            let limit = if leg >= r.job.fresh_from {
+                deep_slice
+            } else {
+                slice
+            };
+            let count = limit.min(room);
             let mut flags = if count == checkpoint_room {
                 SLOT_WRITE_OUTPUT
             } else if observe_stop && count == room {
@@ -993,7 +1006,7 @@ mod tests {
     }
 
     fn finish_step(pool: &mut SlotPool, slice: usize) -> Vec<Checkpoint> {
-        assert!(pool.commit_step(slice).unwrap());
+        assert!(pool.commit_step(slice, slice).unwrap());
         pool.wait();
         pool.take_checkpoints().unwrap()
     }
@@ -1035,7 +1048,7 @@ mod tests {
         }
         let mut expected_us = [0; 3];
         for index in 0..2 {
-            assert!(pool.commit_step(32).unwrap());
+            assert!(pool.commit_step(32, 32).unwrap());
             pool.wait();
             let command_us = sampler::gpu_time_us(pool.command.as_ref().unwrap());
             for (slot, us) in expected_us.iter_mut().enumerate() {
@@ -1107,7 +1120,7 @@ mod tests {
         }
         pool.release(0).unwrap();
         assert_eq!(pool.live(), 0);
-        assert!(!pool.commit_step(32).unwrap());
+        assert!(!pool.commit_step(32, 32).unwrap());
     }
 
     #[test]
@@ -1181,12 +1194,12 @@ mod tests {
         };
         let mut pool = SlotPool::new(&device, &advantage2_system1(7), READS, 2, 32).unwrap();
         pool.admit(job(7, 32, vec![32])).unwrap();
-        assert!(pool.commit_step(32).unwrap());
+        assert!(pool.commit_step(32, 32).unwrap());
         assert!(pool.in_flight());
         pool.admit(job(19, 32, vec![32])).unwrap_err();
         assert!(pool.release(0).is_err());
         pool.reads(0, READS).unwrap_err();
-        pool.commit_step(32).unwrap_err();
+        pool.commit_step(32, 32).unwrap_err();
         assert_eq!(pool.live(), 1);
         pool.wait();
         assert_eq!(pool.take_checkpoints().unwrap().len(), 1);
@@ -1257,7 +1270,7 @@ mod tests {
         let mut pool = SlotPool::new(&device, &graph, 33, 1, 64).unwrap();
         pool.admit(job(7, 64, vec![5, 64])).unwrap();
         pool.admit(job(19, 32, vec![32])).unwrap_err();
-        pool.commit_step(0).unwrap_err();
+        pool.commit_step(0, 0).unwrap_err();
         pool.release(1).unwrap_err();
         let cp = finish_step(&mut pool, 32);
         assert_eq!((cp[0].index, cp[0].last), (0, false));
@@ -1277,7 +1290,7 @@ mod tests {
                 energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges)
             );
         }
-        pool.commit_step(32).unwrap_err();
+        pool.commit_step(32, 32).unwrap_err();
     }
 
     #[test]
@@ -1329,6 +1342,33 @@ mod tests {
     }
 
     #[test]
+    fn fresh_legs_step_at_the_deep_slice() {
+        let Some(device) = device() else {
+            return;
+        };
+        let graph = advantage2_system1(7);
+        let mut pool = SlotPool::new(&device, &graph, READS, 2, 256).unwrap();
+        let continuing = pool.admit(job(7, 256, vec![256])).unwrap();
+        let fresh = pool
+            .admit(SlotJob {
+                fresh_from: 0,
+                ..job(19, 256, vec![256])
+            })
+            .unwrap();
+        assert!(pool.commit_step(8, 16).unwrap());
+        let count = |slot: SlotId| {
+            pool.steps
+                .iter()
+                .find(|step| step.slot as usize == slot)
+                .unwrap()
+                .beta_count
+        };
+        assert_eq!(count(continuing), 8);
+        assert_eq!(count(fresh), 16);
+        pool.wait();
+    }
+
+    #[test]
     fn leg_seeds_are_distinct_and_keep_the_job_seed_first() {
         assert_eq!(leg_seed(42, 0), 42);
         let seeds: std::collections::HashSet<_> = (0..16).map(|leg| leg_seed(42, leg)).collect();
@@ -1345,7 +1385,7 @@ mod tests {
             pool.admit(job(seed, 32, vec![32])).unwrap();
         }
         pool.reads_many(&[0], 33).unwrap_err();
-        assert!(pool.commit_step(32).unwrap());
+        assert!(pool.commit_step(32, 32).unwrap());
         pool.reads_many(&[0], 33).unwrap_err();
         pool.wait();
         assert_eq!(pool.take_checkpoints().unwrap().len(), 3);
@@ -1914,5 +1954,227 @@ mod tests {
             .map(|_| [-1.0, 0.0, 1.0][(xorshift64(&mut s) % 3) as usize])
             .collect();
         IsingGraph::new(h, j, edges)
+    }
+
+    /// Per-checkpoint best energies of the production cascade schedule
+    /// ([`crate::cascade::segment_schedule`]) on recorded problems, with no
+    /// gating: every job runs every leg. Used to set the chain gates.
+    ///
+    /// Ignored: needs a Metal device and a problem directory written by
+    /// `scripts/testnet/regen`. Every problem must share one topology with
+    /// zero fields, so one schedule serves all of them. Writes
+    /// `qblock_id,k,best_<stage>...,best_<sweeps>`.
+    ///
+    /// ```text
+    /// QUIP_TRACE_PROBLEMS=dir QUIP_TRACE_OUT=trace.csv QUIP_TRACE_STAGES=8,16,64 \
+    ///   QUIP_TRACE_SWEEPS=256 QUIP_TRACE_SEEDS=30 \
+    ///   cargo test --release --lib checkpoint_trace -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Metal device and QUIP_TRACE_PROBLEMS"]
+    #[expect(clippy::print_stderr, reason = "the trace reports progress on stderr")]
+    fn checkpoint_trace() {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            path: String,
+            qblock_id: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Problem {
+            h: Vec<f64>,
+            j: Vec<f64>,
+            edges: Vec<(usize, usize)>,
+        }
+        let var =
+            |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+        let dir = std::env::var("QUIP_TRACE_PROBLEMS").expect("QUIP_TRACE_PROBLEMS");
+        let out = std::env::var("QUIP_TRACE_OUT").expect("QUIP_TRACE_OUT");
+        let stages: Vec<usize> = var("QUIP_TRACE_STAGES", "8,16,64")
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let sweeps: usize = var("QUIP_TRACE_SWEEPS", "256").parse().unwrap();
+        let seeds: u64 = var("QUIP_TRACE_SEEDS", "30").parse().unwrap();
+        let slice: usize = var("QUIP_TRACE_SLICE", "4096").parse().unwrap();
+        let index: Vec<Entry> =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/index.json")).unwrap())
+                .unwrap();
+        let mut jobs = Vec::new();
+        for entry in &index {
+            let p: Problem =
+                serde_json::from_str(&std::fs::read_to_string(&entry.path).unwrap()).unwrap();
+            assert!(
+                p.h.iter().all(|&h| h == 0.0),
+                "one schedule needs zero fields"
+            );
+            let graph = IsingGraph::new(p.h, p.j, p.edges);
+            for k in 0..seeds {
+                jobs.push((entry.qblock_id, k, graph.clone()));
+            }
+        }
+        let trace_seed = |qblock: u64, k: u64| {
+            let mut z = qblock.wrapping_mul(1_000_003).wrapping_add(k);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)).max(1)
+        };
+        let params = SampleParams {
+            num_reads: READS,
+            num_sweeps: sweeps,
+            sweeps_per_beta: 1,
+            beta_range: None,
+            seed: 1,
+        };
+        let (schedule, checkpoints, fresh_from) =
+            crate::cascade::segment_schedule(&jobs[0].2, &params, &stages);
+        let schedule: Arc<[f32]> = schedule.into();
+        let device = MetalDevice::open(0).expect("Metal device 0");
+        let capacity = crate::streaming::batch_size_for_reads(crate::Kernel::Msa, READS);
+        let mut pool = SlotPool::new(&device, &jobs[0].2, READS, capacity, schedule.len()).unwrap();
+        let total = jobs.len();
+        let mut owner: Vec<Option<(u64, u64)>> = vec![None; capacity];
+        let mut rows: std::collections::BTreeMap<(u64, u64), Vec<i64>> =
+            std::collections::BTreeMap::new();
+        let mut pending = jobs.into_iter();
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
+        loop {
+            while pool.live() < pool.capacity() {
+                let Some((qblock, k, graph)) = pending.next() else {
+                    break;
+                };
+                let slot = pool
+                    .admit(SlotJob {
+                        graph,
+                        schedule: Arc::clone(&schedule),
+                        checkpoints: checkpoints.clone(),
+                        fresh_from,
+                        seed: trace_seed(qblock, k),
+                        observe: false,
+                    })
+                    .unwrap();
+                owner[slot] = Some((qblock, k));
+            }
+            if pool.live() == 0 {
+                break;
+            }
+            assert!(pool.commit_step(slice, slice).unwrap());
+            pool.wait();
+            for checkpoint in pool.take_checkpoints().unwrap() {
+                let key = owner[checkpoint.slot].expect("live slot has an owner");
+                rows.entry(key).or_default().push(checkpoint.best);
+                if checkpoint.last {
+                    pool.release(checkpoint.slot).unwrap();
+                    owner[checkpoint.slot] = None;
+                    done += 1;
+                    if done.is_multiple_of(100) {
+                        let secs = started.elapsed().as_secs_f64();
+                        eprintln!("{done}/{total} jobs in {secs:.0} s");
+                    }
+                }
+            }
+        }
+        let mut text = String::from("qblock_id,k");
+        for stage in stages.iter().filter(|&&s| s < sweeps).chain([&sweeps]) {
+            text.push_str(&format!(",best_{stage}"));
+        }
+        text.push('\n');
+        for ((qblock, k), bests) in &rows {
+            let cells: Vec<String> = bests.iter().map(i64::to_string).collect();
+            text.push_str(&format!("{qblock},{k},{}\n", cells.join(",")));
+        }
+        std::fs::write(&out, text).unwrap();
+        eprintln!("{total} jobs in {:.0} s", started.elapsed().as_secs_f64());
+    }
+
+    /// Screen throughput against deep-leg speed for several deep step sizes.
+    ///
+    /// Fills a pool of production capacity with screen slots running
+    /// back-to-back fresh 8-sweep legs, each checkpoint standing for one
+    /// screened salt, plus `QUIP_BENCH_DEEP` slots in one long fresh leg. For
+    /// each `deep_slice` it reports screen legs per second and deep sweeps per
+    /// second over `QUIP_BENCH_SECS` seconds.
+    ///
+    /// ```text
+    /// cargo test --release --lib deep_slice_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Metal device; a benchmark"]
+    #[expect(clippy::print_stderr, reason = "the benchmark reports on stderr")]
+    fn deep_slice_bench() {
+        let var =
+            |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+        let deep: usize = var("QUIP_BENCH_DEEP", "4").parse().unwrap();
+        let secs: f64 = var("QUIP_BENCH_SECS", "8").parse().unwrap();
+        let slices: Vec<usize> = var("QUIP_BENCH_SLICES", "8,16,32,64,128,256")
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let device = MetalDevice::open(0).expect("Metal device 0");
+        let graph = advantage2_system1(7);
+        let leg = build_beta_schedule(&graph, 8, 1, None).0;
+        let legs = 40_000;
+        let screen: Arc<[f32]> = leg.iter().copied().cycle().take(8 * legs).collect();
+        let screen_checkpoints: Vec<usize> = (1..=legs).map(|k| 8 * k).collect();
+        let deep_sweeps = 4_000_000;
+        let deep_schedule: Arc<[f32]> = build_beta_schedule(&graph, deep_sweeps, 1, None).0.into();
+        let capacity = crate::streaming::batch_size_for_reads(crate::Kernel::Msa, READS);
+        for &deep_slice in &slices {
+            let mut pool = SlotPool::new(&device, &graph, READS, capacity, deep_sweeps).unwrap();
+            let mut deep_slots = Vec::new();
+            for slot in 0..capacity {
+                let deep_job = slot < deep;
+                let id = pool
+                    .admit(SlotJob {
+                        graph: graph.clone(),
+                        schedule: if deep_job {
+                            Arc::clone(&deep_schedule)
+                        } else {
+                            Arc::clone(&screen)
+                        },
+                        checkpoints: if deep_job {
+                            vec![deep_sweeps]
+                        } else {
+                            screen_checkpoints.clone()
+                        },
+                        fresh_from: if deep_job { 0 } else { 1 },
+                        seed: slot as u64 + 1,
+                        observe: false,
+                    })
+                    .unwrap();
+                if deep_job {
+                    deep_slots.push(id);
+                }
+            }
+            // The screen slots' legs are fresh from the second on, so they
+            // step at `slice`; the deep slots' only leg is fresh, so they step
+            // at `deep_slice`. Warm up, then measure.
+            for _ in 0..50 {
+                assert!(pool.commit_step(8, deep_slice).unwrap());
+                pool.wait();
+                pool.take_checkpoints().unwrap();
+            }
+            let deep_start: usize = deep_slots.iter().map(|&s| pool.position(s)).sum();
+            let started = std::time::Instant::now();
+            let (mut steps, mut screened) = (0u64, 0u64);
+            while started.elapsed().as_secs_f64() < secs {
+                assert!(pool.commit_step(8, deep_slice).unwrap());
+                pool.wait();
+                screened += pool.take_checkpoints().unwrap().len() as u64;
+                steps += 1;
+            }
+            let wall = started.elapsed().as_secs_f64();
+            let deep_done: usize =
+                deep_slots.iter().map(|&s| pool.position(s)).sum::<usize>() - deep_start;
+            let per_deep = deep_done as f64 / deep.max(1) as f64 / wall;
+            eprintln!(
+                "deep_slice {deep_slice:>4}: {:>6.0} steps/s, {:>8.0} screen legs/s, \
+                 {:>7.0} sweeps/s per deep slot, 2.1M-sweep unit in {:>5.0} s",
+                steps as f64 / wall,
+                screened as f64 / wall,
+                per_deep,
+                2_097_152.0 / per_deep.max(1.0)
+            );
+        }
     }
 }

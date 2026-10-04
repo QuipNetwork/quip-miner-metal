@@ -294,6 +294,15 @@ fn salt_seed(nonce: [u8; 32]) -> u64 {
     KEYS.get_or_init(Default::default).hash_one(nonce).max(1)
 }
 
+/// Most sweeps a slot in a fresh deep leg advances per step. Screening slots
+/// keep the first stage's step, which sets the step's pace. On an M4 Max with
+/// 20-slot pools (`slots::tests::deep_slice_bench`), 16 nearly doubles a deep
+/// slot's rate (about 8k to 14k sweeps per second, a 2.1M-sweep unit in 145 s
+/// instead of 265 s) for 9 to 12 percent of screen throughput with one to four
+/// deep slots live. Larger steps gain little: a deep slot peaks near its own
+/// threadgroup's rate, and every step then waits on it.
+const DEEP_SLICE: usize = 16;
+
 struct Pool {
     slots: SlotPool,
     live: Vec<Option<Live>>,
@@ -1491,7 +1500,10 @@ pub(crate) fn run(
             if out.is_closed() {
                 break;
             }
-            if let Err(error) = pools[turn].slots.commit_step(config.stages[0].max(1)) {
+            if let Err(error) = pools[turn]
+                .slots
+                .commit_step(config.stages[0].max(1), DEEP_SLICE)
+            {
                 fault = Some(error);
                 break;
             }
@@ -1887,7 +1899,7 @@ mod tests {
 
         let (out, mut results) = tokio::sync::mpsc::channel(4);
         let cancel = CancelToken::default();
-        pool.slots.commit_step(8).unwrap();
+        pool.slots.commit_step(8, 8).unwrap();
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
 
@@ -1907,7 +1919,7 @@ mod tests {
         assert!(pool.live[plain_slot].is_some());
         assert!(plain_outcomes.try_recv().is_err());
 
-        pool.slots.commit_step(256).unwrap();
+        pool.slots.commit_step(256, 256).unwrap();
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
         match plain_outcomes.try_recv().unwrap() {
@@ -1999,7 +2011,7 @@ mod tests {
 
         // First checkpoint (8 sweeps): the target is unreachable, so the
         // unit keeps running.
-        pool.slots.commit_step(8).unwrap();
+        pool.slots.commit_step(8, 8).unwrap();
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
         assert!(pool.live[slot].is_some(), "unit ended before easing");
@@ -2011,7 +2023,7 @@ mod tests {
 
         // Second checkpoint (64 sweeps, not the schedule's last): the live
         // read now sees the eased target and finishes the unit here.
-        pool.slots.commit_step(64).unwrap();
+        pool.slots.commit_step(64, 64).unwrap();
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
         assert!(
@@ -2134,7 +2146,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             // The gate at 8 sweeps: open_gates keeps it running regardless
             // of any target.
-            pool.slots.commit_step(8).unwrap();
+            pool.slots.commit_step(8, 8).unwrap();
             pool.harvest(&mut controller, &out, &cancel, &Governor)
                 .unwrap();
             assert!(pool.live[slot].is_some());
@@ -2144,7 +2156,10 @@ mod tests {
             // observe point with nothing to check against must do nothing.
             while pool.slots.position(slot) < crate::slots::OBSERVE_INTERVAL {
                 pool.slots
-                    .commit_step(crate::slots::OBSERVE_INTERVAL)
+                    .commit_step(
+                        crate::slots::OBSERVE_INTERVAL,
+                        crate::slots::OBSERVE_INTERVAL,
+                    )
                     .unwrap();
                 pool.harvest(&mut controller, &out, &cancel, &Governor)
                     .unwrap();
@@ -2163,7 +2178,10 @@ mod tests {
             // finish the unit here, not at the schedule's end.
             while pool.live[slot].is_some() {
                 pool.slots
-                    .commit_step(crate::slots::OBSERVE_INTERVAL)
+                    .commit_step(
+                        crate::slots::OBSERVE_INTERVAL,
+                        crate::slots::OBSERVE_INTERVAL,
+                    )
                     .unwrap();
                 pool.harvest(&mut controller, &out, &cancel, &Governor)
                     .unwrap();
@@ -3304,13 +3322,13 @@ mod tests {
         });
         let (out, mut results) = tokio::sync::mpsc::channel(2);
         let cancel = CancelToken::default();
-        pool.slots.commit_step(8).unwrap();
+        pool.slots.commit_step(8, 8).unwrap();
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
         assert_eq!(pool.live[slot].as_ref().unwrap().ticket.stage, 1);
         assert_eq!(pool.slots.live(), 1);
         assert!(matches!(results.try_recv(), Err(TryRecvError::Empty)));
-        pool.slots.commit_step(8).unwrap();
+        pool.slots.commit_step(8, 8).unwrap();
         cancel.cancel_through(1);
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
@@ -3418,12 +3436,12 @@ mod tests {
         });
         let (out, _results) = tokio::sync::mpsc::channel(1);
         let cancel = CancelToken::default();
-        pool.slots.commit_step(8).unwrap();
+        pool.slots.commit_step(8, 8).unwrap();
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
         assert_eq!(pool.slots.live(), 1, "the unit keeps running past stage 0");
         assert!(outcomes.try_recv().is_err());
-        pool.slots.commit_step(8).unwrap();
+        pool.slots.commit_step(8, 8).unwrap();
         stop.store(true, Ordering::Release);
         pool.harvest(&mut controller, &out, &cancel, &Governor)
             .unwrap();
