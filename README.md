@@ -1,4 +1,4 @@
-# quip-miner-metal
+# quip-solver-metal
 
 Metal Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-metal-sa`), multi-spin coded SA
@@ -24,7 +24,7 @@ consensus; there is no GPU energy kernel (Metal Shading Language has no
 | `quip-metal-gibbs` | heat-bath Gibbs |
 
 Prebuilt `arm64` binaries are attached to each
-[Release](https://gitlab.com/quip.network/quip-miner-metal/-/releases)
+[Release](https://gitlab.com/quip.network/quip-solver-metal/-/releases)
 (built best-effort on a macOS CI runner; see [`.gitlab-ci.yml`](.gitlab-ci.yml)).
 
 ## Build

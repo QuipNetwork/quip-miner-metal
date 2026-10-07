@@ -35,11 +35,11 @@
     reason = "the study reports stage rates on stderr, like the other benches"
 )]
 
-use quip_miner_metal::metal_device::MetalDevice;
-use quip_miner_metal::streaming::{run_stream, GpuGovernor};
-use quip_miner_metal::{IsingGraph, Kernel};
 use quip_solver_core::quip_protocol::chacha8::draw_ising_milli;
 use quip_solver_core::{CancelToken, SampleParams, StreamJob, StreamOutcome};
+use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::streaming::{run_stream, GpuGovernor};
+use quip_solver_metal::{IsingGraph, Kernel};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -342,7 +342,7 @@ fn probe_then_solve_on_fresh_nonces() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("quip_miner_metal=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("quip_solver_metal=info")),
         )
         .with_writer(std::io::stderr)
         .try_init();

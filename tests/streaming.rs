@@ -6,13 +6,13 @@
 //!
 //! Requires a Metal device (Apple Silicon).
 
-use quip_miner_metal::iokit_gov::UtilGovernor;
-use quip_miner_metal::metal_device::MetalDevice;
-use quip_miner_metal::streaming::{run_stream, GpuGovernor};
-use quip_miner_metal::{IsingGraph, Kernel, MetalSampler};
 use quip_solver_core::{
     CancelToken, SampleParams, Sampler, StreamJob, StreamOutcome, StreamResult,
 };
+use quip_solver_metal::iokit_gov::UtilGovernor;
+use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::streaming::{run_stream, GpuGovernor};
+use quip_solver_metal::{IsingGraph, Kernel, MetalSampler};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
@@ -396,7 +396,7 @@ fn metal_sampler_sample_smoke() {
         assert!(sampler.stream_width() >= 1);
         assert_eq!(
             sampler.max_reads(),
-            quip_miner_metal::streaming::max_reads(Kernel::Sa)
+            quip_solver_metal::streaming::max_reads(Kernel::Sa)
         );
     });
 }

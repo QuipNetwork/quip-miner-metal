@@ -3,13 +3,13 @@
 //! Requires a Metal device (Apple Silicon). There is no GPU energy kernel
 //! (MSL has no `double`); production scores always use host `energy_milli`.
 //!
-//! Run with `cargo test -p quip-miner-metal`.
+//! Run with `cargo test -p quip-solver-metal`.
 
-use quip_miner_metal::metal_device::MetalDevice;
-use quip_miner_metal::sampler::sample_ising;
-use quip_miner_metal::{IsingGraph, Kernel, SampleParams};
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::quip_protocol::wire::{decode_spins, encode_spins};
+use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::sampler::sample_ising;
+use quip_solver_metal::{IsingGraph, Kernel, SampleParams};
 use serde_json::Value;
 use std::fs;
 

@@ -13,10 +13,10 @@ use metal::{
     Buffer, CommandBuffer, ComputePipelineState, Device, MTLCommandBufferStatus,
     MTLResourceOptions, MTLSize,
 };
-use quip_miner_metal::topology::{fill_h_j, SelfFeedingTopology};
-use quip_miner_metal::IsingGraph;
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 use quip_solver_core::quip_protocol::scoring::energy_milli;
+use quip_solver_metal::topology::{fill_h_j, SelfFeedingTopology};
+use quip_solver_metal::IsingGraph;
 use std::collections::VecDeque;
 use std::time::Instant;
 

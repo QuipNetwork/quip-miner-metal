@@ -84,7 +84,7 @@ impl SampleError {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_metal::sampler::SampleError;
+    /// use quip_solver_metal::sampler::SampleError;
     /// use quip_solver_core::SampleError as HarnessSampleError;
     ///
     /// let err = SampleError::TooLarge("nodes > SA cap".into());
@@ -1181,7 +1181,7 @@ pub(crate) fn harvest_batch(
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_metal::{sample_ising, Kernel, IsingGraph, SampleParams, metal_device::MetalDevice};
+/// use quip_solver_metal::{sample_ising, Kernel, IsingGraph, SampleParams, metal_device::MetalDevice};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = MetalDevice::open(0)?;

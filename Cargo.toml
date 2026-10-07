@@ -1,5 +1,5 @@
 [package]
-name = "quip-miner-metal"
+name = "quip-solver-metal"
 version = "0.3.3-rc3"
 edition = "2021"
 # MSRV contract for consumers. `rust-toolchain.toml` pins the *build* toolchain
@@ -7,10 +7,10 @@ edition = "2021"
 rust-version = "1.97"
 description = "Metal Ising miners: simulated annealing, multi-spin coded SA and heat-bath Gibbs (v0.3, Apple Silicon)"
 license = "AGPL-3.0-or-later"
-repository = "https://gitlab.com/quip.network/quip-miner-metal"
+repository = "https://gitlab.com/quip.network/quip-solver-metal"
 
 [lib]
-name = "quip_miner_metal"
+name = "quip_solver_metal"
 path = "src/lib.rs"
 
 [[bin]]
@@ -31,7 +31,7 @@ path = "src/bin/quip_metal_msa.rs"
 # one core. `quip-solver-core` re-exports `quip_proto` and `quip_protocol`, so
 # this one line covers all three.
 [dependencies]
-quip-miner-ane = { path = "crates/ane-miner" }
+quip-solver-ane = { path = "crates/ane-miner" }
 quip-solver-core = "0.0.1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

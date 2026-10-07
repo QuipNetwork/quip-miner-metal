@@ -4,8 +4,8 @@
 //! macOS-only so these still only build there.
 
 use proptest::prelude::*;
-use quip_miner_metal::topology::{fill_h_j, ColorBlocks, SelfFeedingTopology};
-use quip_miner_metal::IsingGraph;
+use quip_solver_metal::topology::{fill_h_j, ColorBlocks, SelfFeedingTopology};
+use quip_solver_metal::IsingGraph;
 
 // ---------------------------------------------------------------------------
 // Generators

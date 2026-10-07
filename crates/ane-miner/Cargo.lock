@@ -709,25 +709,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quip-miner-ane"
-version = "0.1.0"
-dependencies = [
- "cc",
- "clap",
- "quip-solver-conformance",
- "quip-solver-core",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "quip-proto"
 version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -745,6 +726,25 @@ checksum = "662b61607000230563ffeeea5b2c2226209ff06fd1eebe912d35753ce2dc462d"
 dependencies = [
  "blake3",
  "quip-proto",
+]
+
+[[package]]
+name = "quip-solver-ane"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "clap",
+ "quip-solver-conformance",
+ "quip-solver-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

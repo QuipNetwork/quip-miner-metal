@@ -3,9 +3,9 @@
 //! the unguarded shader returns a uniform state at maximum energy.
 //! Removing the guard makes the trigger test fail while the control passes.
 
-use quip_miner_metal::metal_device::MetalDevice;
-use quip_miner_metal::sampler::sample_ising;
-use quip_miner_metal::{IsingGraph, Kernel, SampleParams};
+use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::sampler::sample_ising;
+use quip_solver_metal::{IsingGraph, Kernel, SampleParams};
 
 fn open_device() -> MetalDevice {
     MetalDevice::open(0).unwrap_or_else(|e| {

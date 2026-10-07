@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use quip_miner_ane::AneSampler;
+use quip_solver_ane::AneSampler;
 use quip_solver_core::{
     CancelToken, IsingGraph, OpenError, SampleError, SampleParams, Sampler, SamplerResult,
     StreamJob, StreamOutcome, StreamResult,

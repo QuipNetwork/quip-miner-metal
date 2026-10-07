@@ -168,7 +168,7 @@ impl UtilGovernor {
     /// sets the scale while yielding is off.
     ///
     /// ```
-    /// use quip_miner_metal::iokit_gov::UtilGovernor;
+    /// use quip_solver_metal::iokit_gov::UtilGovernor;
     ///
     /// let mut gov = UtilGovernor::start(0, 80, false);
     /// assert!((gov.budget_scale() - 0.8).abs() < 1e-9);

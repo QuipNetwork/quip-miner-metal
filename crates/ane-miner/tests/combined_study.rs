@@ -307,7 +307,7 @@ async fn production_channel_study() {
     let env = vec![
         (
             "RUST_LOG".to_owned(),
-            "quip_miner_metal::combined=debug".to_owned(),
+            "quip_solver_metal::combined=debug".to_owned(),
         ),
         (
             "QUIP_METAL_MSA_FOUR_COLOR".to_owned(),

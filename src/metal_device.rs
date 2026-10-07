@@ -90,7 +90,7 @@ impl MetalDevice {
     /// # Examples
     ///
     /// ```no_run
-    /// use quip_miner_metal::metal_device::MetalDevice;
+    /// use quip_solver_metal::metal_device::MetalDevice;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let device = MetalDevice::open(0)?;
@@ -135,7 +135,7 @@ impl MetalDevice {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_metal::metal_device::MetalDevice;
+    /// use quip_solver_metal::metal_device::MetalDevice;
     ///
     /// let a = MetalDevice::device_count();
     /// let b = MetalDevice::device_count();
@@ -158,7 +158,7 @@ impl MetalDevice {
     /// # Examples
     ///
     /// ```no_run
-    /// use quip_miner_metal::metal_device::MetalDevice;
+    /// use quip_solver_metal::metal_device::MetalDevice;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// MetalDevice::check(0)?;

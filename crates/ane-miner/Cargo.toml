@@ -28,7 +28,7 @@ unimplemented = "deny"
 await_holding_lock = "deny"
 
 [package]
-name = "quip-miner-ane"
+name = "quip-solver-ane"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.97"

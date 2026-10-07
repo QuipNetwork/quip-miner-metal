@@ -27,8 +27,8 @@ use quip_solver_core::IsingGraph;
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::IsingGraph;
-/// use quip_miner_metal::topology::SelfFeedingTopology;
+/// use quip_solver_metal::IsingGraph;
+/// use quip_solver_metal::topology::SelfFeedingTopology;
 ///
 /// let graph = IsingGraph::new(
 ///     vec![1.0, -1.0, 0.0, 1.0],
@@ -187,8 +187,8 @@ fn advantage2_color(graph: &IsingGraph) -> Option<ColorBlocks> {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::IsingGraph;
-/// use quip_miner_metal::topology::SelfFeedingTopology;
+/// use quip_solver_metal::IsingGraph;
+/// use quip_solver_metal::topology::SelfFeedingTopology;
 ///
 /// let graph = IsingGraph::new(
 ///     vec![0.0, 0.0],
@@ -238,8 +238,8 @@ impl SelfFeedingTopology {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_metal::IsingGraph;
-    /// use quip_miner_metal::topology::SelfFeedingTopology;
+    /// use quip_solver_metal::IsingGraph;
+    /// use quip_solver_metal::topology::SelfFeedingTopology;
     ///
     /// let graph = IsingGraph::new(
     ///     vec![1.0, -1.0, 0.0, 1.0],
@@ -338,8 +338,8 @@ fn quantize_i8(v: f64) -> i8 {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::IsingGraph;
-/// use quip_miner_metal::topology::{fill_h_j, SelfFeedingTopology};
+/// use quip_solver_metal::IsingGraph;
+/// use quip_solver_metal::topology::{fill_h_j, SelfFeedingTopology};
 ///
 /// let graph = IsingGraph::new(
 ///     vec![1.0, -1.0, 0.0, 1.0],

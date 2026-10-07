@@ -6,8 +6,8 @@
 #![warn(clippy::expect_used)]
 
 use clap::Parser;
-use quip_miner_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
 use quip_solver_core::CommonArgs;
+use quip_solver_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
 use std::process::ExitCode;
 
 #[derive(Parser)]

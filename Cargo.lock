@@ -909,44 +909,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
-name = "quip-miner-ane"
-version = "0.1.0"
-dependencies = [
- "cc",
- "clap",
- "quip-solver-core",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "quip-miner-metal"
-version = "0.3.3-rc3"
-dependencies = [
- "clap",
- "core-foundation-sys",
- "io-kit-sys",
- "metal",
- "objc",
- "proptest",
- "quip-miner-ane",
- "quip-solver-conformance",
- "quip-solver-core",
- "rayon",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "quip-proto"
 version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -964,6 +926,21 @@ checksum = "662b61607000230563ffeeea5b2c2226209ff06fd1eebe912d35753ce2dc462d"
 dependencies = [
  "blake3",
  "quip-proto",
+]
+
+[[package]]
+name = "quip-solver-ane"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "clap",
+ "quip-solver-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1004,6 +981,29 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tonic",
  "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "quip-solver-metal"
+version = "0.3.3-rc3"
+dependencies = [
+ "clap",
+ "core-foundation-sys",
+ "io-kit-sys",
+ "metal",
+ "objc",
+ "proptest",
+ "quip-solver-ane",
+ "quip-solver-conformance",
+ "quip-solver-core",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]

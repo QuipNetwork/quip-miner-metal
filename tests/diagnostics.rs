@@ -27,9 +27,9 @@
 )]
 
 use metal::{Buffer, CompileOptions, Device, MTLResourceOptions, MTLSize};
-use quip_miner_metal::topology::{fill_h_j, SelfFeedingTopology};
-use quip_miner_metal::IsingGraph;
 use quip_solver_core::quip_protocol::scoring::energy_milli;
+use quip_solver_metal::topology::{fill_h_j, SelfFeedingTopology};
+use quip_solver_metal::IsingGraph;
 
 const THREADS: usize = 256;
 const LANES: usize = 32;
