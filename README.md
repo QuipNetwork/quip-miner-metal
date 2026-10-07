@@ -70,7 +70,7 @@ Only MSA can run on the ANE. See [engine selection](docs/combined-engines.md) fo
 ## Multi-spin kernel (`quip-metal-msa`)
 
 `kernels/msa.metal` is a Metal port of the multi-spin coded simulated
-annealing in `quip-miner-cuda`'s `quip-cuda-msa` and `quip-miner-cpu`'s
+annealing in `quip-solver-cuda`'s `quip-cuda-msa` and `quip-solver-cpu`'s
 `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer, *Optimised simulated
 annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015). 32
 replicas share one 32-bit word per spin. The Metropolis test is an integer

@@ -7,7 +7,7 @@ using namespace metal;
 // ==============================================================================
 // METAL MULTI-SPIN CODED SIMULATED ANNEALING
 // ==============================================================================
-// Port of quip-miner-cuda's kernels/msc.cu, itself a port of quip-miner-cpu's
+// Port of quip-solver-cuda's kernels/msc.cu, itself a port of quip-solver-cpu's
 // sa_msc.rs (Isakov, Zintchenko, Ronnow, Troyer 2015). 32 replicas share the
 // bits of one 32-bit word per spin: bit r of state[i] is spin i of replica r,
 // 0 meaning +1 and 1 meaning -1 (the same convention as the packed output of

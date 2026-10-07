@@ -1,12 +1,12 @@
 # Metal multi-spin coded simulated annealing (`quip-metal-msa`)
 
-Design for porting quip-miner-cuda MR 26 (`quip-cuda-msa`, `kernels/msc.cu`)
+Design for porting quip-solver-cuda MR 26 (`quip-cuda-msa`, `kernels/msc.cu`)
 to this crate, and a comparison of how the CUDA and Metal miners map the same
 algorithms onto their hardware. The comparison drives the design choices.
 
-Source MR: https://gitlab.com/quip.network/quip-miner-cuda/-/merge_requests/26
+Source MR: https://gitlab.com/quip.network/quip-solver-cuda/-/merge_requests/26
 (branch `msa-cuda-kernel`, commit `e7fc201`). It ports `sa_msc.rs` from
-quip-miner-cpu v0.3.3 (Isakov, Zintchenko, Ronnow, Troyer, *Optimised
+quip-solver-cpu v0.3.3 (Isakov, Zintchenko, Ronnow, Troyer, *Optimised
 simulated annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015).
 
 ## What the MR adds, and what transfers
