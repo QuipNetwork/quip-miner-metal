@@ -46,8 +46,9 @@ pub enum Kernel {
 }
 
 use crate::topology::{fill_h_j, SelfFeedingTopology};
-use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::beta::default_ising_beta_range;
 pub(crate) use quip_solver_core::quip_protocol::scoring::energy_milli;
+use quip_solver_core::BetaSchedule;
 
 /// Failure from a Metal sample attempt: capacity refusal or driver fault.
 #[derive(Debug, Error)]
@@ -476,24 +477,42 @@ static ENERGY_AUDIT_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// One device-energy job in this many is rescored on the host.
 const ENERGY_AUDIT_EVERY: u64 = 1000;
 
-/// Geometric beta schedule cast to f32 for kernel upload, plus sweeps-per-beta.
+/// Beta schedule of the kind `schedule` names, cast to f32 for kernel upload,
+/// plus sweeps-per-beta.
 ///
-/// Uses the shared f64 schedule and casts each element to f32 — bit-identical
-/// to the prior in-crate f32 schedule.
+/// Uses the shared f64 schedule and casts each element to f32 — for a
+/// geometric ladder, bit-identical to the prior in-crate f32 schedule.
 pub(crate) fn build_beta_schedule(
     graph: &IsingGraph,
     num_sweeps: usize,
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
+    schedule: BetaSchedule,
 ) -> (Vec<f32>, usize) {
     let sweeps_per = sweeps_per_beta.max(1);
     let num_betas = (num_sweeps / sweeps_per).max(1);
     let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
-    let sched: Vec<f32> = geometric_beta_schedule(hot, cold, num_betas)
+    let sched: Vec<f32> = schedule
+        .build(hot, cold, num_betas)
         .iter()
         .map(|&b| b as f32)
         .collect();
     (sched, sweeps_per)
+}
+
+/// The kernels' `uint` seed argument, mixed from all 64 bits of a host seed.
+///
+/// The kernel RNG state is 32-bit, so the seed must be narrowed. Keeping the
+/// low half made seeds that differ only in their high 32 bits run identical
+/// trajectories. The `SplitMix64` finalizer spreads every input bit over the
+/// high word it returns, so any change to the seed changes the kernel seed,
+/// short of a 2^-32 collision.
+pub(crate) fn kernel_seed(seed: u64) -> u32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    u32::try_from(z >> 32).unwrap_or(u32::MAX)
 }
 
 /// Unpack one read's bit-packed spins (LSB-first per byte, bit=1 -> -1,
@@ -1280,6 +1299,7 @@ fn encode_batch_inner(
             params.num_sweeps,
             params.sweeps_per_beta,
             params.beta_range,
+            params.schedule,
         ),
     };
 
@@ -1331,7 +1351,7 @@ fn encode_batch_inner(
         n,
         num_betas: beta.len() as i32,
         sweeps_per,
-        base_seed: (params.seed as u32).wrapping_add(1),
+        base_seed: kernel_seed(params.seed).wrapping_add(1),
         num_threads,
         num_problems,
         num_reads,
@@ -1919,15 +1939,38 @@ mod tests {
     }
 
     #[test]
+    fn a_linear_schedule_is_evenly_spaced() {
+        let (sched, _) = build_beta_schedule(&ring(), 5, 1, Some((1.0, 5.0)), BetaSchedule::Linear);
+        assert_eq!(sched, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// `--solve` seeds that differ only in their high 32 bits used to give the
+    /// same kernel seed, and so the same samples.
+    #[test]
+    fn the_kernel_seed_depends_on_every_bit_of_the_host_seed() {
+        let base = 0x0000_0000_dead_beef_u64;
+        assert_eq!(kernel_seed(base), kernel_seed(base), "deterministic");
+        for bit in 0..64 {
+            assert_ne!(
+                kernel_seed(base),
+                kernel_seed(base ^ (1 << bit)),
+                "flipping bit {bit} must change the kernel seed"
+            );
+        }
+    }
+
+    #[test]
     fn beta_schedule_length_is_sweeps_over_sweeps_per_beta() {
-        let (sched, sweeps_per) = build_beta_schedule(&ring(), 100, 10, Some((0.1, 10.0)));
+        let (sched, sweeps_per) =
+            build_beta_schedule(&ring(), 100, 10, Some((0.1, 10.0)), BetaSchedule::Geometric);
         assert_eq!(sweeps_per, 10);
         assert_eq!(sched.len(), 10);
     }
 
     #[test]
     fn beta_schedule_runs_hot_to_cold() {
-        let (sched, _) = build_beta_schedule(&ring(), 64, 1, Some((0.1, 10.0)));
+        let (sched, _) =
+            build_beta_schedule(&ring(), 64, 1, Some((0.1, 10.0)), BetaSchedule::Geometric);
         assert_eq!(sched.len(), 64);
         assert!((sched[0] - 0.1).abs() < 1e-6, "starts hot: {}", sched[0]);
         let last = sched[sched.len() - 1];
@@ -1939,7 +1982,8 @@ mod tests {
     fn beta_schedule_floors_at_one_beta() {
         // Zero sweeps and zero sweeps-per-beta must not divide by zero or
         // produce an empty ladder the kernel would read as num_betas = 0.
-        let (sched, sweeps_per) = build_beta_schedule(&ring(), 0, 0, Some((0.1, 10.0)));
+        let (sched, sweeps_per) =
+            build_beta_schedule(&ring(), 0, 0, Some((0.1, 10.0)), BetaSchedule::Geometric);
         assert_eq!(sweeps_per, 1);
         assert_eq!(sched.len(), 1);
     }
@@ -1948,7 +1992,13 @@ mod tests {
     fn beta_schedule_at_the_sweep_cap_is_bounded() {
         // The whole point of MAX_SWEEPS: the largest accepted job still
         // allocates a schedule of a size we can name.
-        let (sched, _) = build_beta_schedule(&ring(), MAX_SWEEPS, 1, Some((0.1, 10.0)));
+        let (sched, _) = build_beta_schedule(
+            &ring(),
+            MAX_SWEEPS,
+            1,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+        );
         assert_eq!(sched.len(), MAX_SWEEPS);
     }
 

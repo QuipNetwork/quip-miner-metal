@@ -6,6 +6,7 @@
 use quip_solver_conformance::driver::{
     drive_miner, DriverReport, Terminal, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER,
 };
+use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use quip_solver_core::quip_proto::v1::RejectReason;
 use std::process::Command;
 
@@ -242,6 +243,44 @@ async fn quip_metal_msa_passes_conformance() {
     // The session builds SamplerMeta from the requested budget even when the
     // resident runner returns probe reads. Keep the exact metadata contract.
     assert_conformant("quip-metal-msa", &report, CONFIGURED_SWEEPS);
+}
+
+/// Every kernel passes the `--solve` gate, runs a linear schedule, and honours
+/// the limits it advertises: a model at each limit solves, one past it is
+/// refused as capacity.
+#[tokio::test]
+async fn every_kernel_passes_the_solve_gate() {
+    ensure_built(&["quip-metal-sa", "quip-metal-gibbs", "quip-metal-msa"]);
+    for (bin, limit_cases) in [
+        (
+            "quip-metal-sa",
+            &["field-limit-inside", "field-limit-outside"][..],
+        ),
+        (
+            "quip-metal-gibbs",
+            &["field-limit-inside", "field-limit-outside"][..],
+        ),
+        (
+            "quip-metal-msa",
+            &[
+                "degree-limit-inside",
+                "degree-limit-outside",
+                "field-limit-inside",
+                "field-limit-outside",
+            ][..],
+        ),
+    ] {
+        let report = drive_solve(&profile_bin(bin)).await;
+        assert!(report.is_conformant(), "{bin}:\n{}", report.summary());
+        for case in ["linear-schedule"].iter().chain(limit_cases) {
+            assert_eq!(
+                report.outcome(case),
+                Some(&CaseOutcome::Passed),
+                "{bin} {case}:\n{}",
+                report.summary()
+            );
+        }
+    }
 }
 
 #[test]
