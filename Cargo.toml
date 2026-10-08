@@ -126,3 +126,12 @@ indexing_slicing = "allow"
 # `cast_possible_truncation`/`cast_sign_loss`/`cast_possible_wrap` — which are
 # deliberate for GPU buffer packing, plus 21 `doc_markdown` and 17
 # `must_use_candidate`). Adopting it needs its own triage pass.
+
+# Temporary: quip-solver-core 0.0.3 is not on crates.io yet, so build against
+# the commit that carries it. Remove this section and run `cargo update` once
+# 0.0.3 is published.
+[patch.crates-io]
+quip-proto = { git = "https://gitlab.com/quip.network/quip-solver-core.git", rev = "4d58710d229646b3b3e0ac18511e9434283f2b52" }
+quip-protocol = { git = "https://gitlab.com/quip.network/quip-solver-core.git", rev = "4d58710d229646b3b3e0ac18511e9434283f2b52" }
+quip-solver-core = { git = "https://gitlab.com/quip.network/quip-solver-core.git", rev = "4d58710d229646b3b3e0ac18511e9434283f2b52" }
+quip-solver-conformance = { git = "https://gitlab.com/quip.network/quip-solver-core.git", rev = "4d58710d229646b3b3e0ac18511e9434283f2b52" }

@@ -746,9 +746,8 @@ dependencies = [
 
 [[package]]
 name = "quip-proto"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b23623cac848ac57fb00ae389f4ada328f09ff89631f30c955b7285a4d88879c"
+version = "0.0.3"
+source = "git+https://gitlab.com/quip.network/quip-solver-core.git?rev=4d58710d229646b3b3e0ac18511e9434283f2b52#4d58710d229646b3b3e0ac18511e9434283f2b52"
 dependencies = [
  "prost",
  "tonic",
@@ -756,9 +755,8 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2685030cd72ce49aeb91a3ece54b91733cd30d64922277f907459b231441b46f"
+version = "0.0.3"
+source = "git+https://gitlab.com/quip.network/quip-solver-core.git?rev=4d58710d229646b3b3e0ac18511e9434283f2b52#4d58710d229646b3b3e0ac18511e9434283f2b52"
 dependencies = [
  "blake3",
  "quip-proto",
@@ -766,9 +764,8 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-conformance"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d47a4535d28590887754ac6beeeeca10924a68895d0ae0ccf64feb15d6ba862"
+version = "0.0.3"
+source = "git+https://gitlab.com/quip.network/quip-solver-core.git?rev=4d58710d229646b3b3e0ac18511e9434283f2b52#4d58710d229646b3b3e0ac18511e9434283f2b52"
 dependencies = [
  "hyper-util",
  "prost",
@@ -784,9 +781,8 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-core"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97610f7de2d194bb3a1c43802bffd223ecfc8ec93d3f49e08fdbeeaae5fd2850"
+version = "0.0.3"
+source = "git+https://gitlab.com/quip.network/quip-solver-core.git?rev=4d58710d229646b3b3e0ac18511e9434283f2b52#4d58710d229646b3b3e0ac18511e9434283f2b52"
 dependencies = [
  "base64",
  "clap",
