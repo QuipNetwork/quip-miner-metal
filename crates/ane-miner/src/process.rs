@@ -1049,6 +1049,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: None,
             seed: 123,
+            ..SampleParams::default()
         };
         let worker = WorkerProcess::spawn(
             &worker_binary(),

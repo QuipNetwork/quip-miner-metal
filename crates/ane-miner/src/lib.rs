@@ -30,6 +30,7 @@ pub const ANE_MSA_IDENTITY: quip_solver_core::BackendIdentity = quip_solver_core
         reads_solution_max_factor: 0,
         reads_solution_floor_factor: 0,
     },
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 #[derive(Debug, thiserror::Error)]

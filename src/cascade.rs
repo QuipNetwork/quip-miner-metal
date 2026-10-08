@@ -1290,6 +1290,7 @@ mod tests {
             sweeps_per_beta,
             beta_range: None,
             seed: 42,
+            ..SampleParams::default()
         }
     }
     fn job(id: u64, sweeps: usize) -> StreamJob {

@@ -168,6 +168,7 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     // capability names `BackendIdentity::features` documents.
     features: &["streaming", "governor"],
     adapt: METAL_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-metal-gibbs`.
@@ -192,6 +193,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // Same capability set as `METAL_SA_IDENTITY`: streaming + governor.
     features: &["streaming", "governor"],
     adapt: METAL_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-metal-msa`.
@@ -214,6 +216,7 @@ pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &["streaming", "governor"],
     adapt: METAL_MSA_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization

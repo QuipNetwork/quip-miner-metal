@@ -2193,6 +2193,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: Some((0.1, 1.0)),
             seed: 7,
+            ..SampleParams::default()
         };
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             let batch = encode_batch_inner(
@@ -2223,6 +2224,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: Some((0.1, 1.0)),
             seed: 7,
+            ..SampleParams::default()
         };
         let plan: Vec<_> = (0..128).map(|start| (start, 1)).collect();
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
@@ -2249,6 +2251,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: Some((0.1, 1.0)),
             seed: 7,
+            ..SampleParams::default()
         };
         let mut batch = encode_batch(&device, &[&graph], &params, Kernel::Msa, 2).unwrap();
         let mut checks = 0;
@@ -2327,6 +2330,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: Some((0.1, 4.0)),
             seed: 7,
+            ..SampleParams::default()
         };
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             let mut whole = encode_batch_inner(
@@ -2415,6 +2419,7 @@ mod tests {
             // Keep thermal variation so distinct words need not converge.
             beta_range: Some((0.1, 0.5)),
             seed: 3,
+            ..SampleParams::default()
         };
         let mut batch = encode_batch(&device, &[&a, &b], &params, Kernel::Msa, 1).unwrap();
         while batch.commit_next(|| false) {

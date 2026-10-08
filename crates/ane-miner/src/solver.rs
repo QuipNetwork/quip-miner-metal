@@ -198,6 +198,7 @@ mod tests {
             sweeps_per_beta: 4,
             beta_range: Some((0.2, 2.0)),
             seed: 0x1234_5678,
+            ..SampleParams::default()
         }
     }
 
@@ -599,6 +600,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: None,
             seed: 123,
+            ..SampleParams::default()
         };
         let output = solve_in_process(&graph, &parameters).unwrap();
         eprintln!(

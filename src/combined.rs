@@ -762,6 +762,7 @@ mod tests {
                 sweeps_per_beta: 1,
                 beta_range: None,
                 seed: 7,
+                ..SampleParams::default()
             },
             watermark: Some(id as u64 + 1),
         }

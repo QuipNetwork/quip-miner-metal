@@ -374,6 +374,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: Some((0.25, 4.0)),
             seed: 0,
+            ..SampleParams::default()
         };
         assert!(validate_params(&valid).is_ok());
 

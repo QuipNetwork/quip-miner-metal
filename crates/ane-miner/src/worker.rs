@@ -64,6 +64,7 @@ impl RawJob {
                 sweeps_per_beta: self.sweeps_per_beta,
                 beta_range: self.beta_range,
                 seed: self.seed,
+                ..SampleParams::default()
             },
         )
     }
@@ -260,6 +261,7 @@ mod tests {
             sweeps_per_beta: 2,
             beta_range: Some((0.25, 4.0)),
             seed: 99,
+            ..SampleParams::default()
         };
         let (graph_copy, params_copy) = RawJob::from_parts(&graph, &params).into_parts();
         assert_eq!(graph_copy.h, vec![-1.0, 1.0]);

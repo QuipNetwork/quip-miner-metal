@@ -2024,6 +2024,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: None,
             seed: 1,
+            ..SampleParams::default()
         };
         let (schedule, checkpoints, fresh_from) =
             crate::cascade::segment_schedule(&jobs[0].2, &params, &stages);

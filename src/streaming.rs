@@ -773,6 +773,7 @@ mod tests {
             sweeps_per_beta,
             beta_range: None,
             seed: 0,
+            ..SampleParams::default()
         }
     }
 
