@@ -7,14 +7,14 @@
 //! Metal GPU tests: need a real device (Apple Silicon). Run with
 //! `--test-threads=1`. Each test skips when no Metal device opens.
 
-use quip_miner_metal::iokit_gov::UtilGovernor;
-use quip_miner_metal::metal_device::MetalDevice;
-use quip_miner_metal::{GibbsTag, Kernel, MetalSampler, MsaTag, SaTag, TaggedSampler};
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleError, SampleParams, Sampler, StreamJob, StreamOutcome,
     StreamResult,
 };
+use quip_solver_metal::iokit_gov::UtilGovernor;
+use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::{GibbsTag, Kernel, MetalSampler, MsaTag, SaTag, TaggedSampler};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;

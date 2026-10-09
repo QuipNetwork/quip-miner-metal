@@ -36,7 +36,7 @@ const DEFAULT_GPU_CORES: usize = 10;
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::{streaming, Kernel};
+/// use quip_solver_metal::{streaming, Kernel};
 ///
 /// assert_eq!(streaming::max_reads(Kernel::Sa), 256);
 /// assert_eq!(streaming::max_reads(Kernel::Gibbs), 256);
@@ -188,7 +188,7 @@ pub(crate) fn scale_budget(nominal: usize, scale: f64) -> usize {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::{streaming, Kernel};
+/// use quip_solver_metal::{streaming, Kernel};
 ///
 /// assert!(streaming::declared_stream_width(Kernel::Sa) >= 1);
 /// ```
@@ -219,7 +219,7 @@ pub fn declared_stream_width(kernel: Kernel) -> usize {
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_metal::{streaming, Kernel, metal_device::MetalDevice};
+/// use quip_solver_metal::{streaming, Kernel, metal_device::MetalDevice};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = MetalDevice::open(0)?;

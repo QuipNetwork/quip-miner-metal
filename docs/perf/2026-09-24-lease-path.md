@@ -67,7 +67,7 @@ Follow-up bead `quip-miner-metal-zse` is a P1 bug. It calls for computing the st
 
 ## Production note
 
-Under leases, the coordinator receives one `Result` per winning salt instead of one per job. A protocol-2 coordinator exists as quip-miner merge request !290, which is open and not merged. It sizes each lease at 4 s of the miner's smoothed salt rate, never below one stream_width, and at most 2^20 salts. Its first lease uses 4 x stream_width. This report did not run that coordinator.
+Under leases, the coordinator receives one `Result` per winning salt instead of one per job. A protocol-2 coordinator exists as quip-solver merge request !290, which is open and not merged. It sizes each lease at 4 s of the miner's smoothed salt rate, never below one stream_width, and at most 2^20 salts. Its first lease uses 4 x stream_width. This report did not run that coordinator.
 
 ## Data
 

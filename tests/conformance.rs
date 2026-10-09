@@ -176,10 +176,10 @@ fn profile_bin(name: &str) -> String {
 
 fn ensure_built(package_bins: &[&str]) {
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "quip-miner-metal"])
+        .args(["build", "-p", "quip-solver-metal"])
         .status()
-        .expect("cargo build quip-miner-metal");
-    assert!(status.success(), "failed to build quip-miner-metal");
+        .expect("cargo build quip-solver-metal");
+    assert!(status.success(), "failed to build quip-solver-metal");
     for b in package_bins {
         assert!(
             std::path::Path::new(&profile_bin(b)).exists(),

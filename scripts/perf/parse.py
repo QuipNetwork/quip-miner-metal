@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
-"""Steady-state rate from a quip_miner_metal debug log on stdin.
+"""Steady-state rate from a quip_solver_metal debug log on stdin.
 
 The rate counts the jobs of every batch after the first, over the time from
 the first batch completion to the last. That removes device open, kernel

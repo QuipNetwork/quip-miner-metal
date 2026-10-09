@@ -42,7 +42,7 @@
 // see; it still fires for any build that reaches this crate.
 #[cfg(not(target_os = "macos"))]
 compile_error!(
-    "quip-miner-metal is macOS-only: it depends on Metal and IOKit, which exist \
+    "quip-solver-metal is macOS-only: it depends on Metal and IOKit, which exist \
      on no other platform. Build it on macOS (Apple Silicon)."
 );
 
@@ -147,7 +147,7 @@ const _: () = assert!(
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::METAL_SA_IDENTITY;
+/// use quip_solver_metal::METAL_SA_IDENTITY;
 /// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
 /// assert_eq!(METAL_SA_IDENTITY.backend, Backend::Metal);
@@ -175,7 +175,7 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::METAL_GIBBS_IDENTITY;
+/// use quip_solver_metal::METAL_GIBBS_IDENTITY;
 /// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
 /// assert_eq!(METAL_GIBBS_IDENTITY.backend, Backend::Metal);
@@ -199,7 +199,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::METAL_MSA_IDENTITY;
+/// use quip_solver_metal::METAL_MSA_IDENTITY;
 /// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
 /// assert_eq!(METAL_MSA_IDENTITY.backend, Backend::Metal);
@@ -210,7 +210,7 @@ pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: quip_solver_core::quip_proto::v1::Backend::Metal,
     algorithm: quip_solver_core::quip_proto::v1::Algorithm::Msa,
     // Union capacity. Routing still enforces each engine's own limits.
-    max_nodes: quip_miner_ane::ANE_MSA_IDENTITY.max_nodes,
+    max_nodes: quip_solver_ane::ANE_MSA_IDENTITY.max_nodes,
     max_edges: DEFAULT_MAX_EDGES,
     features: &["streaming", "governor"],
     adapt: METAL_MSA_ADAPT,
@@ -222,7 +222,7 @@ pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_metal::{
+/// use quip_solver_metal::{
 ///     Kernel, MetalSampler,
 ///     iokit_gov::UtilGovernor,
 ///     metal_device::MetalDevice,
@@ -298,7 +298,7 @@ impl MetalSampler {
     /// # Examples
     ///
     /// ```no_run
-    /// use quip_miner_metal::{
+    /// use quip_solver_metal::{
     ///     Kernel, MetalSampler,
     ///     iokit_gov::UtilGovernor,
     ///     metal_device::MetalDevice,
@@ -700,7 +700,7 @@ impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
 ///
 /// ```no_run
 /// use quip_solver_core::CommonArgs;
-/// use quip_miner_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
+/// use quip_solver_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
 ///
 /// let common = CommonArgs {
 ///     quip_coordinator: None,

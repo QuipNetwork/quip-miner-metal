@@ -8,12 +8,12 @@ from pathlib import Path
 HERE = Path(__file__).parent
 
 LOG = """\
-2026-09-22T10:00:00.000000Z DEBUG quip_miner_metal::streaming: prepared batch batch=40 cap=40 chunks=1 seed=Blocking
-2026-09-22T10:00:00.010000Z DEBUG quip_miner_metal::streaming: batch complete chunks=1 max_chunk_ms=9 total_ms=9
-2026-09-22T10:00:00.011000Z DEBUG quip_miner_metal::streaming: prepared batch batch=40 cap=40 chunks=1 seed=NonBlocking
-2026-09-22T10:00:00.020000Z DEBUG quip_miner_metal::streaming: batch complete chunks=1 max_chunk_ms=8 total_ms=8
-2026-09-22T10:00:00.021000Z DEBUG quip_miner_metal::streaming: prepared batch batch=40 cap=40 chunks=1 seed=NonBlocking
-2026-09-22T10:00:00.030000Z DEBUG quip_miner_metal::streaming: batch complete chunks=1 max_chunk_ms=8 total_ms=8
+2026-09-22T10:00:00.000000Z DEBUG quip_solver_metal::streaming: prepared batch batch=40 cap=40 chunks=1 seed=Blocking
+2026-09-22T10:00:00.010000Z DEBUG quip_solver_metal::streaming: batch complete chunks=1 max_chunk_ms=9 total_ms=9
+2026-09-22T10:00:00.011000Z DEBUG quip_solver_metal::streaming: prepared batch batch=40 cap=40 chunks=1 seed=NonBlocking
+2026-09-22T10:00:00.020000Z DEBUG quip_solver_metal::streaming: batch complete chunks=1 max_chunk_ms=8 total_ms=8
+2026-09-22T10:00:00.021000Z DEBUG quip_solver_metal::streaming: prepared batch batch=40 cap=40 chunks=1 seed=NonBlocking
+2026-09-22T10:00:00.030000Z DEBUG quip_solver_metal::streaming: batch complete chunks=1 max_chunk_ms=8 total_ms=8
 """
 
 

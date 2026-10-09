@@ -11,7 +11,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$out"
 uptime >"$out/$label.uptime"
 QUIP_BENCH_KERNEL=msa QUIP_BENCH_JOBS="$jobs" QUIP_BENCH_READS="$reads" \
-	QUIP_BENCH_SWEEPS="$sweeps" RUST_LOG=quip_miner_metal=debug \
+	QUIP_BENCH_SWEEPS="$sweeps" RUST_LOG=quip_solver_metal=debug \
 	cargo test --release --test msa_bench -- --ignored --nocapture \
 	>"$out/$label.log" 2>&1
 python3 "$here/parse.py" <"$out/$label.log" >"$out/$label.json"

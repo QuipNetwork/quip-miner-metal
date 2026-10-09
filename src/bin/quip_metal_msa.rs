@@ -11,8 +11,8 @@
 #![warn(clippy::expect_used)]
 
 use clap::Parser;
-use quip_miner_metal::{run_metal, MsaTag, METAL_MSA_IDENTITY};
 use quip_solver_core::CommonArgs;
+use quip_solver_metal::{run_metal, MsaTag, METAL_MSA_IDENTITY};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -37,7 +37,7 @@ struct Cli {
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
     if let Some(parent_pid) = cli.ane_worker {
-        return quip_miner_ane::worker_main(parent_pid);
+        return quip_solver_ane::worker_main(parent_pid);
     }
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("metal-{}", cli.device));

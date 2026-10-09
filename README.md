@@ -1,4 +1,4 @@
-# quip-miner-metal
+# quip-solver-metal
 
 Metal Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-metal-sa`), multi-spin coded SA
@@ -25,7 +25,7 @@ other coefficients, are scored on the host.
 | `quip-metal-gibbs` | heat-bath Gibbs |
 
 Prebuilt `arm64` binaries are attached to each
-[Release](https://gitlab.com/quip.network/quip-miner-metal/-/releases)
+[Release](https://gitlab.com/quip.network/quip-solver-metal/-/releases)
 (built best-effort on a macOS CI runner. See [`.gitlab-ci.yml`](.gitlab-ci.yml)).
 
 ## Build
@@ -104,7 +104,7 @@ key validation, and model checks.
 ## Multi-spin kernel (`quip-metal-msa`)
 
 `kernels/msa.metal` is a Metal port of the multi-spin coded simulated
-annealing in `quip-miner-cuda`'s `quip-cuda-msa` and `quip-miner-cpu`'s
+annealing in `quip-solver-cuda`'s `quip-cuda-msa` and `quip-solver-cpu`'s
 `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer, *Optimised simulated
 annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015). 32
 replicas share one 32-bit word per spin. The Metropolis test is an integer

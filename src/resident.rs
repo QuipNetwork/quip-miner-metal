@@ -394,7 +394,7 @@ impl Pool {
                         Origin::Stream => None,
                     };
                     tracing::info!(
-                        target: "quip_miner_metal::cascade_trace",
+                        target: "quip_solver_metal::cascade_trace",
                         ?index,
                         sweeps = checkpoint.position,
                         best = checkpoint.best,
@@ -408,7 +408,7 @@ impl Pool {
             }
             debug_assert_eq!(checkpoint.index, live.ticket.stage);
             tracing::debug!(
-                target: "quip_miner_metal::cascade_trace",
+                target: "quip_solver_metal::cascade_trace",
                 job = %String::from_utf8_lossy(&live.job.job_id),
                 stage = checkpoint.index,
                 best = checkpoint.best,
@@ -425,7 +425,7 @@ impl Pool {
                         Origin::Stream => None,
                     };
                     tracing::info!(
-                        target: "quip_miner_metal::cascade_trace",
+                        target: "quip_solver_metal::cascade_trace",
                         ?index,
                         sweeps,
                         best = checkpoint.best,
@@ -460,7 +460,7 @@ impl Pool {
         }
         for (old, new, units) in target_changes {
             tracing::debug!(
-                target: "quip_miner_metal::cascade_trace",
+                target: "quip_solver_metal::cascade_trace",
                 ?old,
                 ?new,
                 units,

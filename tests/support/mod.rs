@@ -375,7 +375,7 @@ pub(crate) fn miner_binary(name: &str) -> String {
             "build",
             "--release",
             "-p",
-            "quip-miner-metal",
+            "quip-solver-metal",
             "--bin",
             name,
         ])
