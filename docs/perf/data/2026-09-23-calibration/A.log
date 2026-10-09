@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 0.08s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/probe_screen.rs (target/release/deps/probe_screen-31d2414799d6b67c)
+
+running 1 test
+50000 nonces, 4 stages, target -14625068 milli, output docs/perf/data/2026-09-23-calibration/A.csv
+  producers, summed over threads: drawing 8.0 s, blocked on the device 53.4 s (10.3 s wall); 0.16 ms per instance
+stage 64x32: 50000 of 50000 jobs in 10.3 s = 4873.50 jobs/s; lead 0.03 s; wall_seconds=10.259567
+  producers, summed over threads: drawing 10.8 s, blocked on the device 71.4 s (13.8 s wall); 0.22 ms per instance
+stage 64x64: 50000 of 50000 jobs in 13.8 s = 3630.74 jobs/s; lead 0.02 s; wall_seconds=13.771311
+  producers, summed over threads: drawing 13.4 s, blocked on the device 108.9 s (20.5 s wall); 0.27 ms per instance
+stage 64x128: 50000 of 50000 jobs in 20.5 s = 2436.80 jobs/s; lead 0.03 s; wall_seconds=20.518701
+test probe_then_solve_on_fresh_nonces has been running for over 60 seconds
+  producers, summed over threads: drawing 18.3 s, blocked on the device 199.9 s (36.7 s wall); 0.37 ms per instance
+stage 64x256: 50000 of 50000 jobs in 36.7 s = 1361.58 jobs/s; lead 0.05 s; wall_seconds=36.722034
+wrote docs/perf/data/2026-09-23-calibration/A.csv
+test probe_then_solve_on_fresh_nonces ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 81.39s
+

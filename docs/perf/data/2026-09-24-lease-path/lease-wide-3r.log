@@ -1,0 +1,39 @@
+    Finished `release` profile [optimized] target(s) in 0.09s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/lease.rs (target/release/deps/lease-46a2f48e6a900157)
+    Finished `release` profile [optimized] target(s) in 0.07s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+lease: 162 credits, 4000 salts per lease, 14336 sweeps, target -14625068, backend_toml=""
+lease: t=10 salts=5719 rate=570.14/s results=0
+lease: t=20 salts=11467 rate=571.80/s results=0
+lease: t=30 salts=17216 rate=572.38/s results=0
+lease: t=40 salts=22967 rate=572.69/s results=0
+lease: t=50 salts=28706 rate=572.67/s results=0
+lease: t=60 salts=34439 rate=572.55/s results=0
+lease: t=70 salts=40185 rate=572.66/s results=0
+lease: t=80 salts=45942 rate=572.88/s results=0
+lease: t=90 salts=51692 rate=572.96/s results=0
+lease: t=100 salts=57461 rate=573.20/s results=0
+lease: t=110 salts=63199 rate=573.14/s results=0
+lease: t=120 salts=68948 rate=573.19/s results=0
+lease: t=130 salts=74695 rate=573.21/s results=0
+lease: t=140 salts=80437 rate=573.19/s results=0
+lease: t=150 salts=86182 rate=573.18/s results=0
+lease: t=160 salts=91946 rate=573.29/s results=0
+lease: t=170 salts=97700 rate=573.33/s results=0
+lease: t=180 salts=103458 rate=573.40/s results=0
+lease: t=190 salts=109205 rate=573.39/s results=0
+lease: t=200 salts=114685 rate=573.42/s results=0
+lease: t=210 salts=120487 rate=573.37/s results=0
+lease: t=220 salts=126238 rate=573.39/s results=0
+lease: t=230 salts=132047 rate=573.66/s results=0
+lease: t=240 salts=137778 rate=573.58/s results=0
+lease: t=250 salts=143530 rate=573.61/s results=0
+lease: t=260 salts=149277 rate=573.60/s results=0
+lease: t=270 salts=155036 rate=573.64/s results=0
+lease: t=280 salts=160780 rate=573.63/s results=0
+lease: t=290 salts=166536 rate=573.65/s results=0
+lease: t=300 salts=172318 rate=573.76/s results=0
+lease summary: salts 172320 in 300.3 s = 573.76 salts/s; miner CPU ms per salt 2.537; results 0 verified 0; leases finished 16

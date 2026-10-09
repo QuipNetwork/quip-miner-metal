@@ -1,0 +1,76 @@
+    Finished `release` profile [optimized] target(s) in 0.08s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/release/deps/quip_miner_metal-fc5244250143ee85)
+
+running 1 test
+test slots::tests::seeded_segments_calibration ... A-r0.10.csv: 200/2000 nonces, wall_seconds=9.047
+A-r0.10.csv: 400/2000 nonces, wall_seconds=25.205
+A-r0.10.csv: 600/2000 nonces, wall_seconds=40.909
+A-r0.10.csv: 800/2000 nonces, wall_seconds=56.459
+A-r0.10.csv: 1000/2000 nonces, wall_seconds=70.113
+A-r0.10.csv: 1200/2000 nonces, wall_seconds=78.922
+A-r0.10.csv: 1400/2000 nonces, wall_seconds=88.203
+A-r0.10.csv: 1600/2000 nonces, wall_seconds=96.877
+A-r0.10.csv: 1800/2000 nonces, wall_seconds=105.125
+A-r0.10.csv: 2000/2000 nonces, wall_seconds=113.312
+A-r0.10.csv: complete 2000 nonces, wall_seconds=113.312
+B-r0.10.csv: 200/2000 nonces, wall_seconds=8.366
+B-r0.10.csv: 400/2000 nonces, wall_seconds=16.803
+B-r0.10.csv: 600/2000 nonces, wall_seconds=25.233
+B-r0.10.csv: 800/2000 nonces, wall_seconds=33.733
+B-r0.10.csv: 1000/2000 nonces, wall_seconds=42.016
+B-r0.10.csv: 1200/2000 nonces, wall_seconds=50.347
+B-r0.10.csv: 1400/2000 nonces, wall_seconds=58.903
+B-r0.10.csv: 1600/2000 nonces, wall_seconds=67.364
+B-r0.10.csv: 1800/2000 nonces, wall_seconds=75.758
+B-r0.10.csv: 2000/2000 nonces, wall_seconds=86.618
+B-r0.10.csv: complete 2000 nonces, wall_seconds=86.618
+A-r0.15.csv: 200/2000 nonces, wall_seconds=9.123
+A-r0.15.csv: 400/2000 nonces, wall_seconds=17.949
+A-r0.15.csv: 600/2000 nonces, wall_seconds=26.296
+A-r0.15.csv: 800/2000 nonces, wall_seconds=35.019
+A-r0.15.csv: 1000/2000 nonces, wall_seconds=43.235
+A-r0.15.csv: 1200/2000 nonces, wall_seconds=51.439
+A-r0.15.csv: 1400/2000 nonces, wall_seconds=59.702
+A-r0.15.csv: 1600/2000 nonces, wall_seconds=67.822
+A-r0.15.csv: 1800/2000 nonces, wall_seconds=76.002
+A-r0.15.csv: 2000/2000 nonces, wall_seconds=85.157
+A-r0.15.csv: complete 2000 nonces, wall_seconds=85.157
+B-r0.15.csv: 200/2000 nonces, wall_seconds=8.794
+B-r0.15.csv: 400/2000 nonces, wall_seconds=17.007
+B-r0.15.csv: 600/2000 nonces, wall_seconds=25.467
+B-r0.15.csv: 800/2000 nonces, wall_seconds=37.765
+B-r0.15.csv: 1000/2000 nonces, wall_seconds=48.284
+B-r0.15.csv: 1200/2000 nonces, wall_seconds=57.008
+B-r0.15.csv: 1400/2000 nonces, wall_seconds=65.695
+B-r0.15.csv: 1600/2000 nonces, wall_seconds=74.462
+B-r0.15.csv: 1800/2000 nonces, wall_seconds=83.241
+B-r0.15.csv: 2000/2000 nonces, wall_seconds=93.336
+B-r0.15.csv: complete 2000 nonces, wall_seconds=93.336
+A-r0.25.csv: 200/2000 nonces, wall_seconds=10.590
+A-r0.25.csv: 400/2000 nonces, wall_seconds=22.327
+A-r0.25.csv: 600/2000 nonces, wall_seconds=31.023
+A-r0.25.csv: 800/2000 nonces, wall_seconds=39.988
+A-r0.25.csv: 1000/2000 nonces, wall_seconds=48.484
+A-r0.25.csv: 1200/2000 nonces, wall_seconds=58.428
+A-r0.25.csv: 1400/2000 nonces, wall_seconds=68.625
+A-r0.25.csv: 1600/2000 nonces, wall_seconds=78.422
+A-r0.25.csv: 1800/2000 nonces, wall_seconds=87.045
+A-r0.25.csv: 2000/2000 nonces, wall_seconds=95.479
+A-r0.25.csv: complete 2000 nonces, wall_seconds=95.479
+B-r0.25.csv: 200/2000 nonces, wall_seconds=8.542
+B-r0.25.csv: 400/2000 nonces, wall_seconds=16.802
+B-r0.25.csv: 600/2000 nonces, wall_seconds=26.591
+B-r0.25.csv: 800/2000 nonces, wall_seconds=35.668
+B-r0.25.csv: 1000/2000 nonces, wall_seconds=49.197
+B-r0.25.csv: 1200/2000 nonces, wall_seconds=60.475
+B-r0.25.csv: 1400/2000 nonces, wall_seconds=71.260
+B-r0.25.csv: 1600/2000 nonces, wall_seconds=82.799
+B-r0.25.csv: 1800/2000 nonces, wall_seconds=93.822
+B-r0.25.csv: 2000/2000 nonces, wall_seconds=106.214
+B-r0.25.csv: complete 2000 nonces, wall_seconds=106.214
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 192 filtered out; finished in 580.20s
+

@@ -1,0 +1,1 @@
+{"batches": 50, "batch_size": 20, "steady_jobs_per_s": 5119.658968053535, "gpu_ms_per_batch_median": 1, "gpu_ms_per_job": 0.05, "wall_ms_per_batch": 3.906510204058354, "gpu_ms_per_batch_mean": 1.68}

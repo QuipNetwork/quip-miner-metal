@@ -209,7 +209,7 @@ to 0.051 on P(valid).
 
 The first bench set ran into an Apple Neural Engine job. The `ane-grid.done`
 marker appeared at 09:06:58 and the study runs went ahead. A different
-`quip_miner_ane` test process, PID 82068, started later and held
+`quip_solver_ane` test process, PID 82068, started later and held
 `ANECompilerService` at 98% of a core through the first bench set. That set
 reported 4.43 jobs per second at 128 reads and 16,384 sweeps, 29% below the
 documented rate, and it showed a super-linear slowdown from 8,192 to 16,384

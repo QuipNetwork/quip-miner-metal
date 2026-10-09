@@ -466,12 +466,12 @@ These runs do not show a qualifying rate across mining jobs.
 
 ### Comparison with the reference miner
 
-[MR 27](https://gitlab.com/quip.network/quip-miner-cuda/-/merge_requests/27)
+[MR 27](https://gitlab.com/quip.network/quip-solver-cuda/-/merge_requests/27)
 sets the `CUDA` miner to 7,392–29,568 adaptive sweeps. It uses 128 reads.
 That target and topology select 29,053 sweeps there.
 Both miners use ordered color updates. Both use Metropolis acceptance.
 
-Source inspection points to a benchmark mismatch in [MR 26](https://gitlab.com/quip.network/quip-miner-cuda/-/merge_requests/26).
+Source inspection points to a benchmark mismatch in [MR 26](https://gitlab.com/quip.network/quip-solver-cuda/-/merge_requests/26).
 The default benchmark preset permits fields in `{-1, 0, 1}`. It has 41,515
 edges. The captured live problem has zero fields. It has 41,514 edges.
 The MR does not publish the full command. It also omits the raw records needed

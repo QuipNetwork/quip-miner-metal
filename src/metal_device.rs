@@ -69,6 +69,12 @@ pub struct MetalDevice {
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
     pub(crate) msa: ComputePipelineState,
+    /// Multi-spin slot-table dispatch with per-slot state and schedules.
+    pub(crate) msa_slots: ComputePipelineState,
+    /// One CSR topology, replaced when `n`, edges, or the colouring flag change.
+    pub(crate) topology_cache: crate::sampler::TopologyCache,
+    /// Multi-spin batch buffers returned after their command buffers retire.
+    pub(crate) buffer_pool: std::sync::Arc<crate::sampler::BufferPool>,
 }
 
 impl MetalDevice {
@@ -90,7 +96,7 @@ impl MetalDevice {
     /// # Examples
     ///
     /// ```no_run
-    /// use quip_miner_metal::metal_device::MetalDevice;
+    /// use quip_solver_metal::metal_device::MetalDevice;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let device = MetalDevice::open(0)?;
@@ -112,6 +118,7 @@ impl MetalDevice {
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
         let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
+        let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let queue = device.new_command_queue();
 
         Ok(Self {
@@ -122,6 +129,9 @@ impl MetalDevice {
             gibbs,
             gibbs_parallel,
             msa,
+            msa_slots,
+            topology_cache: crate::sampler::TopologyCache::default(),
+            buffer_pool: std::sync::Arc::new(crate::sampler::BufferPool::default()),
         })
     }
 
@@ -135,7 +145,7 @@ impl MetalDevice {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_metal::metal_device::MetalDevice;
+    /// use quip_solver_metal::metal_device::MetalDevice;
     ///
     /// let a = MetalDevice::device_count();
     /// let b = MetalDevice::device_count();
@@ -158,7 +168,7 @@ impl MetalDevice {
     /// # Examples
     ///
     /// ```no_run
-    /// use quip_miner_metal::metal_device::MetalDevice;
+    /// use quip_solver_metal::metal_device::MetalDevice;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// MetalDevice::check(0)?;
@@ -247,25 +257,34 @@ mod tests {
     }
 
     #[test]
-    fn msa_pipeline_compiles_and_admits_256_threads() {
+    fn msa_static_threadgroup_memory_is_the_lane_totals_only() {
         if MetalDevice::device_count() == 0 {
             return;
         }
         let dev = MetalDevice::open(0).unwrap();
-        // The host dispatches 256 threads per multi-spin threadgroup; a
-        // pipeline that admits fewer would silently shrink every colour class
-        // stride and break the persistent-RNG layout.
-        assert!(dev.msa.max_total_threads_per_threadgroup() >= 256);
-        // Static threadgroup arrays (row + cut) must leave room for the
-        // largest advertised N at 4 bytes per spin under the 32 KB cap.
-        let static_bytes = dev.msa.static_threadgroup_memory_length() as usize;
-        assert!(
-            static_bytes <= 8192 + 64 * 4 + 64,
-            "static tg bytes {static_bytes}"
-        );
-        assert!(
-            static_bytes + 6016 * 4 <= dev.device.max_threadgroup_memory_length() as usize,
-            "6016 spins do not fit beside {static_bytes} static bytes"
-        );
+        for pipeline in [&dev.msa, &dev.msa_slots] {
+            assert!(pipeline.static_threadgroup_memory_length() as usize <= 32 * 4 + 16);
+        }
+    }
+
+    #[test]
+    fn msa_pipeline_compiles_and_admits_at_least_256_threads() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = MetalDevice::open(0).unwrap();
+        // The host requests 1,024 threads per multi-spin threadgroup and clamps
+        // to the pipeline maximum. Require support for at least 256 threads.
+        for pipeline in [&dev.msa, &dev.msa_slots] {
+            assert!(pipeline.max_total_threads_per_threadgroup() >= 256);
+            // Static threadgroup lane totals must leave room for the
+            // largest advertised N at 4 bytes per spin under the 32 KB cap.
+            let static_bytes = pipeline.static_threadgroup_memory_length() as usize;
+            assert!(static_bytes <= 144, "static tg bytes {static_bytes}");
+            assert!(
+                static_bytes + 6016 * 4 <= dev.device.max_threadgroup_memory_length() as usize,
+                "6016 spins do not fit beside {static_bytes} static bytes"
+            );
+        }
     }
 }

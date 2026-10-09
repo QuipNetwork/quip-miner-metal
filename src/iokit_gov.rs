@@ -168,7 +168,7 @@ impl UtilGovernor {
     /// sets the scale while yielding is off.
     ///
     /// ```
-    /// use quip_miner_metal::iokit_gov::UtilGovernor;
+    /// use quip_solver_metal::iokit_gov::UtilGovernor;
     ///
     /// let mut gov = UtilGovernor::start(0, 80, false);
     /// assert!((gov.budget_scale() - 0.8).abs() < 1e-9);
@@ -202,6 +202,7 @@ impl UtilGovernor {
     pub fn stop(&mut self) {
         self.knobs.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
+            h.thread().unpark();
             // A panicking poll thread is not fatal: the governor's whole
             // contract is to degrade to util 0 (see the module docs), which is
             // what a dead thread produces anyway — `last_util` simply stops
@@ -270,7 +271,8 @@ fn poll_loop(_device_index: u32, knobs: &Knobs) {
         } else {
             REPORTING_POLL
         };
-        thread::sleep(interval);
+        // stop() leaves a wake token even if it races with entering this wait.
+        thread::park_timeout(interval);
     }
 }
 
@@ -442,7 +444,15 @@ fn query_iokit_gpu_utilization() -> u32 {
 /// back to a conservative default when this returns `None`, so a miss costs
 /// concurrency tuning, never correctness. Never panics — same "return nothing
 /// on any error" contract as [`query_iokit_gpu_utilization`].
+///
+/// The core count is fixed hardware, and the registry query costs tens of
+/// microseconds, so the first answer is kept for the life of the process.
 pub fn gpu_core_count() -> Option<usize> {
+    static CORES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CORES.get_or_init(query_gpu_core_count)
+}
+
+fn query_gpu_core_count() -> Option<usize> {
     let mut cores: Option<usize> = None;
     for_each_accelerator_properties(|props| {
         // SAFETY: `props` is a live, borrowed property dictionary for the whole
@@ -542,6 +552,21 @@ mod tests {
         gov.stop();
     }
 
+    #[test]
+    fn stop_wakes_the_reporting_poller() {
+        let mut gov = UtilGovernor::start(0, 100, false);
+        gov.record_gpu_busy_us(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // A drained report proves the poller has entered its sampling loop.
+        while gov.knobs.busy_us.load(Ordering::Relaxed) != 0 {
+            assert!(Instant::now() < deadline, "poller did not sample");
+            thread::yield_now();
+        }
+        let started = Instant::now();
+        gov.stop();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     /// Utilization reporting must not depend on `yielding`: `Status.utilization`
     /// is the miner's health report, and a busy non-yielding miner reporting 0%
     /// is a lie the coordinator cannot detect. Only the range is asserted — the
@@ -616,16 +641,6 @@ mod tests {
         assert_eq!(self_util_pct(1_000, 0), 0);
         // Idle.
         assert_eq!(self_util_pct(0, 1_000), 0);
-    }
-
-    /// The subtraction that turns whole-device load into external-only load
-    /// must floor at 0, never wrap.
-    #[test]
-    fn external_util_floors_at_zero() {
-        // Sensor says 40%, we accounted for 90% of it: nobody else is waiting.
-        assert_eq!(40_u32.saturating_sub(90), 0);
-        // Sensor says 70%, we caused 30%: 40 points belong to someone else.
-        assert_eq!(70_u32.saturating_sub(30), 40);
     }
 
     /// End-to-end through the poll thread: a batch report must show up as

@@ -1,4 +1,4 @@
-# quip-miner-metal
+# quip-solver-metal
 
 Metal Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-metal-sa`), multi-spin coded SA
@@ -10,10 +10,11 @@ platform, so this crate does not build anywhere else and offers no stub or CPU
 fallback. A non-macOS build fails while compiling the Apple-only dependencies.
 Build and run on Apple Silicon.
 
-Energies are scored on the host with the canonical
-`quip_solver_core::quip_protocol::scoring::energy_milli` so results match
-consensus; there is no GPU energy kernel (Metal Shading Language has no
-`double`).
+Energies match consensus `quip_solver_core::quip_protocol::scoring::energy_milli`.
+The multi-spin kernel computes each read's energy on the device in integer
+milli units when every coefficient is a whole number in `i8` range, and the
+host rescores 1 job in 1,000 to check it. Other kernels, and graphs with
+other coefficients, are scored on the host.
 
 ## Binaries
 
@@ -24,8 +25,8 @@ consensus; there is no GPU energy kernel (Metal Shading Language has no
 | `quip-metal-gibbs` | heat-bath Gibbs |
 
 Prebuilt `arm64` binaries are attached to each
-[Release](https://gitlab.com/quip.network/quip-miner-metal/-/releases)
-(built best-effort on a macOS CI runner; see [`.gitlab-ci.yml`](.gitlab-ci.yml)).
+[Release](https://gitlab.com/quip.network/quip-solver-metal/-/releases)
+(built best-effort on a macOS CI runner. See [`.gitlab-ci.yml`](.gitlab-ci.yml)).
 
 ## Build
 
@@ -34,8 +35,14 @@ cargo build --release
 ```
 
 The solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) comes
-from crates.io at a pinned version, published from
-[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core).
+from crates.io at version 0.0.2-rc3, published from
+[quip-solver-core](https://gitlab.com/quip.network/quip-solver-core). It
+speaks protocol version 2, so the coordinator must also speak version 2.
+
+The miners accept `ISING_GENERATE` salt leases. The session draws each salt's
+problem from the lease, runs it through the same stream as a plain job, and
+sends a `Result` only for a salt whose reads meet the target. Each lease ends
+with one `LeaseDone` summary and a credit refund.
 
 ## Running
 
@@ -45,7 +52,7 @@ from crates.io at a pinned version, published from
 quip-metal-sa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
-**Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
+**Driver / fixed-input (run in isolation).** Use the coordinator's
 `drive` harness pointed at the binary — `--source random` for golden-drawn
 problems, `--source list <jsonl>` for a fixed replay:
 
@@ -67,16 +74,46 @@ quip-metal-sa --check          # probe the backend is runnable
 All binaries accept `enable_ane` and `enable_metal` in `backend_toml`. Both default to `true`.
 Only MSA can run on the ANE. See [engine selection](docs/combined-engines.md) for modes, limits, and invalid settings.
 
+## Probe cascade (`quip-metal-msa`)
+
+Metal MSA streams always use the resident runner. Jobs stay in GPU slots
+between probe checkpoints, and kept jobs continue to the full sweep budget.
+Four workers prepare jobs before admission. The sampler saves controller
+state between streams for the process lifetime.
+
+No configuration turns the cascade off. A leftover `cascade` key logs the
+unknown-field warning. Jobs whose coefficients have no exact device-energy
+form run once at full budget through the batch path after live slots drain.
+Fractional coefficients are one example.
+Other kernels and the Apple Neural Engine use separate paths.
+
+| key | default | purpose |
+|-----|---------|---------|
+| `cascade_stages` | `[32, 256]` | sweep budget of each probe anneal |
+| `cascade_keep` | `2000` | probe-to-full denominator |
+| `cascade_keep_min` | `1000` | floor for the probe-to-full keep |
+| `cascade_keep_max` | `30000` | ceiling for the probe-to-full keep |
+| `cascade_audit` | `200` | audit lane denominator |
+| `cascade_yield_per_million` | none | expected nonces per million below target |
+
+These keys enter through `backend_toml`.
+The target energy comes from the session target, not from a key.
+See [probe cascade](docs/cascade.md) for slots, schedules, controller lifetime,
+key validation, and model checks.
+
 ## Multi-spin kernel (`quip-metal-msa`)
 
 `kernels/msa.metal` is a Metal port of the multi-spin coded simulated
-annealing in `quip-miner-cuda`'s `quip-cuda-msa` and `quip-miner-cpu`'s
+annealing in `quip-solver-cuda`'s `quip-cuda-msa` and `quip-solver-cpu`'s
 `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer, *Optimised simulated
 annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015). 32
 replicas share one 32-bit word per spin. The Metropolis test is an integer
-comparison against a per-rung geometric threshold table. The kernel updates
-spins one colour class at a time (the greedy colouring the Gibbs kernel
-uses). One threadgroup anneals one 32-replica word of one problem in
+comparison against an inline geometric threshold draw. The kernel drives
+spins one colour class at a time, using the Advantage2 four-colouring by
+default and falling back to the greedy colouring the Gibbs kernel uses when
+the graph is not Advantage2. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`,
+or `off` (case-insensitive) to force the greedy colouring. One threadgroup
+anneals one 32-replica word of one problem in
 threadgroup memory. A 128-read job dispatches four threadgroups per problem.
 
 The CUDA kernel packs 64 replicas per `u64` in 99 KB of shared memory. Apple
@@ -85,8 +122,10 @@ per spin exceeds for Advantage2's 4577 spins, so this port uses 32-bit
 words. See `docs/metal-msa-design.md` for the
 full comparison.
 
-The host rescores every sample with `energy_milli`, as for the other
-kernels, because the device does not compute energies. Couplings must be in
+The MSA kernel computes on-device energies for whole coefficients. The host
+rescores 1 job in 1,000 with `energy_milli` to check those energies. Other
+kernels and graphs with fractional coefficients use host rescoring.
+Couplings must be in
 `{-1, 1}` and fields in `{-1, 0, 1}`, which v0.3 problems meet. The CSR
 degree must be at most 20. The miner rejects denser graphs as over capacity
 so the coordinator routes them elsewhere.

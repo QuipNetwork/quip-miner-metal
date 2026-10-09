@@ -1,0 +1,41 @@
+    Finished `release` profile [optimized] target(s) in 0.09s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/release/deps/quip_miner_metal-fc5244250143ee85)
+
+running 1 test
+test sampler::tests::seeded_start_from_probe_spins_against_cold_anneal ... default beta range: hot=0.01732867951399863, cold=6.516984613320867
+standard 32-rung override parity passed
+seeded experiment: 100/2000 nonces complete, all arms
+seeded experiment: 200/2000 nonces complete, all arms
+seeded experiment: 300/2000 nonces complete, all arms
+seeded experiment: 400/2000 nonces complete, all arms
+seeded experiment: 500/2000 nonces complete, all arms
+seeded experiment: 600/2000 nonces complete, all arms
+seeded experiment: 700/2000 nonces complete, all arms
+seeded experiment: 800/2000 nonces complete, all arms
+seeded experiment: 900/2000 nonces complete, all arms
+seeded experiment: 1000/2000 nonces complete, all arms
+seeded experiment: 1100/2000 nonces complete, all arms
+seeded experiment: 1200/2000 nonces complete, all arms
+seeded experiment: 1300/2000 nonces complete, all arms
+seeded experiment: 1400/2000 nonces complete, all arms
+seeded experiment: 1500/2000 nonces complete, all arms
+seeded experiment: 1600/2000 nonces complete, all arms
+seeded experiment: 1700/2000 nonces complete, all arms
+seeded experiment: 1800/2000 nonces complete, all arms
+seeded experiment: 1900/2000 nonces complete, all arms
+seeded experiment: 2000/2000 nonces complete, all arms
+seeded beta_r=0.25 tail=2048 n=2000: mean_difference_milli=25261 standard_error_milli=275.3068041625726 deeper=36 equal=21 shallower=1943 target_hits=0 cold_target_hits=1
+seeded beta_r=0.25 tail=4096 n=2000: mean_difference_milli=10303 standard_error_milli=248.68055112584523 deeper=299 equal=98 shallower=1603 target_hits=0 cold_target_hits=1
+seeded beta_r=0.25 tail=14304 n=2000: mean_difference_milli=-7290 standard_error_milli=215.1862043702515 deeper=1487 equal=134 shallower=379 target_hits=2 cold_target_hits=1
+seeded beta_r=0.4 tail=2048 n=2000: mean_difference_milli=50243 standard_error_milli=350.86611266194865 deeper=5 equal=0 shallower=1995 target_hits=0 cold_target_hits=1
+seeded beta_r=0.4 tail=4096 n=2000: mean_difference_milli=28663 standard_error_milli=294.9283079892921 deeper=27 equal=17 shallower=1956 target_hits=0 cold_target_hits=1
+seeded beta_r=0.4 tail=14304 n=2000: mean_difference_milli=1860 standard_error_milli=251.64630522116897 deeper=798 equal=154 shallower=1048 target_hits=0 cold_target_hits=1
+seeded beta_r=0.6 tail=2048 n=2000: mean_difference_milli=116548 standard_error_milli=462.81415975879196 deeper=0 equal=0 shallower=2000 target_hits=0 cold_target_hits=1
+seeded beta_r=0.6 tail=4096 n=2000: mean_difference_milli=86099 standard_error_milli=414.33070664293473 deeper=0 equal=0 shallower=2000 target_hits=0 cold_target_hits=1
+seeded beta_r=0.6 tail=14304 n=2000: mean_difference_milli=45498 standard_error_milli=362.1236871324371 deeper=9 equal=3 shallower=1988 target_hits=0 cold_target_hits=1
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 168 filtered out; finished in 687.60s
+

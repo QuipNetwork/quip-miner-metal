@@ -3,10 +3,10 @@
 //! Kernels are the original v0.2 Metal sources (`GPU/metal_kernels.metal` /
 //! `GPU/metal_gibbs.metal`, copied verbatim into `kernels/`): int8-quantized
 //! CSR, D-Wave incremental delta-energy SA / color-block Gibbs, bit-packed
-//! thread-local state, one thread per read. Solution energies are always
-//! scored on the host with
-//! [`quip_solver_core::quip_protocol::scoring::energy_milli`] (f64
-//! consensus). There is no GPU energy kernel (MSL has no `double`).
+//! thread-local state, one thread per read. The multi-spin kernel computes
+//! energies on the device for whole-unit graphs, with one job in 1,000 audited
+//! on the host. SA, Gibbs, and non-integer graphs are scored on the host with
+//! [`quip_solver_core::quip_protocol::scoring::energy_milli`] (f64 consensus).
 //!
 //! # Batched dispatch (throughput)
 //!
@@ -47,7 +47,7 @@ pub enum Kernel {
 
 use crate::topology::{fill_h_j, SelfFeedingTopology};
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-use quip_solver_core::quip_protocol::scoring::energy_milli;
+pub(crate) use quip_solver_core::quip_protocol::scoring::energy_milli;
 
 /// Failure from a Metal sample attempt: capacity refusal or driver fault.
 #[derive(Debug, Error)]
@@ -84,7 +84,7 @@ impl SampleError {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_metal::sampler::SampleError;
+    /// use quip_solver_metal::sampler::SampleError;
     /// use quip_solver_core::SampleError as HarnessSampleError;
     ///
     /// let err = SampleError::TooLarge("nodes > SA cap".into());
@@ -152,21 +152,22 @@ const _: () = assert!(
     MSA_LANES == SIMD_WIDTH,
     "simd_rounded_reads must produce whole 32-lane multi-spin words"
 );
-/// Threads per multi-spin threadgroup: they split each colour class's nodes.
-/// Also the per-threadgroup RNG stream count the persistent buffer is sized by.
-const MSA_THREADS: usize = 256;
-/// Static threadgroup bytes `msa_anneal` declares: an 8192-byte threshold row
-/// plus 64 `uint` cut values. `msa_pipeline_compiles_and_admits_256_threads`
-/// checks the compiled figure against a bound using the literal 8448 bytes,
+/// 1,024 threads split each colour class, bounded at dispatch by the pipeline's
+/// `max_total_threads_per_threadgroup`. The persistent RNG buffer is sized by
+/// that clamped width, not by this constant.
+pub(crate) const MSA_THREADS: usize = 1024;
+/// Static threadgroup bytes `msa_anneal` declares: 32 atomic lane totals.
+/// `msa_pipeline_compiles_and_admits_at_least_256_threads` checks the compiled figure
+/// against a bound using the literal 144 bytes (16 bytes of alignment headroom),
 /// rather than reading this constant.
-const MSA_STATIC_TG_BYTES: usize = 8192 + 64 * 4;
+pub(crate) const MSA_STATIC_TG_BYTES: usize = MSA_LANES * 4;
 /// Threadgroup memory every Apple GPU family offers per threadgroup, bytes.
 /// There is no opt-in above it (CUDA's `MAX_DYNAMIC_SHARED_SIZE_BYTES` has no
 /// counterpart), which is why the kernel uses 32-bit words: one `u64` per
 /// spin does not fit Advantage2's 4577 spins.
 const APPLE_TG_MEMORY_BYTES: usize = 32 * 1024;
 /// Multi-spin kernel `N` cap: `N * 4` bytes of spin words must fit beside the
-/// static arrays under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 8448 = 32,512).
+/// lane totals under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 128 = 24,192).
 ///
 /// `crate::METAL_MSA_IDENTITY` advertises this same cap, so the identity
 /// const and the dispatch guard have one source.
@@ -190,14 +191,12 @@ pub(crate) const MSA_MAX_DEG: usize = 20;
 /// `f64`s, so `u32::MAX` sweeps is a ~34 GB allocation — and then drives that
 /// many kernel sweeps, i.e. both an OOM and a GPU-watchdog denial of service.
 ///
-/// 65536 is 32x the `max_sweeps: 2048` in `METAL_ADAPT` (`lib.rs`).
-/// `quip-solver-core` doubles the resolved sweeps for Gibbs
-/// (`GIBBS_SWEEP_MULTIPLIER`), so the largest legitimate adapt-driven job
-/// reaching here is 4096 — 16x of headroom — while bounding the schedule to
-/// 64Ki `f64` + 64Ki `f32` (~768 KiB). Raise this only together with
-/// `METAL_ADAPT.max_sweeps`; it must stay >= `2 * METAL_ADAPT.max_sweeps`,
-/// which a `const _: () = assert!(..)` in `lib.rs` enforces at compile time.
-pub(crate) const MAX_SWEEPS: usize = 65_536;
+/// 1,048,576 admits the deep final stage of the chain-gated cascade, where the
+/// catch rate on recent winners still rises past 131,072 sweeps. It bounds the
+/// schedule to 1Mi `f64` + 1Mi `f32` (~12 MiB). It must stay at least
+/// `2 * METAL_ADAPT.max_sweeps`, which a `const _: () = assert!(..)` in
+/// `lib.rs` enforces at compile time.
+pub(crate) const MAX_SWEEPS: usize = 1_048_576;
 
 /// Target GPU time for one command buffer, in milliseconds.
 ///
@@ -345,6 +344,25 @@ fn chunk_plan(
     let num_betas = dims.num_betas.max(1);
     let per_beta =
         (dims.num_threads as f64) * (dims.sweeps_per.max(1) as f64) * (dims.n.max(1) as f64);
+    let betas_per_chunk = dispatch_beta_limit(kernel, per_beta, groups, in_flight, num_betas);
+
+    let mut plan = Vec::new();
+    let mut start = 0;
+    while start < num_betas {
+        let count = betas_per_chunk.min(num_betas - start);
+        plan.push((start, count));
+        start += count;
+    }
+    plan
+}
+
+fn dispatch_beta_limit(
+    kernel: Kernel,
+    per_beta: f64,
+    groups: usize,
+    in_flight: usize,
+    num_betas: i32,
+) -> i32 {
     // Concurrent batches share the aggregate rate at their combined occupancy.
     // Reserve the full stream window even while priming or draining it.
     let in_flight = in_flight.max(1);
@@ -355,17 +373,19 @@ fn chunk_plan(
         clippy::cast_possible_truncation,
         reason = "clamped to 1..=num_betas immediately below"
     )]
-    let betas_per_chunk =
-        ((budget / per_beta.max(1.0)).floor() as i64).clamp(1, i64::from(num_betas)) as i32;
+    let limit = ((budget / per_beta.max(1.0)).floor() as i64).clamp(1, i64::from(num_betas)) as i32;
+    limit
+}
 
-    let mut plan = Vec::new();
-    let mut start = 0;
-    while start < num_betas {
-        let count = betas_per_chunk.min(num_betas - start);
-        plan.push((start, count));
-        start += count;
-    }
-    plan
+/// Bound slot commands with the batch estimate, reserving both resident pools.
+pub(crate) fn msa_step_limit(n: usize, groups: usize, slice: usize) -> usize {
+    dispatch_beta_limit(
+        Kernel::Msa,
+        groups as f64 * n.max(1) as f64,
+        groups,
+        2,
+        slice.clamp(1, MAX_SWEEPS) as i32,
+    ) as usize
 }
 
 /// Whether Gibbs uses the chromatic (node-parallel) kernel — the default.
@@ -392,16 +412,26 @@ pub(crate) fn gibbs_node_parallel() -> bool {
     })
 }
 
-/// Experimental MSA schedule. Read once per process so a streaming session
-/// keeps the same update order. Other kernels always use their usual coloring.
+/// Parses `QUIP_METAL_MSA_FOUR_COLOR`: on unless `0`, `false`, or `off`.
+fn four_color_from(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the multi-spin MSA kernel uses the Advantage2 four-colouring — the
+/// default. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`, or `off`
+/// (case-insensitive) to disable it and fall back to the greedy colouring.
+/// `build_with_advantage2_coloring` already falls back to the greedy colouring
+/// when the graph is not Advantage2.
+///
+/// Read once per process so a streaming session keeps the same update order.
+/// Other kernels always use their usual coloring.
 fn msa_four_color() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("QUIP_METAL_MSA_FOUR_COLOR").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
+    *ENABLED
+        .get_or_init(|| four_color_from(std::env::var("QUIP_METAL_MSA_FOUR_COLOR").ok().as_deref()))
 }
 
 /// Largest `N` the kernel's fixed-size arrays admit.
@@ -421,11 +451,36 @@ fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     }
 }
 
+/// Largest `sum |h| + sum |J|` in whole units for which the kernel's `int`
+/// energy cannot overflow: every term is at most 1000 in magnitude per unit.
+pub(crate) const DEVICE_ENERGY_MAX_UNITS: f64 = (i32::MAX / 1000) as f64;
+
+/// Whether the multi-spin kernel's energy equals consensus `energy_milli` for
+/// `graph`. The kernel truncates each coefficient to `i8` and sums in `int`,
+/// so it matches only when every coefficient is a whole number in `i8` range
+/// and the total magnitude cannot overflow. Consensus instances always pass.
+pub(crate) fn device_energy_exact(graph: &IsingGraph) -> bool {
+    let whole = |v: f64| v.is_finite() && v.fract() == 0.0 && (-128.0..=127.0).contains(&v);
+    let mut units = 0.0;
+    for &v in graph.h.iter().chain(graph.j.iter()) {
+        if !whole(v) {
+            return false;
+        }
+        units += v.abs();
+    }
+    units <= DEVICE_ENERGY_MAX_UNITS
+}
+
+/// Jobs harvested with device energies so far, for the 1-in-1,000 audit.
+static ENERGY_AUDIT_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// One device-energy job in this many is rescored on the host.
+const ENERGY_AUDIT_EVERY: u64 = 1000;
+
 /// Geometric beta schedule cast to f32 for kernel upload, plus sweeps-per-beta.
 ///
 /// Uses the shared f64 schedule and casts each element to f32 — bit-identical
 /// to the prior in-crate f32 schedule.
-fn build_beta_schedule(
+pub(crate) fn build_beta_schedule(
     graph: &IsingGraph,
     num_sweeps: usize,
     sweeps_per_beta: usize,
@@ -449,7 +504,7 @@ fn build_beta_schedule(
 /// zero past its end (i.e. `+1`, the initialized value) instead of panicking:
 /// the caller sizes both the allocation and the harvest count from the same
 /// `packed_size`, so a mismatch is a bug, not a reason to abort the miner.
-fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
+pub(crate) fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
     let mut spins = vec![1i8; n];
     for (i, s) in spins.iter_mut().enumerate() {
         let byte = packed.get(i >> 3).copied().unwrap_or(0) as u8;
@@ -459,9 +514,163 @@ fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
     spins
 }
 
+/// One built topology and the device buffers that depend only on its edges.
+#[derive(Debug)]
+pub(crate) struct CachedTopology {
+    pub(crate) n: usize,
+    pub(crate) edges: std::sync::Arc<[(usize, usize)]>,
+    pub(crate) four_color: bool,
+    pub(crate) topo: SelfFeedingTopology,
+    pub(crate) colors: Vec<metal::Buffer>,
+    pub(crate) row: metal::Buffer,
+    pub(crate) col: metal::Buffer,
+}
+
+/// Single cached topology. A miss replaces the entry.
+#[derive(Debug, Default)]
+pub(crate) struct TopologyCache {
+    slot: std::sync::Mutex<Option<std::sync::Arc<CachedTopology>>>,
+}
+
+impl TopologyCache {
+    pub(crate) fn get_or_build(
+        &self,
+        device: &crate::metal_device::MetalDevice,
+        graph: &IsingGraph,
+        four_color: bool,
+    ) -> std::sync::Arc<CachedTopology> {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = slot.as_ref() {
+            if entry.n == graph.num_nodes()
+                && entry.four_color == four_color
+                && entry.edges == graph.edges
+            {
+                return std::sync::Arc::clone(entry);
+            }
+        }
+        let cached = std::sync::Arc::new(build_cached_topology(device, graph, four_color));
+        *slot = Some(std::sync::Arc::clone(&cached));
+        cached
+    }
+}
+
+fn build_cached_topology(
+    device: &crate::metal_device::MetalDevice,
+    graph: &IsingGraph,
+    four_color: bool,
+) -> CachedTopology {
+    let topo = if four_color {
+        SelfFeedingTopology::build_with_advantage2_coloring(graph)
+    } else {
+        SelfFeedingTopology::build(graph)
+    };
+    let colors = [&topo.colors.starts, &topo.colors.counts, &topo.colors.nodes]
+        .into_iter()
+        .map(|values| device.new_buffer_from_slice(&pad_i32(values)))
+        .collect();
+    let zero = [0i32];
+    let base_row: &[i32] = if topo.row_ptr.is_empty() {
+        &zero
+    } else {
+        &topo.row_ptr
+    };
+    let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
+    let row = device.new_buffer_from_slice(base_row);
+    let col = device.new_buffer_from_slice(base_col);
+    CachedTopology {
+        n: graph.num_nodes(),
+        edges: std::sync::Arc::clone(&graph.edges),
+        four_color,
+        topo,
+        colors,
+        row,
+        col,
+    }
+}
+
+/// Free shared-storage buffers for later multi-spin batches. At most 64.
+#[derive(Debug, Default)]
+pub(crate) struct BufferPool {
+    free: std::sync::Mutex<Vec<metal::Buffer>>,
+}
+
+impl BufferPool {
+    /// Smallest free buffer with `len <= length <= 2 * len`, else a new shared buffer.
+    pub(crate) fn take(&self, device: &metal::DeviceRef, len: u64) -> metal::Buffer {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut best_index = None;
+        let mut best_len = u64::MAX;
+        for (index, buf) in free.iter().enumerate() {
+            let length = buf.length();
+            if length >= len && length <= len.saturating_mul(2) && length < best_len {
+                best_index = Some(index);
+                best_len = length;
+            }
+        }
+        if let Some(index) = best_index {
+            return free.swap_remove(index);
+        }
+        drop(free);
+        device.new_buffer(len, metal::MTLResourceOptions::StorageModeShared)
+    }
+
+    /// Keep `buf` if the pool holds fewer than 64 buffers.
+    pub(crate) fn give(&self, buf: metal::Buffer) {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if free.len() < 64 {
+            free.push(buf);
+        }
+    }
+}
+
+/// Copy `data` into a pooled shared buffer.
+///
+/// An empty slice becomes a 4-byte zero stub, matching
+/// [`crate::metal_device::MetalDevice::new_buffer_from_slice`].
+fn pooled_from_slice<T: Copy>(
+    pool: &BufferPool,
+    device: &metal::DeviceRef,
+    data: &[T],
+) -> metal::Buffer {
+    let bytes = std::mem::size_of_val(data);
+    if bytes == 0 {
+        let buf = pool.take(device, 4);
+        // SAFETY: `take(4)` returns StorageModeShared storage of at least 4
+        // bytes, so `contents()` maps those bytes on the host. The write stays
+        // inside that mapping.
+        unsafe {
+            std::ptr::write_bytes(buf.contents().cast::<u8>(), 0, 4);
+        }
+        return buf;
+    }
+    let buf = pool.take(device, bytes as u64);
+    // SAFETY: `take` returns StorageModeShared storage of at least `bytes`
+    // bytes, so `contents()` is a non-null host mapping of that many bytes.
+    // `data` is a separate allocation and cannot overlap the mapping.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().cast::<u8>(),
+            buf.contents().cast::<u8>(),
+            bytes,
+        );
+    }
+    buf
+}
+
 /// A prepared batch retaining its inputs and carry-over state between chunks.
 /// Only `commit_next` submits work, with at most one unfinished chunk per batch.
 pub(crate) struct EncodedBatch {
+    /// Energies come from the kernel's `final_energies` buffer instead of the host rescore.
+    device_energy: bool,
     /// Command buffers in submission order. A long anneal is split across
     /// several so no single one trips the macOS GPU watchdog; the last carries
     /// the final state. See [`TARGET_DISPATCH_MS`].
@@ -482,6 +691,15 @@ pub(crate) struct EncodedBatch {
     groups: usize,
     threads_per_group: usize,
     plan: Vec<(i32, i32)>,
+    /// Retains the topology buffers after a later miss replaces the device slot.
+    #[expect(
+        dead_code,
+        reason = "keeps cached Metal buffers alive until the batch drops"
+    )]
+    cached: std::sync::Arc<CachedTopology>,
+    pool: std::sync::Arc<BufferPool>,
+    /// Multi-spin buffers rented from `pool`.
+    pooled: Vec<metal::Buffer>,
 }
 
 impl EncodedBatch {
@@ -502,6 +720,22 @@ impl EncodedBatch {
         };
         let cmd = self.queue.new_command_buffer().to_owned();
         let encoder = cmd.new_compute_command_encoder();
+        self.encode_chunk(encoder, beta_start, beta_count);
+        encoder.end_encoding();
+        if cancelled() {
+            return false;
+        }
+        cmd.commit();
+        self.cmds.push(cmd);
+        true
+    }
+
+    fn encode_chunk(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        beta_start: i32,
+        beta_count: i32,
+    ) {
         encoder.set_compute_pipeline_state(&self.pipeline);
         bind_shared_args(encoder, &self.inputs, &self.out, &self.dims);
         match &self.kstate {
@@ -526,13 +760,6 @@ impl EncodedBatch {
             mtl_size_1d(self.groups),
             mtl_size_1d(self.threads_per_group),
         );
-        encoder.end_encoding();
-        if cancelled() {
-            return false;
-        }
-        cmd.commit();
-        self.cmds.push(cmd);
-        true
     }
 
     fn bind_colors(&self, encoder: &metal::ComputeCommandEncoderRef, slot19: i32) {
@@ -580,31 +807,79 @@ impl EncodedBatch {
     }
 }
 
+impl Drop for EncodedBatch {
+    fn drop(&mut self) {
+        // Give every pooled buffer back when `cmds` is empty or every command
+        // buffer has status `Completed` or `Error`. Otherwise drop them: the
+        // GPU may still be using them.
+        let retired = self.cmds.iter().all(|cmd| {
+            matches!(
+                cmd.status(),
+                metal::MTLCommandBufferStatus::Completed | metal::MTLCommandBufferStatus::Error
+            )
+        });
+        if retired {
+            for buf in self.pooled.drain(..) {
+                self.pool.give(buf);
+            }
+        }
+    }
+}
+
 /// True GPU execution time of a completed command buffer, in microseconds,
-/// from `GPUEndTime - GPUStartTime` (`CFTimeInterval` seconds). metal-rs 0.33
-/// exposes no accessor, so read the properties via `objc`. Returns 0 if the
-/// timestamps are unavailable / non-positive.
+/// from `GPUEndTime - GPUStartTime` (`CFTimeInterval` seconds). Returns 0 if
+/// the timestamps are unavailable / non-positive.
+pub(crate) fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "guarded finite and positive; GPU spans are far below u64::MAX microseconds"
+    )]
+    gpu_span(cmd).map_or(0, |(start, end)| ((end - start) * 1_000_000.0) as u64)
+}
+
+/// Host time in seconds, on the clock `MTLCommandBuffer.GPUStartTime` and
+/// `GPUEndTime` report.
+pub(crate) fn host_seconds() -> f64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let scale = *SCALE.get_or_init(|| {
+        let mut info = Timebase { numer: 0, denom: 0 };
+        // SAFETY: `info` is a valid, writable `mach_timebase_info_data_t`.
+        let status = unsafe { mach_timebase_info(&mut info) };
+        if status == 0 && info.denom != 0 {
+            f64::from(info.numer) / f64::from(info.denom) * 1e-9
+        } else {
+            1e-9
+        }
+    });
+    // SAFETY: `mach_absolute_time` takes no arguments and cannot fail.
+    unsafe { mach_absolute_time() as f64 * scale }
+}
+
+/// `(GPUStartTime, GPUEndTime)` of a completed command buffer, in seconds on
+/// the host's absolute clock, or `None` if unavailable or non-positive.
+/// metal-rs 0.33 exposes no accessor, so read the properties via `objc`.
 #[expect(
     unexpected_cfgs,
     reason = "objc 0.2 msg_send! expands to cfg(cargo-clippy) the compiler no longer recognizes"
 )]
-fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
+pub(crate) fn gpu_span(cmd: &metal::CommandBufferRef) -> Option<(f64, f64)> {
     use objc::{msg_send, sel, sel_impl};
     // SAFETY: `GPUStartTime`/`GPUEndTime` are `CFTimeInterval` (f64) properties
     // on a completed `MTLCommandBuffer`; `cmd` implements `objc::Message`.
     let (start, end): (f64, f64) =
         unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
     let dur = end - start;
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "guarded finite and positive; GPU spans are far below u64::MAX microseconds"
-    )]
-    if dur.is_finite() && dur > 0.0 {
-        (dur * 1_000_000.0) as u64
-    } else {
-        0
-    }
+    (dur.is_finite() && dur > 0.0).then_some((start, end))
 }
 
 fn set_bytes_i32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: i32) {
@@ -676,7 +951,7 @@ struct DispatchBuffers {
 fn max_csr_degree(graph: &IsingGraph) -> usize {
     let n = graph.num_nodes();
     let mut degree = vec![0usize; n];
-    for &(u, v) in &graph.edges {
+    for &(u, v) in graph.edges.iter() {
         if u >= n || v >= n {
             continue;
         }
@@ -692,7 +967,7 @@ fn max_csr_degree(graph: &IsingGraph) -> usize {
 ///
 /// Split out of [`encode_batch`] so both rejections are reachable without a
 /// Metal device.
-fn validate_batch<'a>(
+pub(crate) fn validate_batch<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
     kernel: Kernel,
@@ -741,28 +1016,36 @@ fn validate_batch<'a>(
 /// Build and upload one batch's CSR structure and per-problem `h` / `J`.
 ///
 /// The CSR structure is shared by every problem in the batch (same topology),
-/// so it is tiled `num_problems` times; the offset arrays give the kernel each
-/// problem's slice.
+/// so the multi-spin kernel reads the one untiled copy in `cached`. The SA and
+/// Gibbs kernels read a tiled copy through the offset arrays.
 fn upload_inputs(
     device: &crate::metal_device::MetalDevice,
-    topo: &SelfFeedingTopology,
+    cached: &CachedTopology,
     graphs: &[&IsingGraph],
+    kernel: Kernel,
 ) -> InputBuffers {
+    let topo = &cached.topo;
     let num_problems = graphs.len();
     let n = topo.n;
     let nnz_alloc = topo.nnz.max(1);
     let rp_len = topo.row_ptr.len().max(1);
 
-    // Shared CSR structure, tiled per problem; per-problem J / h values.
-    let zero = [0i32];
-    let base_row: &[i32] = if topo.row_ptr.is_empty() {
-        &zero
+    // Shared CSR structure for MSA, tiled for SA / Gibbs; per-problem J / h values.
+    let (row, col) = if kernel == Kernel::Msa {
+        (cached.row.clone(), cached.col.clone())
     } else {
-        &topo.row_ptr
+        let zero = [0i32];
+        let base_row: &[i32] = if topo.row_ptr.is_empty() {
+            &zero
+        } else {
+            &topo.row_ptr
+        };
+        let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
+        (
+            device.new_buffer_from_slice(&tile_i32(base_row, num_problems)),
+            device.new_buffer_from_slice(&tile_i32(base_col, num_problems)),
+        )
     };
-    let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
-    let all_row_ptr = tile_i32(base_row, num_problems);
-    let all_col_ind = tile_i32(base_col, num_problems);
     let mut all_j = vec![0i8; num_problems * nnz_alloc];
     let mut all_h = vec![0i8; num_problems * n];
     for (p, graph) in graphs.iter().enumerate() {
@@ -774,12 +1057,23 @@ fn upload_inputs(
     }
     let row_ptr_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * rp_len) as i32).collect();
     let col_ind_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * nnz_alloc) as i32).collect();
+    let (j, h) = if kernel == Kernel::Msa {
+        (
+            pooled_from_slice(&device.buffer_pool, &device.device, &all_j),
+            pooled_from_slice(&device.buffer_pool, &device.device, &all_h),
+        )
+    } else {
+        (
+            device.new_buffer_from_slice(&all_j),
+            device.new_buffer_from_slice(&all_h),
+        )
+    };
 
     InputBuffers {
-        row: device.new_buffer_from_slice(&all_row_ptr),
-        col: device.new_buffer_from_slice(&all_col_ind),
-        j: device.new_buffer_from_slice(&all_j),
-        h: device.new_buffer_from_slice(&all_h),
+        row,
+        col,
+        j,
+        h,
         row_off: device.new_buffer_from_slice(&row_ptr_offsets),
         col_off: device.new_buffer_from_slice(&col_ind_offsets),
     }
@@ -862,19 +1156,20 @@ fn new_gibbs_persistent(
 }
 
 /// Multi-spin carry-over state: one `uint` word per (threadgroup, spin) plus
-/// one xoshiro128** stream (four `uint`) per (threadgroup, thread). The
-/// threshold row is rebuilt at every rung and the sweep offsets are hashed
-/// from their coordinates, so nothing else survives a chunk boundary.
+/// one xoshiro128** stream (four `uint`) per (threadgroup, thread). Only spin
+/// words and RNG streams persist across a chunk boundary.
 fn new_msa_persistent(
-    device: &crate::metal_device::MetalDevice,
+    pool: &BufferPool,
+    device: &metal::DeviceRef,
     num_streams: usize,
     n: usize,
     threads_per_group: usize,
 ) -> [metal::Buffer; 2] {
     const RNG_BYTES_PER_STREAM: usize = 16;
     [
-        device.new_zeroed_buffer((num_streams * n.max(1) * 4) as u64),
-        device.new_zeroed_buffer(
+        pool.take(device, (num_streams * n.max(1) * 4) as u64),
+        pool.take(
+            device,
             (num_streams * threads_per_group.max(1) * RNG_BYTES_PER_STREAM) as u64,
         ),
     ]
@@ -948,12 +1243,12 @@ pub(crate) fn encode_batch(
     kernel: Kernel,
     in_flight: usize,
 ) -> Result<EncodedBatch, SampleError> {
-    encode_batch_inner(device, graphs, params, kernel, in_flight, None)
+    encode_batch_inner(device, graphs, params, kernel, in_flight, None, None)
 }
 
-/// [`encode_batch`] with an optional chunk-plan override, so a test can split
-/// one anneal at chosen rung boundaries and compare it with the unsplit run.
-/// Production passes `None` and lets [`chunk_plan`] decide.
+/// [`encode_batch`] with optional chunk-plan and beta-schedule overrides.
+/// A beta override supplies one rung per sweep, including reheating schedules.
+/// Production passes `None` for both overrides.
 fn encode_batch_inner(
     device: &crate::metal_device::MetalDevice,
     graphs: &[&IsingGraph],
@@ -961,6 +1256,7 @@ fn encode_batch_inner(
     kernel: Kernel,
     in_flight: usize,
     plan_override: Option<&[(i32, i32)]>,
+    beta_override: Option<Vec<f32>>,
 ) -> Result<EncodedBatch, SampleError> {
     let (first, n) = validate_batch(graphs, params, kernel)?;
 
@@ -969,12 +1265,23 @@ fn encode_batch_inner(
     let num_samples = num_problems * num_reads;
     let packed_size = n.div_ceil(8).max(1);
 
-    let (beta, sweeps_per) = build_beta_schedule(
-        first,
-        params.num_sweeps,
-        params.sweeps_per_beta,
-        params.beta_range,
-    );
+    let (beta, sweeps_per) = match beta_override {
+        Some(beta) => {
+            if beta.is_empty() || beta.len() > MAX_SWEEPS {
+                return Err(SampleError::TooLarge(format!(
+                    "beta override length {} must be in 1..={MAX_SWEEPS}",
+                    beta.len()
+                )));
+            }
+            (beta, 1)
+        }
+        None => build_beta_schedule(
+            first,
+            params.num_sweeps,
+            params.sweeps_per_beta,
+            params.beta_range,
+        ),
+    };
 
     // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
     // only the dispatch geometry below differs.
@@ -1001,7 +1308,7 @@ fn encode_batch_inner(
     // partial_energies[256]` reduction array.
     //
     // Multi-spin: one threadgroup per (problem, 32-replica word), `words`
-    // threadgroups per problem, 256 threads splitting each colour class.
+    // threadgroups per problem, 1,024 threads splitting each colour class.
     let words = num_reads.div_ceil(MSA_LANES);
     let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
     let (groups, threads_per_group) = match kernel {
@@ -1009,6 +1316,9 @@ fn encode_batch_inner(
         Kernel::Gibbs if node_parallel => (num_samples, 256.min(max_threads).max(1)),
         Kernel::Sa | Kernel::Gibbs => (num_problems, num_reads),
     };
+    if kernel == Kernel::Msa {
+        tracing::debug!(threads_per_group, "msa dispatch width");
+    }
     // `buffer(12)`: threads for SA / sequential Gibbs (one per read),
     // threadgroups for chromatic Gibbs and multi-spin. Also the count
     // `chunk_plan` multiplies: spin updates per thread, or word updates per
@@ -1043,45 +1353,85 @@ fn encode_batch_inner(
         }
     }
 
-    let topo = if kernel == Kernel::Msa && msa_four_color() {
-        SelfFeedingTopology::build_with_advantage2_coloring(first)
-    } else {
-        SelfFeedingTopology::build(first)
-    };
-    let inputs = upload_inputs(device, &topo, graphs);
-    let out = DispatchBuffers {
-        beta: device.new_buffer_from_slice(&beta),
-        samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
-        energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
-    };
+    let cached = device.topology_cache.get_or_build(
+        device,
+        first,
+        kernel == Kernel::Msa && msa_four_color(),
+    );
+    let inputs = upload_inputs(device, &cached, graphs, kernel);
 
     let plan = match plan_override {
         Some(p) => p.to_vec(),
         None => chunk_plan(kernel, &dims, groups, in_flight),
     };
-    let kstate = match kernel {
-        Kernel::Sa => KernelEncode::Sa {
-            persist: new_sa_persistent(device, &dims),
-        },
-        Kernel::Gibbs => KernelEncode::Gibbs {
-            persist: new_gibbs_persistent(device, &dims, node_parallel, threads_per_group),
-        },
-        Kernel::Msa => KernelEncode::Msa {
-            persist: new_msa_persistent(device, groups, n, threads_per_group),
-            words: words as i32,
-            state_bytes: state_bytes as u64,
-        },
+    let mut pooled = Vec::new();
+    let (out, kstate) = match kernel {
+        Kernel::Sa => (
+            DispatchBuffers {
+                beta: device.new_buffer_from_slice(&beta),
+                samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
+                energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
+            },
+            KernelEncode::Sa {
+                persist: new_sa_persistent(device, &dims),
+            },
+        ),
+        Kernel::Gibbs => (
+            DispatchBuffers {
+                beta: device.new_buffer_from_slice(&beta),
+                samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
+                energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
+            },
+            KernelEncode::Gibbs {
+                persist: new_gibbs_persistent(device, &dims, node_parallel, threads_per_group),
+            },
+        ),
+        Kernel::Msa => {
+            let beta_buf = pooled_from_slice(&device.buffer_pool, &device.device, &beta);
+            // The kernel writes `samples`, `energies`, and the persistent buffers
+            // in full before any read (first chunk initializes state and RNG, and
+            // every read's bytes are packed), so pooled buffers need no zeroing.
+            let samples = device
+                .buffer_pool
+                .take(&device.device, (num_samples * packed_size) as u64);
+            let energies = device
+                .buffer_pool
+                .take(&device.device, (num_samples * 4) as u64);
+            let persist = new_msa_persistent(
+                &device.buffer_pool,
+                &device.device,
+                groups,
+                n,
+                threads_per_group,
+            );
+            pooled.extend([
+                inputs.j.clone(),
+                inputs.h.clone(),
+                beta_buf.clone(),
+                samples.clone(),
+                energies.clone(),
+                persist[0].clone(),
+                persist[1].clone(),
+            ]);
+            (
+                DispatchBuffers {
+                    beta: beta_buf,
+                    samples,
+                    energies,
+                },
+                KernelEncode::Msa {
+                    persist,
+                    words: words as i32,
+                    state_bytes: state_bytes as u64,
+                },
+            )
+        }
     };
 
-    let colors = if kernel == Kernel::Sa {
-        Vec::new()
-    } else {
-        [&topo.colors.starts, &topo.colors.counts, &topo.colors.nodes]
-            .into_iter()
-            .map(|values| device.new_buffer_from_slice(&pad_i32(values)))
-            .collect()
-    };
+    let colors = cached.colors.clone();
+    let num_colors = cached.topo.colors.num_colors;
     Ok(EncodedBatch {
+        device_energy: kernel == Kernel::Msa && graphs.iter().all(|g| device_energy_exact(g)),
         cmds: Vec::with_capacity(plan.len()),
         d_samples: out.samples.clone(),
         n,
@@ -1095,10 +1445,13 @@ fn encode_batch_inner(
         dims,
         kstate,
         colors,
-        num_colors: topo.colors.num_colors,
+        num_colors,
         groups,
         threads_per_group,
         plan,
+        cached,
+        pool: std::sync::Arc::clone(&device.buffer_pool),
+        pooled,
     })
 }
 
@@ -1110,21 +1463,18 @@ fn pad_i32(v: &[i32]) -> Vec<i32> {
     }
 }
 
-/// Read a completed batch's bit-packed samples and host-score each read,
-/// returning one `Vec<SamplerResult>` per problem (in `graphs` order).
+/// Read a completed batch's bit-packed samples and return results in `graphs` order.
+/// Whole-unit multi-spin graphs use device energies, with one job in 1,000
+/// audited on the host. SA, Gibbs, and non-integer graphs use host scoring.
 ///
 /// `graphs` must be the exact slice passed to [`encode_batch`] (same order and
-/// length) so each problem's spins are scored against its own `h`/`J`. The
-/// buffer read is on the caller's thread; unpack + `energy_milli` scoring runs
-/// on a rayon pool (one task per problem) — this is the bulk of the per-batch
-/// host cost, overlapped with the next batch's GPU compute by the streaming
-/// pipeline.
+/// length) so each problem's spins are scored against its own `h`/`J`.
+/// Buffer reads run on the caller's thread. Unpacking and host scoring run
+/// on a rayon pool, with one task per problem.
 pub(crate) fn harvest_batch(
     batch: &EncodedBatch,
     graphs: &[&IsingGraph],
 ) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
-    use rayon::prelude::*;
-
     // Was a `debug_assert_eq!`, which is compiled out in release — a length
     // mismatch would index `packed` from `graphs` while sizing it from
     // `batch.num_problems` and panic the miner.
@@ -1138,7 +1488,37 @@ pub(crate) fn harvest_batch(
     let count = batch.num_problems * batch.num_reads * batch.packed_size;
     let packed = read_i8_buffer(&batch.d_samples, count)?;
     let (num_reads, packed_size, n) = (batch.num_reads, batch.packed_size, batch.n);
-    let out = graphs
+    let energies = if batch.device_energy {
+        Some(read_i32_buffer(
+            &batch.out.energies,
+            batch.num_problems * num_reads,
+        )?)
+    } else {
+        None
+    };
+    decode_packed_reads(
+        &packed,
+        energies.as_deref(),
+        graphs,
+        num_reads,
+        packed_size,
+        n,
+    )
+}
+
+/// Decode dense job regions in graph order, then audit device energies.
+/// Callers provide initialized storage for graphs.len() * num_reads reads.
+pub(crate) fn decode_packed_reads(
+    packed: &[i8],
+    energies: Option<&[i32]>,
+    graphs: &[&IsingGraph],
+    num_reads: usize,
+    packed_size: usize,
+    n: usize,
+) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
+    use rayon::prelude::*;
+
+    let out: Vec<Vec<SamplerResult>> = graphs
         .par_iter()
         .enumerate()
         .map(|(p, graph)| {
@@ -1146,12 +1526,47 @@ pub(crate) fn harvest_batch(
                 .map(|r| {
                     let start = (p * num_reads + r) * packed_size;
                     let spins = unpack_spins(&packed[start..start + packed_size], n);
-                    score_spins(&spins, graph)
+                    match energies {
+                        Some(e) => SamplerResult {
+                            spins,
+                            energy_milli: i64::from(e[p * num_reads + r]),
+                        },
+                        None => score_spins(&spins, graph),
+                    }
                 })
                 .collect()
         })
         .collect();
+    if energies.is_some() {
+        audit_device_energies(&out, graphs)?;
+    }
     Ok(out)
+}
+
+/// Rescore one job in [`ENERGY_AUDIT_EVERY`] on the host. A mismatch means the
+/// kernel's reduction is wrong, which would turn into rejected proofs, so it
+/// is a device fault rather than a per-job error.
+pub(crate) fn audit_device_energies(
+    out: &[Vec<SamplerResult>],
+    graphs: &[&IsingGraph],
+) -> Result<(), SampleError> {
+    use std::sync::atomic::Ordering;
+    let first = ENERGY_AUDIT_JOBS.fetch_add(out.len() as u64, Ordering::Relaxed);
+    for (p, (reads, graph)) in out.iter().zip(graphs).enumerate() {
+        if !(first + p as u64).is_multiple_of(ENERGY_AUDIT_EVERY) {
+            continue;
+        }
+        for (r, read) in reads.iter().enumerate() {
+            let want = energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges);
+            if read.energy_milli != want {
+                return Err(SampleError::Driver(format!(
+                    "device energy {} != host energy {want} for problem {p} read {r}",
+                    read.energy_milli
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run `num_reads` independent anneals on the GPU for one explicit problem
@@ -1181,7 +1596,7 @@ pub(crate) fn harvest_batch(
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_metal::{sample_ising, Kernel, IsingGraph, SampleParams, metal_device::MetalDevice};
+/// use quip_solver_metal::{sample_ising, Kernel, IsingGraph, SampleParams, metal_device::MetalDevice};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = MetalDevice::open(0)?;
@@ -1272,12 +1687,160 @@ fn read_i8_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i8>, SampleEr
     Ok(out)
 }
 
+fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, SampleError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let len = buf.length() as usize;
+    if len < count * 4 {
+        return Err(SampleError::Driver(format!(
+            "Metal buffer holds {len} bytes, need {}",
+            count * 4
+        )));
+    }
+    let ptr = buf.contents() as *const i32;
+    if ptr.is_null() {
+        return Err(SampleError::Driver(
+            "Metal buffer contents() returned null".into(),
+        ));
+    }
+    let mut out = vec![0i32; count];
+    // SAFETY: buffer is StorageModeShared; `contents()` is non-null and
+    // `length() >= count * 4` are checked above. Metal buffers are aligned
+    // for i32; `out` owns `count` initialized i32 values and cannot overlap
+    // the device allocation. The writing command buffer completed before this call.
+    unsafe {
+        std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), count);
+    }
+    Ok(out)
+}
+
 // Host-side (GPU-free) logic only: everything under test here is `cfg(macos)`,
 // so the module carries the same gate. The dispatch itself is covered by
-// `tests/golden_parity.rs`, which needs a real device.
+// `tests/stream_contract.rs`, which needs a real device.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_decode_preserves_jobs_reads_and_host_scoring() {
+        let a = IsingGraph::new(vec![1.0, -1.0, 0.0], vec![], vec![]);
+        let b = IsingGraph::new(vec![-1.0, 1.0, 0.0], vec![], vec![]);
+        let graphs = [&a, &b];
+        let packed = [0, 5, 7, 2];
+        let expected = [[1, 1, 1], [-1, 1, -1], [-1, -1, -1], [1, -1, 1]];
+        let energies = [0, -2000, 0, -2000];
+        for device_energies in [Some(energies.as_slice()), None] {
+            let results = decode_packed_reads(&packed, device_energies, &graphs, 2, 1, 3).unwrap();
+            assert_eq!(results.len(), 2);
+            for (p, reads) in results.iter().enumerate() {
+                assert_eq!(reads.len(), 2);
+                for (r, read) in reads.iter().enumerate() {
+                    assert_eq!(read.spins, expected[p * 2 + r]);
+                    assert_eq!(read.energy_milli, i64::from(energies[p * 2 + r]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn four_color_is_on_unless_disabled() {
+        assert!(four_color_from(None));
+        assert!(four_color_from(Some("1")));
+        assert!(!four_color_from(Some("0")));
+        assert!(!four_color_from(Some("false")));
+        assert!(!four_color_from(Some("OFF")));
+    }
+
+    #[test]
+    fn device_energy_is_exact_only_for_whole_i8_coefficients() {
+        let unit = IsingGraph::new(vec![1.0, -1.0, 0.0], vec![1.0, -1.0], vec![(0, 1), (1, 2)]);
+        assert!(device_energy_exact(&unit));
+        let half = IsingGraph::new(vec![0.5, 0.0, 0.0], vec![1.0, 1.0], vec![(0, 1), (1, 2)]);
+        assert!(!device_energy_exact(&half));
+        let big = IsingGraph::new(vec![0.0; 3], vec![200.0, 1.0], vec![(0, 1), (1, 2)]);
+        assert!(!device_energy_exact(&big));
+        let nan = IsingGraph::new(
+            vec![f64::NAN, 0.0, 0.0],
+            vec![1.0, 1.0],
+            vec![(0, 1), (1, 2)],
+        );
+        assert!(!device_energy_exact(&nan));
+        // 127 units per node: 16,909 nodes stay under i32::MAX / 1000 units,
+        // 16,910 nodes would let the kernel's int sum wrap.
+        let fits = IsingGraph::new(vec![127.0; 16_909], vec![], vec![]);
+        assert!(device_energy_exact(&fits));
+        let wraps = IsingGraph::new(vec![127.0; 16_910], vec![], vec![]);
+        assert!(!device_energy_exact(&wraps));
+    }
+
+    #[test]
+    fn msa_device_energies_equal_consensus_energy() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        // 50 reads: not a whole number of 32-lane words.
+        for (graph, sweeps) in [(chain(64), 32), (ring(), 256), (chain(300), 1)] {
+            let mut p = params(sweeps);
+            p.num_reads = 50;
+            let results = sample_ising(&dev, &graph, &p, Kernel::Msa).unwrap();
+            assert_eq!(results.len(), 50);
+            for r in &results {
+                let want = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
+                assert_eq!(r.energy_milli, want);
+            }
+        }
+    }
+
+    #[test]
+    fn msa_non_unit_graph_falls_back_to_host_scoring() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let mut graph = chain(64);
+        graph.h[3] = 0.5;
+        let results = sample_ising(&dev, &graph, &params(32), Kernel::Msa).unwrap();
+        for r in &results {
+            assert_eq!(
+                r.energy_milli,
+                energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
+    }
+
+    #[test]
+    fn msa_chunked_run_writes_energies_on_the_last_chunk_only() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let graph = chain(64);
+        let p = params(64);
+        let graphs = [&graph];
+        let mut batch = encode_batch_inner(
+            &dev,
+            &graphs,
+            &p,
+            Kernel::Msa,
+            1,
+            Some(&[(0, 20), (20, 44)]),
+            None,
+        )
+        .unwrap();
+        while batch.commit_next(|| false) {
+            batch.wait_until_completed();
+        }
+        assert!(batch.failed_status().is_none());
+        let results = harvest_batch(&batch, &graphs).unwrap();
+        for r in &results[0] {
+            assert_eq!(
+                r.energy_milli,
+                energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
+    }
 
     /// Small ring: 0-1-2-3-0, unit J, ternary h (same fixture as `topology`).
     fn ring() -> IsingGraph {
@@ -1525,6 +2088,11 @@ mod tests {
     }
 
     #[test]
+    fn msa_static_threadgroup_budget_is_the_lane_totals_only() {
+        assert_eq!(MSA_STATIC_TG_BYTES, 32 * 4);
+    }
+
+    #[test]
     fn msa_node_cap_fits_apple_threadgroup_memory() {
         assert_eq!(kernel_max_nodes(Kernel::Msa), MSA_MAX_NODES);
         const {
@@ -1556,6 +2124,66 @@ mod tests {
     }
 
     #[test]
+    fn topology_cache_hits_on_the_same_edges_and_misses_on_new_ones() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let a = chain(50);
+        let mut a2 = chain(50);
+        a2.j[0] = -a2.j[0]; // same topology, different couplings
+        let b = ring();
+        let first = dev.topology_cache.get_or_build(&dev, &a, false);
+        let again = dev.topology_cache.get_or_build(&dev, &a2, false);
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        // Same node count, one edge moved: the cache must rebuild.
+        let mut moved = chain(50);
+        let mut edges = moved.edges.to_vec();
+        edges[0] = (0, 2);
+        moved.edges = edges.into();
+        let rewired = dev.topology_cache.get_or_build(&dev, &moved, false);
+        assert!(!std::sync::Arc::ptr_eq(&first, &rewired));
+        let other = dev.topology_cache.get_or_build(&dev, &b, false);
+        assert!(!std::sync::Arc::ptr_eq(&first, &other));
+        assert_eq!(other.n, b.num_nodes());
+        let colored = dev.topology_cache.get_or_build(&dev, &b, true);
+        assert!(!std::sync::Arc::ptr_eq(&other, &colored));
+    }
+
+    #[test]
+    fn buffer_pool_reuses_a_returned_buffer_of_fitting_size() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let pool = BufferPool::default();
+        let a = pool.take(&dev.device, 4096);
+        let ptr = a.contents();
+        pool.give(a);
+        let b = pool.take(&dev.device, 3000);
+        assert_eq!(b.contents(), ptr);
+        let c = pool.take(&dev.device, 100_000);
+        assert!(c.length() >= 100_000);
+    }
+
+    #[test]
+    fn consecutive_batches_on_one_topology_give_consensus_energies() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        for graph in [chain(80), chain(80), ring(), chain(80)] {
+            let results = sample_ising(&dev, &graph, &params(32), Kernel::Msa).unwrap();
+            for r in &results {
+                assert_eq!(
+                    r.energy_milli,
+                    energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn preparing_a_batch_does_not_submit_its_chunks() {
         let device = crate::metal_device::MetalDevice::open(0).unwrap();
         let graph = chain(32);
@@ -1574,6 +2202,7 @@ mod tests {
                 kernel,
                 1,
                 Some(&[(0, 1), (1, 1), (2, 1), (3, 1)]),
+                None,
             )
             .unwrap();
             batch.wait_until_completed();
@@ -1598,7 +2227,8 @@ mod tests {
         let plan: Vec<_> = (0..128).map(|start| (start, 1)).collect();
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             let mut batch =
-                encode_batch_inner(&device, &[&graph], &params, kernel, 2, Some(&plan)).unwrap();
+                encode_batch_inner(&device, &[&graph], &params, kernel, 2, Some(&plan), None)
+                    .unwrap();
             let cancel = quip_solver_core::CancelToken::default();
             assert!(batch.commit_next(|| cancel.is_cancelled(Some(1))));
             cancel.cancel_through(1);
@@ -1650,6 +2280,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resident_step_limit_matches_two_in_flight_batch_chunks() {
+        for n in [64, 4577, MSA_MAX_NODES] {
+            for groups in [1, 2, 20, 80, 512] {
+                for slice in [1, 32, MAX_SWEEPS, usize::MAX] {
+                    let dims = BatchDims {
+                        n,
+                        num_betas: slice.min(MAX_SWEEPS) as i32,
+                        sweeps_per: 1,
+                        base_seed: 1,
+                        num_threads: groups,
+                        num_problems: groups,
+                        num_reads: MSA_LANES,
+                        packed_size: n.div_ceil(8),
+                    };
+                    let limit = msa_step_limit(n, groups, slice);
+                    assert_eq!(
+                        limit,
+                        chunk_plan(Kernel::Msa, &dims, groups, 2)[0].1 as usize
+                    );
+                    assert!((1..=slice.min(MAX_SWEEPS)).contains(&limit));
+                    let work = limit as f64 * groups as f64 * n as f64;
+                    let budget = TARGET_DISPATCH_MS / 1000.0
+                        * estimated_updates_per_sec(Kernel::Msa, groups * 2)
+                        / 2.0;
+                    assert!(work <= budget || limit == 1);
+                }
+            }
+        }
+        assert!(msa_step_limit(4577, 80, MAX_SWEEPS) < MAX_SWEEPS);
+    }
+
     /// Chunk boundaries fall on rung boundaries, and every carry-over (the
     /// spin words and each thread's RNG stream) round-trips through the
     /// persistent buffers, so splitting an anneal into chunks must not change
@@ -1667,12 +2329,20 @@ mod tests {
             seed: 7,
         };
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
-            let mut whole =
-                encode_batch_inner(&device, &[&graph], &params, kernel, 1, Some(&[(0, 128)]))
-                    .unwrap();
+            let mut whole = encode_batch_inner(
+                &device,
+                &[&graph],
+                &params,
+                kernel,
+                1,
+                Some(&[(0, 128)]),
+                None,
+            )
+            .unwrap();
             let plan: Vec<_> = (0..128).map(|start| (start, 1)).collect();
             let mut split =
-                encode_batch_inner(&device, &[&graph], &params, kernel, 1, Some(&plan)).unwrap();
+                encode_batch_inner(&device, &[&graph], &params, kernel, 1, Some(&plan), None)
+                    .unwrap();
             while whole.commit_next(|| false) {
                 whole.wait_until_completed();
             }
@@ -1689,6 +2359,43 @@ mod tests {
             assert!(a.iter().any(|&byte| byte != 0));
             assert_eq!(split.cmds.len(), 128);
         }
+    }
+
+    #[test]
+    fn msa_shared_csr_matches_tiled_results_bit_for_bit() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let a = chain(200);
+        let mut b = chain(200);
+        b.j.iter_mut().step_by(3).for_each(|v| *v = -*v);
+        let mut c = chain(200);
+        c.j.iter_mut().skip(1).step_by(5).for_each(|v| *v = -*v);
+        let graphs = [&a, &b, &c];
+        let p = params(64);
+        let mut batch = encode_batch(&dev, &graphs, &p, Kernel::Msa, 1).unwrap();
+        while batch.commit_next(|| false) {
+            batch.wait_until_completed();
+        }
+        batch.wait_until_completed();
+        let got = harvest_batch(&batch, &graphs).unwrap();
+        // Every problem has its own J, so a problem reading another's slice
+        // gives reads whose energies disagree with consensus. The row and
+        // column structure is one untiled copy.
+        for (reads, g) in got.iter().zip(graphs) {
+            for r in reads {
+                assert_eq!(r.energy_milli, energy_milli(&r.spins, &g.h, &g.j, &g.edges));
+            }
+        }
+        assert_eq!(
+            batch.inputs.row.length() as usize,
+            (a.num_nodes() + 1) * std::mem::size_of::<i32>()
+        );
+        assert_eq!(
+            batch.inputs.col.length() as usize,
+            2 * a.edges.len() * std::mem::size_of::<i32>()
+        );
     }
 
     /// Two problems in one batch with two words each: every (problem, word)

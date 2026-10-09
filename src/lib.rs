@@ -42,13 +42,20 @@
 // see; it still fires for any build that reaches this crate.
 #[cfg(not(target_os = "macos"))]
 compile_error!(
-    "quip-miner-metal is macOS-only: it depends on Metal and IOKit, which exist \
+    "quip-solver-metal is macOS-only: it depends on Metal and IOKit, which exist \
      on no other platform. Build it on macOS (Apple Silicon)."
 );
 
 pub mod sampler;
 
+mod cascade;
 mod combined;
+mod cutoff;
+mod draw;
+mod lease_turn;
+mod model_checks;
+mod resident;
+mod slots;
 
 pub mod iokit_gov;
 pub mod metal_device;
@@ -140,15 +147,16 @@ const _: () = assert!(
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::METAL_SA_IDENTITY;
+/// use quip_solver_metal::METAL_SA_IDENTITY;
+/// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
-/// assert_eq!(METAL_SA_IDENTITY.backend, "metal");
-/// assert_eq!(METAL_SA_IDENTITY.algorithm, "sa");
+/// assert_eq!(METAL_SA_IDENTITY.backend, Backend::Metal);
+/// assert_eq!(METAL_SA_IDENTITY.algorithm, Algorithm::Sa);
 /// assert!(METAL_SA_IDENTITY.max_nodes > 0);
 /// ```
 pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "metal",
-    algorithm: "sa",
+    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
+    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Sa,
     // Single source of truth with the sampler's runtime guard: the advertised
     // cap and the guard cannot drift because this is the same constant. A job
     // over it would overrun the SA kernel's `thread int8_t delta_energy[4593]`
@@ -167,15 +175,16 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::METAL_GIBBS_IDENTITY;
+/// use quip_solver_metal::METAL_GIBBS_IDENTITY;
+/// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
-/// assert_eq!(METAL_GIBBS_IDENTITY.backend, "metal");
-/// assert_eq!(METAL_GIBBS_IDENTITY.algorithm, "gibbs");
+/// assert_eq!(METAL_GIBBS_IDENTITY.backend, Backend::Metal);
+/// assert_eq!(METAL_GIBBS_IDENTITY.algorithm, Algorithm::Gibbs);
 /// assert!(METAL_GIBBS_IDENTITY.max_nodes > 0);
 /// ```
 pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "metal",
-    algorithm: "gibbs",
+    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
+    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Gibbs,
     // Same single-source-of-truth rule as SA above; the Gibbs cap comes from
     // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
     max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
@@ -190,17 +199,18 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::METAL_MSA_IDENTITY;
+/// use quip_solver_metal::METAL_MSA_IDENTITY;
+/// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
-/// assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
-/// assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
+/// assert_eq!(METAL_MSA_IDENTITY.backend, Backend::Metal);
+/// assert_eq!(METAL_MSA_IDENTITY.algorithm, Algorithm::Msa);
 /// assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads, 64);
 /// ```
 pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "metal",
-    algorithm: "msa",
+    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
+    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Msa,
     // Union capacity. Routing still enforces each engine's own limits.
-    max_nodes: quip_miner_ane::ANE_MSA_IDENTITY.max_nodes,
+    max_nodes: quip_solver_ane::ANE_MSA_IDENTITY.max_nodes,
     max_edges: DEFAULT_MAX_EDGES,
     features: &["streaming", "governor"],
     adapt: METAL_MSA_ADAPT,
@@ -212,7 +222,7 @@ pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_metal::{
+/// use quip_solver_metal::{
 ///     Kernel, MetalSampler,
 ///     iokit_gov::UtilGovernor,
 ///     metal_device::MetalDevice,
@@ -226,11 +236,42 @@ pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct MetalSampler {
     device: crate::metal_device::MetalDevice,
     gov: crate::iokit_gov::UtilGovernor,
     kernel: Kernel,
+    cascade: std::sync::Mutex<cascade::CascadeSettings>,
+    controller: std::sync::Mutex<Option<cascade::Controller>>,
+    salts_tx: std::sync::mpsc::SyncSender<resident::Salt>,
+    salts_rx: std::sync::Mutex<std::sync::mpsc::Receiver<resident::Salt>>,
+    /// Cleared when the resident runner exits, so a lease stops waiting on it.
+    runner_live: std::sync::atomic::AtomicBool,
+    lease_turns: lease_turn::LeaseTurns,
+    /// Counts lease cancellations, as the miner's view of the coordinator's
+    /// rounds: a reseed cancels every queued lease. A lease bumps it while it
+    /// still holds its place in `lease_turns`, so every lease that feeds after
+    /// a reseed reads the new value.
+    lease_round: std::sync::atomic::AtomicU64,
+}
+
+/// Stores a value into a flag when dropped, on every exit path.
+struct StoreOnDrop<'a>(&'a std::sync::atomic::AtomicBool, bool);
+
+impl Drop for StoreOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(self.1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for MetalSampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalSampler")
+            .field("device", &self.device)
+            .field("gov", &self.gov)
+            .field("kernel", &self.kernel)
+            .field("cascade", &self.cascade)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Metal backend config, parsed from the verbatim `config.toml` subsection in
@@ -245,6 +286,8 @@ struct MetalConfig {
     enable_ane: Option<bool>,
     enable_metal: Option<bool>,
     #[serde(flatten)]
+    cascade: cascade::CascadeToml,
+    #[serde(flatten)]
     unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
@@ -255,7 +298,7 @@ impl MetalSampler {
     /// # Examples
     ///
     /// ```no_run
-    /// use quip_miner_metal::{
+    /// use quip_solver_metal::{
     ///     Kernel, MetalSampler,
     ///     iokit_gov::UtilGovernor,
     ///     metal_device::MetalDevice,
@@ -273,15 +316,177 @@ impl MetalSampler {
         gov: crate::iokit_gov::UtilGovernor,
         kernel: Kernel,
     ) -> Self {
+        let (salts_tx, salts_rx) = std::sync::mpsc::sync_channel(resident::PREP_BOUND);
         Self {
             device,
             gov,
             kernel,
+            cascade: std::sync::Mutex::new(cascade::CascadeSettings::default()),
+            controller: std::sync::Mutex::new(None),
+            salts_tx,
+            salts_rx: std::sync::Mutex::new(salts_rx),
+            runner_live: std::sync::atomic::AtomicBool::new(true),
+            lease_turns: lease_turn::LeaseTurns::default(),
+            lease_round: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Report a lease's outcomes until every queued salt has one, the
+    /// feeder has stopped, or the lease stops.
+    fn report_lease(
+        &self,
+        sink: &quip_solver_core::LeaseSink,
+        outcomes: &std::sync::mpsc::Receiver<resident::SaltOutcome>,
+        live_target: &resident::LiveTarget,
+        fed: &std::sync::atomic::AtomicU64,
+        feeding: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), quip_solver_core::SampleError> {
+        use std::sync::atomic::Ordering;
+        let mut reported = 0u64;
+        while !sink.is_stopped() {
+            self.require_runner()?;
+            live_target.set(sink.target_energy_milli());
+            // `feeding` is cleared after the last increment of `fed`.
+            if !feeding.load(Ordering::Acquire) && reported == fed.load(Ordering::Acquire) {
+                break;
+            }
+            let Ok(first) = outcomes.recv_timeout(std::time::Duration::from_millis(1)) else {
+                continue;
+            };
+            for outcome in std::iter::once(first).chain(outcomes.try_iter()) {
+                reported += 1;
+                let sent = match outcome {
+                    resident::SaltOutcome::Screened {
+                        index,
+                        energy_milli,
+                    } => sink.screen(index, energy_milli),
+                    resident::SaltOutcome::Survived { index, reads } => sink.push(index, reads),
+                    resident::SaltOutcome::Dropped { index } => {
+                        tracing::debug!(index, "lease salt dropped before reporting");
+                        Ok(())
+                    }
+                    resident::SaltOutcome::Failed { index, error } => {
+                        return Err(quip_solver_core::SampleError::DeviceFault(format!(
+                            "lease salt {index}: {error}"
+                        )));
+                    }
+                };
+                if sent.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn require_runner(&self) -> Result<(), quip_solver_core::SampleError> {
+        if self.runner_live.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(quip_solver_core::SampleError::DeviceFault(
+                "resident runner stopped during a lease".into(),
+            ))
+        }
+    }
+
+    pub(crate) fn set_cascade(&self, settings: cascade::CascadeSettings) {
+        *self
+            .cascade
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = settings;
     }
 }
 
 impl quip_solver_core::Sampler for MetalSampler {
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        topology: &quip_solver_core::quip_protocol::lease::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), quip_solver_core::SampleError> {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        if self.kernel != Kernel::Msa {
+            return Err(quip_solver_core::SampleError::DeviceFault(
+                "local lease generation needs the MSA kernel".into(),
+            ));
+        }
+        let topology = std::sync::Arc::new(topology.clone());
+        let (reply, outcomes) = std::sync::mpsc::channel();
+        // Queued, preparing, and live units of this lease stop once it returns.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let _stop = StoreOnDrop(&stop, true);
+        // One lease feeds at a time; see `lease_turn`.
+        let mut turn = self.lease_turns.join();
+        let runner_live = || self.runner_live.load(Ordering::Acquire);
+        if !turn.wait(|| sink.is_stopped() || !runner_live()) {
+            if sink.is_stopped() {
+                self.lease_round.fetch_add(1, Ordering::AcqRel);
+            }
+            return self.require_runner();
+        }
+        let round = self.lease_round.load(Ordering::Acquire);
+        tracing::debug!(
+            turn = turn.id(),
+            salts = lease.salt_count(),
+            "lease feeding"
+        );
+        // Shared with every unit of this lease. quip-solver-core keeps the
+        // session target in a live `watch` channel (LeaseSink::target_energy_milli,
+        // a cheap borrow); the reporting loop below refreshes this cell on
+        // every pass instead of units each capturing a target snapshot at
+        // enqueue time. The resident runner only reads it, at each checkpoint.
+        let live_target = resident::LiveTarget::new(sink.target_energy_milli());
+        // Shared with every unit of this lease. A new lease starts empty;
+        // see `resident::LeaseTopK`.
+        let top10 = resident::LeaseTopK::new();
+        // Salts queued so far, and whether the feeder may queue more.
+        let (fed, feeding) = (AtomicU64::new(0), AtomicBool::new(true));
+        std::thread::scope(|scope| {
+            // The feeder only queues salts, blocking while the intake channel
+            // is full, so the runner never waits on this lease's reporting.
+            // It hands the turn to the next lease once its last salt is queued.
+            let (fed, feeding, stop) = (&fed, &feeding, &stop);
+            let (target, top10, unit_reply) = (live_target.clone(), top10.clone(), reply.clone());
+            let topology = std::sync::Arc::clone(&topology);
+            scope.spawn(move || {
+                let _done = StoreOnDrop(feeding, false);
+                for index in 0..lease.salt_count() {
+                    if sink.is_stopped() || stop.load(Ordering::Acquire) {
+                        if sink.is_stopped() {
+                            // Still holding the turn; see `lease_round`.
+                            self.lease_round.fetch_add(1, Ordering::AcqRel);
+                        }
+                        return;
+                    }
+                    let salt = resident::Salt {
+                        topology: std::sync::Arc::clone(&topology),
+                        nonce: lease.nonce(index),
+                        index,
+                        round,
+                        params: params.clone(),
+                        stop: std::sync::Arc::clone(stop),
+                        target: target.clone(),
+                        top10: top10.clone(),
+                        reply: unit_reply.clone(),
+                    };
+                    if self.salts_tx.send(salt).is_err() {
+                        return;
+                    }
+                    fed.fetch_add(1, Ordering::Release);
+                }
+                turn.release();
+                tracing::debug!(turn = turn.id(), "lease fed");
+            });
+            drop(reply);
+            let reported = self.report_lease(sink, &outcomes, &live_target, fed, feeding);
+            // Stop the feeder before the scope joins it: queued salts of a
+            // stopped lease drain without running.
+            stop.store(true, Ordering::Release);
+            reported
+        })
+    }
+
     fn sample(
         &self,
         graph: &IsingGraph,
@@ -305,18 +510,27 @@ impl quip_solver_core::Sampler for MetalSampler {
         out: tokio::sync::mpsc::Sender<quip_solver_core::StreamResult>,
         cancel: quip_solver_core::CancelToken,
     ) {
-        // `&out`: `run_stream` borrows the sender (it only ever clones/sends
-        // through it). Depends on the matching `streaming::run_stream`
-        // signature change landing in the same round.
-        //
-        // The governor is passed as a predicate rather than read inside
-        // `run_stream`: the streaming loop overrides `Sampler::sample_stream`,
-        // whose default implementation is the only place the harness consults
-        // `should_throttle`. Overriding it silently dropped all yielding
-        // behavior, so the dependency is made explicit in the signature. The
-        // governor is passed whole (not just a throttle closure) because sizing
-        // is a loop: the stream reports its GPU time back through it.
-        streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
+        // Both runners report device time to the same governor that sizes work.
+        if self.kernel == Kernel::Msa {
+            self.runner_live
+                .store(true, std::sync::atomic::Ordering::Release);
+            let _exited = StoreOnDrop(&self.runner_live, false);
+            resident::run(
+                &self.device,
+                &self.cascade,
+                &self.controller,
+                jobs,
+                &self
+                    .salts_rx
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+                &out,
+                &self.gov,
+                &cancel,
+            );
+        } else {
+            streaming::run_stream(&self.device, self.kernel, jobs, &out, &self.gov, &cancel);
+        }
     }
 
     fn stream_width(&self) -> usize {
@@ -344,6 +558,12 @@ impl quip_solver_core::Sampler for MetalSampler {
             self.gov.yielding(),
         );
         self.gov.reconfigure(ceiling, yielding);
+        if let Ok(cfg) = toml::from_str::<MetalConfig>(backend_toml) {
+            self.cascade
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .merge(&cfg.cascade);
+        }
     }
 }
 
@@ -414,6 +634,20 @@ pub struct TaggedSampler<A: KernelTag> {
 }
 
 impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
+    fn generates_locally() -> bool {
+        A::KERNEL == Kernel::Msa
+    }
+
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        topology: &quip_solver_core::quip_protocol::lease::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), quip_solver_core::SampleError> {
+        self.inner.sample_lease(lease, topology, params, sink)
+    }
+
     fn sample(
         &self,
         graph: &IsingGraph,
@@ -466,7 +700,7 @@ impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
 ///
 /// ```no_run
 /// use quip_solver_core::CommonArgs;
-/// use quip_miner_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
+/// use quip_solver_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
 ///
 /// let common = CommonArgs {
 ///     quip_coordinator: None,
@@ -527,8 +761,14 @@ mod tests {
     #[test]
     fn msa_identity_advertises_the_multi_spin_kernel() {
         use super::{METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
-        assert_eq!(METAL_MSA_IDENTITY.backend, "metal");
-        assert_eq!(METAL_MSA_IDENTITY.algorithm, "msa");
+        assert_eq!(
+            METAL_MSA_IDENTITY.backend,
+            quip_solver_core::quip_proto::v1::Backend::Metal
+        );
+        assert_eq!(
+            METAL_MSA_IDENTITY.algorithm,
+            quip_solver_core::quip_proto::v1::Algorithm::Msa
+        );
         assert_eq!(METAL_MSA_IDENTITY.max_nodes, 16_384);
         assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
         // Reads are pinned to whole words.

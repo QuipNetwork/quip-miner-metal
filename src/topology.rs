@@ -3,7 +3,8 @@
 //!
 //! Mirrors `GPU/sampler_utils.py::build_csr_structure_from_edges` /
 //! `build_edge_position_index` / `compute_color_blocks`, but computes a
-//! generic greedy coloring by default. The opt-in MSA candidate maps the
+//! generic greedy coloring by default (`build_with_advantage2_coloring` uses
+//! the MSA four-colouring when the graph is Advantage2). The candidate maps the
 //! audited Advantage2 System 1 compact labels back to physical labels and
 //! validates its four-color partition against every supplied edge.
 //!
@@ -27,8 +28,8 @@ use quip_solver_core::IsingGraph;
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::IsingGraph;
-/// use quip_miner_metal::topology::SelfFeedingTopology;
+/// use quip_solver_metal::IsingGraph;
+/// use quip_solver_metal::topology::SelfFeedingTopology;
 ///
 /// let graph = IsingGraph::new(
 ///     vec![1.0, -1.0, 0.0, 1.0],
@@ -187,8 +188,8 @@ fn advantage2_color(graph: &IsingGraph) -> Option<ColorBlocks> {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::IsingGraph;
-/// use quip_miner_metal::topology::SelfFeedingTopology;
+/// use quip_solver_metal::IsingGraph;
+/// use quip_solver_metal::topology::SelfFeedingTopology;
 ///
 /// let graph = IsingGraph::new(
 ///     vec![0.0, 0.0],
@@ -238,8 +239,8 @@ impl SelfFeedingTopology {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_metal::IsingGraph;
-    /// use quip_miner_metal::topology::SelfFeedingTopology;
+    /// use quip_solver_metal::IsingGraph;
+    /// use quip_solver_metal::topology::SelfFeedingTopology;
     ///
     /// let graph = IsingGraph::new(
     ///     vec![1.0, -1.0, 0.0, 1.0],
@@ -338,8 +339,8 @@ fn quantize_i8(v: f64) -> i8 {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::IsingGraph;
-/// use quip_miner_metal::topology::{fill_h_j, SelfFeedingTopology};
+/// use quip_solver_metal::IsingGraph;
+/// use quip_solver_metal::topology::{fill_h_j, SelfFeedingTopology};
 ///
 /// let graph = IsingGraph::new(
 ///     vec![1.0, -1.0, 0.0, 1.0],
@@ -353,11 +354,58 @@ fn quantize_i8(v: f64) -> i8 {
 /// assert_eq!(j_csr.iter().filter(|&&v| v != 0).count(), 8);
 /// ```
 pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>, Vec<i8>) {
+    fill_h_j_inspecting_edges(topology, graph, |_, _| {})
+}
+
+/// [`fill_h_j`]'s couplings from whole-unit `j_units` in the establishing
+/// edge order.
+///
+/// # Precondition
+///
+/// The caller verified once that the establishing edges have no self-loop and
+/// no out-of-range endpoint. Under that condition the result equals
+/// [`fill_h_j`]'s couplings for the same values.
+pub(crate) fn fill_couplings(topology: &SelfFeedingTopology, j_units: &[i8]) -> Vec<i8> {
+    debug_assert_eq!(j_units.len(), topology.edge_pos.len());
+    let mut j_csr = vec![0i8; topology.nnz];
+    for (&(pos_ij, pos_ji), &value) in topology.edge_pos.iter().zip(j_units) {
+        j_csr[pos_ij as usize] = value;
+        j_csr[pos_ji as usize] = value;
+    }
+    j_csr
+}
+
+/// Compare the exact ordered edges during coefficient construction, avoiding
+/// a separate topology walk. No coefficients escape on a mismatch.
+pub(crate) fn fill_h_j_matching(
+    topology: &SelfFeedingTopology,
+    edges: &[(usize, usize)],
+    graph: &IsingGraph,
+) -> Option<(Vec<i8>, Vec<i8>)> {
+    if graph.num_nodes() != topology.n
+        || graph.edges.len() != edges.len()
+        || topology.edge_pos.len() != edges.len()
+    {
+        return None;
+    }
+    let mut matches = true;
+    let coefficients = fill_h_j_inspecting_edges(topology, graph, |k, edge| {
+        matches &= edges[k] == edge;
+    });
+    matches.then_some(coefficients)
+}
+
+fn fill_h_j_inspecting_edges(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+    mut inspect: impl FnMut(usize, (usize, usize)),
+) -> (Vec<i8>, Vec<i8>) {
     let mut j_csr = vec![0i8; topology.nnz];
     for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
         let Some(&(u, v)) = graph.edges.get(k) else {
             continue;
         };
+        inspect(k, (u, v));
         if u >= topology.n || v >= topology.n {
             continue;
         }
@@ -374,6 +422,32 @@ pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matching_coefficients_require_exact_topology() {
+        let graph = g();
+        let topology = SelfFeedingTopology::build(&graph);
+        assert_eq!(
+            fill_h_j_matching(&topology, &graph.edges, &graph).unwrap(),
+            fill_h_j(&topology, &graph)
+        );
+        let mut changed = graph.clone();
+        let mut swapped = changed.edges.to_vec();
+        swapped.swap(0, 1);
+        changed.edges = swapped.into();
+        assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
+        changed = graph.clone();
+        let mut edges = changed.edges.to_vec();
+        edges[0] = (0, 2);
+        changed.edges = edges.clone().into();
+        assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
+        edges.pop();
+        changed.edges = edges.into();
+        assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
+        changed = graph.clone();
+        changed.h.pop();
+        assert!(fill_h_j_matching(&topology, &graph.edges, &changed).is_none());
+    }
 
     fn g() -> IsingGraph {
         // Small ring: 0-1-2-3-0, unit J, ternary h.
@@ -420,7 +494,7 @@ mod tests {
         assert_eq!(candidate.colors.num_colors, 4);
         assert_eq!(candidate.colors.counts, [1148, 1145, 1145, 1139]);
         let colors = labels(&candidate.colors);
-        for &(u, v) in &graph.edges {
+        for &(u, v) in graph.edges.iter() {
             assert_ne!(colors[u], colors[v], "edge ({u}, {v})");
         }
         assert!(graph.edges.contains(&(880, 2695)));
@@ -434,10 +508,12 @@ mod tests {
         let expected = advantage2_color(&graph).unwrap();
         graph.j.fill(0.0);
         graph.h.fill(-1.0);
-        graph.edges.reverse();
-        for edge in &mut graph.edges {
+        let mut edges = graph.edges.to_vec();
+        edges.reverse();
+        for edge in &mut edges {
             *edge = (edge.1, edge.0);
         }
+        graph.edges = edges.into();
         assert_eq!(advantage2_color(&graph), Some(expected));
     }
 
@@ -448,7 +524,7 @@ mod tests {
         let other = (1..colors.len())
             .find(|&node| colors[node] == colors[0])
             .unwrap();
-        graph.edges.push((0, other));
+        graph.edges = [&graph.edges[..], &[(0, other)]].concat().into();
         graph.j.push(0.0);
         assert_eq!(advantage2_color(&graph), None);
         assert_eq!(
@@ -465,7 +541,7 @@ mod tests {
         );
         for edge in [(0, 0), (0, 4577), (usize::MAX, 0)] {
             let mut graph = advantage2_fixture();
-            graph.edges.push(edge);
+            graph.edges = [&graph.edges[..], &[edge]].concat().into();
             graph.j.push(1.0);
             assert_eq!(advantage2_color(&graph), None);
             assert_eq!(

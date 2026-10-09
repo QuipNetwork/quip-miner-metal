@@ -6,12 +6,12 @@
 #![warn(clippy::expect_used)]
 
 use clap::Parser;
-use quip_miner_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
 use quip_solver_core::CommonArgs;
+use quip_solver_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 2"))]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,

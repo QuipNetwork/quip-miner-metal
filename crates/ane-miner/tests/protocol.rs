@@ -8,12 +8,13 @@ use std::process::{Command, Stdio};
 mod support;
 
 use quip_solver_conformance::driver::CONFIGURED_SWEEPS;
+use quip_solver_core::quip_proto::v1::CoefficientEncoding;
 use quip_solver_core::quip_proto::v1::{
-    coord_msg, ising_problem, Cancel, Configure, EdgeList, GetCapabilities, IsingProblem, JobKind,
-    Ping, RejectReason, Shutdown, Topology, Welcome,
+    coord_msg, ising_problem, Algorithm, Backend, Cancel, Configure, EdgeList, GetCapabilities,
+    IsingProblem, JobKind, Ping, RejectReason, Shutdown, Topology, Welcome,
 };
 use quip_solver_core::quip_protocol::scoring::energy_milli;
-use quip_solver_core::quip_protocol::wire::encode_i32_le;
+use quip_solver_core::quip_protocol::wire::{encode_i32_le, encode_spins_packed};
 
 fn miner() -> &'static str {
     env!("CARGO_BIN_EXE_quip-ane-msa")
@@ -21,7 +22,13 @@ fn miner() -> &'static str {
 
 const SOLVE_INPUT: &str = r#"{"h":[0.0,0.0],"j":[1.0],"edges":[[0,1]],"num_reads":33,"num_sweeps":5,"sweeps_per_beta":2,"beta_range":[0.25,4.0],"seed":123}"#;
 
-const SOLVABLE_JOBS: [&[u8]; 4] = [b"job-1", b"job-2", b"job-hash", b"job-sparse"];
+const SOLVABLE_JOBS: [&[u8]; 5] = [
+    b"job-1",
+    b"job-2",
+    b"job-hash",
+    b"job-sparse",
+    b"job-seeded",
+];
 
 fn run_args(args: &[&str]) -> std::process::Output {
     Command::new(miner())
@@ -98,8 +105,11 @@ fn capabilities_json_matches_ane_msa_identity() {
     assert_eq!(value["maxNodes"], 16_384);
     assert_eq!(value["maxEdges"], 163_840);
     assert_eq!(value["streamWidth"], 1);
-    assert_eq!(value["protocolVersion"], 1);
-    assert_eq!(value["supportedKinds"], serde_json::json!(["ISING_SAMPLE"]));
+    assert_eq!(value["protocolVersion"], 2);
+    assert_eq!(
+        value["supportedKinds"],
+        serde_json::json!(["ISING_SAMPLE", "ISING_GENERATE"])
+    );
     let features = value["features"]
         .as_array()
         .expect("features must be an array");
@@ -110,13 +120,13 @@ fn capabilities_json_matches_ane_msa_identity() {
 }
 
 #[test]
-fn version_includes_protocol_one() {
+fn version_includes_protocol_two() {
     let out = run_args(&["--version"]);
     assert!(out.status.success(), "--version failed: {:?}", out.status);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("protocol 1"),
-        "--version must name protocol 1: {text}"
+        text.contains("protocol 2"),
+        "--version must name protocol 2: {text}"
     );
 }
 
@@ -252,11 +262,14 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
             u: vec![0],
             v: vec![1],
         })),
-        h_milli_le32: encode_i32_le(&[1000, -1000]),
-        j_milli_le32: encode_i32_le(&[1000]),
+        encoding: CoefficientEncoding::I32 as i32,
+        scale: 1000,
+        h: encode_i32_le(&[1000, -1000]),
+        j: encode_i32_le(&[1000]),
         num_reads: 1,
         num_sweeps: 0,
         anneal_time_us: 0,
+        ..Default::default()
     };
     let dense_hash = vec![0x11; 32];
     let sparse_hash = vec![0x22; 32];
@@ -265,7 +278,7 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
     assert!(session.report.handshake_ok);
     session
         .send(coord_msg::Msg::Welcome(Welcome {
-            protocol_version: 1,
+            protocol_version: 2,
         }))
         .await;
     session
@@ -286,6 +299,7 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
                 v: vec![1],
             }),
             allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
         }))
         .await;
     session
@@ -319,9 +333,9 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
     // These valid wire jobs are outside the approved coefficient domain.
     // Each rejection must refund its credit before supported work resumes.
     let mut fractional_h = inline.clone();
-    fractional_h.h_milli_le32 = encode_i32_le(&[500, -1000]);
+    fractional_h.h = encode_i32_le(&[500, -1000]);
     let mut fractional_j = inline.clone();
-    fractional_j.j_milli_le32 = encode_i32_le(&[500]);
+    fractional_j.j = encode_i32_le(&[500]);
     for (id, problem) in [
         (&b"job-fractional-h"[..], fractional_h),
         (&b"job-fractional-j"[..], fractional_j),
@@ -359,6 +373,19 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
             false,
         )
         .await;
+
+    let mut seeded = inline.clone();
+    seeded.initial_spins = vec![encode_spins_packed(&[-1, 1])];
+    session
+        .job(
+            b"job-seeded",
+            2,
+            seeded,
+            &[(0, 1)],
+            JobKind::IsingSample,
+            false,
+        )
+        .await;
     session.refunded("inline and cached jobs").await;
 
     session
@@ -370,12 +397,15 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
                 v: vec![12, 2400],
             }),
             allowed_h_milli: vec![-1000, 0, 1000],
+            allowed_j_milli: vec![-1000, 1000],
         }))
         .await;
     let sparse = IsingProblem {
         graph: Some(ising_problem::Graph::TopologyHash(sparse_hash)),
-        h_milli_le32: encode_i32_le(&[1000, -1000, 0]),
-        j_milli_le32: encode_i32_le(&[1000, -1000]),
+        encoding: CoefficientEncoding::I32 as i32,
+        scale: 1000,
+        h: encode_i32_le(&[1000, -1000, 0]),
+        j: encode_i32_le(&[1000, -1000]),
         ..inline.clone()
     };
     session
@@ -391,9 +421,9 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
     session.refunded("sparse topology job").await;
 
     let mut malformed_h = inline.clone();
-    malformed_h.h_milli_le32 = vec![1, 2, 3];
+    malformed_h.h = vec![1, 2, 3];
     let mut malformed_j = inline.clone();
-    malformed_j.j_milli_le32 = vec![1, 2, 3];
+    malformed_j.j = vec![1, 2, 3];
     for (id, problem, kind, expired) in [
         (&b"job-bad-h"[..], malformed_h, JobKind::IsingSample, false),
         (&b"job-bad-j"[..], malformed_j, JobKind::IsingSample, false),
@@ -454,8 +484,9 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
         "no Ready after Configure: {report:#?}"
     );
     let hello = report.hello.as_ref().expect("Hello");
-    assert_eq!(hello.backend, "ane");
-    assert_eq!(hello.algorithm, "msa");
+    let caps = hello.capabilities.as_ref().expect("Hello capabilities");
+    assert_eq!(caps.backend, Backend::Ane as i32);
+    assert_eq!(caps.algorithm, Algorithm::Msa as i32);
     let capabilities = report.capabilities_received.as_ref().expect("Capabilities");
     assert_eq!(capabilities.stream_width, 1);
     assert!(
@@ -518,9 +549,9 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
         "stream did not end cleanly"
     );
     assert_eq!(report.exit_code, 0, "clean shutdown expected");
-    assert_eq!(report.jobs_dispatched, 12);
+    assert_eq!(report.jobs_dispatched, 13);
     assert_eq!(report.rejects.len(), 6, "no duplicate or unexpected Reject");
-    assert_eq!(report.job_request_credits.len(), 13);
+    assert_eq!(report.job_request_credits.len(), 14);
     assert!(report
         .job_request_credits
         .iter()
@@ -539,5 +570,21 @@ async fn standalone_ane_passes_supported_coordinator_protocol() {
             .count()
             <= 1
     );
-    assert!(report.is_conformant(), "{report:#?}");
+    // rc3's is_conformant() also grades a salt lease whenever Hello
+    // advertises ISING_GENERATE. This hand-built coordinator sends no lease,
+    // so assert every other component of is_conformant() by name.
+    assert!(report.lease.is_none(), "this coordinator sends no lease");
+    assert!(report.ready_received, "no Ready");
+    assert!(report.results_conformant(), "{report:#?}");
+    assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
+    assert!(report.has_reject(b"job-bad-j", RejectReason::Malformed));
+    assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
+    assert!(report.has_reject(b"job-old", RejectReason::Expired));
+    assert!(report.warm_start_conformant(), "{report:#?}");
+    assert!(report.cancel_acked, "Cancel not acknowledged");
+    assert!(report.ping_acked, "Ping not acknowledged");
+    assert!(report.capabilities_conformant(), "{report:#?}");
+    assert!(report.live_cancel_conformant(), "{report:#?}");
+    assert!(report.credit_ledger_balanced(), "{report:#?}");
+    assert!(report.timed_out_phases.is_empty(), "{report:#?}");
 }

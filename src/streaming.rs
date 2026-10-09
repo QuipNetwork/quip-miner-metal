@@ -36,7 +36,7 @@ const DEFAULT_GPU_CORES: usize = 10;
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::{streaming, Kernel};
+/// use quip_solver_metal::{streaming, Kernel};
 ///
 /// assert_eq!(streaming::max_reads(Kernel::Sa), 256);
 /// assert_eq!(streaming::max_reads(Kernel::Gibbs), 256);
@@ -145,7 +145,7 @@ fn tg_budget(kernel: Kernel) -> usize {
 /// mapping: chromatic Gibbs spends `num_reads` threadgroups per problem and
 /// multi-spin spends `num_reads / 32`, so their batches shrink as reads grow.
 /// SA spends one.
-fn batch_size_for_reads(kernel: Kernel, num_reads: usize) -> usize {
+pub(crate) fn batch_size_for_reads(kernel: Kernel, num_reads: usize) -> usize {
     let budget = tg_budget(kernel);
     let per_problem = match kernel {
         Kernel::Gibbs if sampler::gibbs_node_parallel() => {
@@ -163,7 +163,7 @@ fn batch_size_for_reads(kernel: Kernel, num_reads: usize) -> usize {
 ///
 /// Never returns 0: one problem per dispatch is the floor, because a dispatch
 /// of nothing makes no progress and would never free the coordinator's credit.
-fn scale_budget(nominal: usize, scale: f64) -> usize {
+pub(crate) fn scale_budget(nominal: usize, scale: f64) -> usize {
     if !scale.is_finite() || scale >= 1.0 {
         return nominal.max(1);
     }
@@ -182,17 +182,27 @@ fn scale_budget(nominal: usize, scale: f64) -> usize {
 /// A pure function of the kernel — the device does not participate in the
 /// Metal width — split out so `Sampler::declared_stream_width` can advertise
 /// the same number without opening a device (`--capabilities` must not).
+/// For the multi-spin kernel the width also covers the resident runner's
+/// preparation queue, `resident::PREP_BOUND`.
 ///
 /// # Examples
 ///
 /// ```
-/// use quip_miner_metal::{streaming, Kernel};
+/// use quip_solver_metal::{streaming, Kernel};
 ///
 /// assert!(streaming::declared_stream_width(Kernel::Sa) >= 1);
 /// ```
 #[must_use]
 pub fn declared_stream_width(kernel: Kernel) -> usize {
-    (batch_size_for_reads(kernel, nominal_reads(kernel)) * 2).max(1)
+    let batches = batch_size_for_reads(kernel, nominal_reads(kernel)) * 2;
+    if kernel == Kernel::Msa {
+        // Two live slot pools plus the resident preparation queue. The
+        // session's lease expander and the coordinator's credits both stop at
+        // this width, and each salt needs a host draw before it can prepare.
+        batches + crate::resident::PREP_BOUND
+    } else {
+        batches.max(1)
+    }
 }
 
 /// `Sampler::stream_width`: how many models the backend keeps in flight.
@@ -209,7 +219,7 @@ pub fn declared_stream_width(kernel: Kernel) -> usize {
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_metal::{streaming, Kernel, metal_device::MetalDevice};
+/// use quip_solver_metal::{streaming, Kernel, metal_device::MetalDevice};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = MetalDevice::open(0)?;
@@ -262,7 +272,7 @@ impl<'a> BatchKey<'a> {
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.beta_range == job.params.beta_range
-            && self.edges == job.graph.edges.as_slice()
+            && self.edges == &*job.graph.edges
     }
 }
 
@@ -340,19 +350,23 @@ impl StreamCtx<'_> {
     /// the miner keeps running at a smaller size instead of stopping and
     /// starting.
     fn yield_gate(&self) {
-        if !self.gov.should_throttle() {
-            return;
-        }
-        tracing::debug!("yield gate: pausing");
-        let deadline = Instant::now() + THROTTLE_MAX_PAUSE;
-        while !self.out.is_closed() && Instant::now() < deadline && self.gov.should_throttle() {
-            std::thread::sleep(THROTTLE_PAUSE);
-        }
+        yield_gate(self.out, self.gov);
+    }
+}
+
+pub(crate) fn yield_gate(out: &Sender<StreamResult>, gov: &dyn GpuGovernor) {
+    if !gov.should_throttle() {
+        return;
+    }
+    tracing::debug!("yield gate: pausing");
+    let deadline = Instant::now() + THROTTLE_MAX_PAUSE;
+    while !out.is_closed() && Instant::now() < deadline && gov.should_throttle() {
+        std::thread::sleep(THROTTLE_PAUSE);
     }
 }
 
 /// Emit an empty-graph job's answer directly (no GPU work needed).
-fn answer_empty(out: &Sender<StreamResult>, job: StreamJob) {
+pub(crate) fn answer_empty(out: &Sender<StreamResult>, job: StreamJob) {
     let reads = job.params.num_reads.max(1);
     if out
         .blocking_send(StreamResult {
@@ -387,7 +401,7 @@ fn send_cancelled(out: &Sender<StreamResult>, job: StreamJob) {
     }
 }
 
-fn send_reject(out: &Sender<StreamResult>, job: StreamJob, err: SampleError) {
+pub(crate) fn send_reject(out: &Sender<StreamResult>, job: StreamJob, err: SampleError) {
     if out
         .blocking_send(StreamResult {
             job_id: job.job_id,
@@ -994,7 +1008,7 @@ mod tests {
         let j = job(b"a", ring4(), 16, 64, 1);
         let key = BatchKey::from_job(&j);
         let mut other = job(b"b", ring4(), 16, 64, 1);
-        other.graph.edges = vec![(0, 1), (1, 2), (2, 3)]; // drop one edge
+        other.graph.edges = vec![(0, 1), (1, 2), (2, 3)].into(); // drop one edge
         assert!(!key.matches(&other));
     }
 
@@ -1120,8 +1134,26 @@ mod tests {
         assert_eq!(nominal_reads(Kernel::Msa), 64);
         assert_eq!(
             declared_stream_width(Kernel::Msa),
-            (batch_size_for_reads(Kernel::Msa, 64) * 2).max(1)
+            batch_size_for_reads(Kernel::Msa, 64) * 2 + crate::resident::PREP_BOUND
         );
+    }
+
+    /// The session keeps at most `stream_width` salts in flight. The resident
+    /// runner holds two live slot pools plus `PREP_BOUND` jobs in preparation,
+    /// so a narrower window leaves slots idle between salts.
+    #[test]
+    fn msa_width_covers_live_slots_and_preparation() {
+        let batch = batch_size_for_reads(Kernel::Msa, nominal_reads(Kernel::Msa));
+        assert_eq!(
+            declared_stream_width(Kernel::Msa),
+            2 * batch + crate::resident::PREP_BOUND
+        );
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            assert_eq!(
+                declared_stream_width(kernel),
+                (batch_size_for_reads(kernel, nominal_reads(kernel)) * 2).max(1)
+            );
+        }
     }
 
     #[test]

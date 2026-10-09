@@ -1,9 +1,9 @@
 use clap::Parser;
-use quip_miner_ane::{worker_main, AneSampler, ANE_MSA_IDENTITY};
+use quip_solver_ane::{worker_main, AneSampler, ANE_MSA_IDENTITY};
 use quip_solver_core::{run, CommonArgs, OpenError};
 
 #[derive(Parser)]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 2"))]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,

@@ -47,6 +47,19 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Cascade throughput tests
+
+A throughput test measures either one gate or the whole system. Pick one and
+say which in the report.
+
+- **One gate.** Place every later gate checkpoint past the job's last sweep,
+  so no later gate evaluates, and fix the job at the minimum sweep count of
+  the gate under test.
+- **Whole system.** Run the adaptive controller. It adjusts the cutoff gates
+  as jobs arrive, so the rate rises while the cutoffs settle toward the
+  target hardness. Report the rate over time, not one number, and state how
+  long the controller ran before the timed interval.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
 

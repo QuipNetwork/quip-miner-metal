@@ -13,6 +13,7 @@ use std::time::Duration;
 )]
 mod support;
 
+use quip_solver_core::quip_proto::v1::CoefficientEncoding;
 use quip_solver_core::quip_proto::v1::{
     coord_msg, ising_problem, Configure, EdgeList, IsingProblem, JobKind, SetTarget, Shutdown,
     Topology, Welcome,
@@ -167,11 +168,14 @@ fn problem(block: &Block, reads: usize, sweeps: usize) -> IsingProblem {
     .expect("draw testnet problem");
     IsingProblem {
         graph: Some(ising_problem::Graph::TopologyHash(TOPOLOGY_HASH.to_vec())),
-        h_milli_le32: encode_i32_le(&h),
-        j_milli_le32: encode_i32_le(&j),
+        encoding: CoefficientEncoding::I32 as i32,
+        scale: 1000,
+        h: encode_i32_le(&h),
+        j: encode_i32_le(&j),
         num_reads: u32::try_from(reads).expect("reads fit u32"),
         num_sweeps: u32::try_from(sweeps).expect("sweeps fit u32"),
         anneal_time_us: 0,
+        ..Default::default()
     }
 }
 
@@ -231,12 +235,12 @@ fn compact_fixture_regenerates_the_historical_problem_shape() {
     assert_eq!(edges().len(), EDGE_COUNT);
     for (index, block) in fixture.into_iter().enumerate() {
         let generated = problem(&block, 128, 16_384);
-        assert_eq!(generated.h_milli_le32.len(), NODE_COUNT * 4);
-        assert_eq!(generated.j_milli_le32.len(), EDGE_COUNT * 4);
+        assert_eq!(generated.h.len(), NODE_COUNT * 4);
+        assert_eq!(generated.j.len(), EDGE_COUNT * 4);
         if index == 0 {
             // Fingerprints of every coefficient in the archived problem-3250.json.
-            assert_eq!(fnv1a64(&generated.h_milli_le32), 0x69af_3cd5_1b79_49f5);
-            assert_eq!(fnv1a64(&generated.j_milli_le32), 0x57ab_be35_25c5_f8da);
+            assert_eq!(fnv1a64(&generated.h), 0x69af_3cd5_1b79_49f5);
+            assert_eq!(fnv1a64(&generated.j), 0x57ab_be35_25c5_f8da);
         }
     }
 }
@@ -307,7 +311,7 @@ async fn production_channel_study() {
     let env = vec![
         (
             "RUST_LOG".to_owned(),
-            "quip_miner_metal::combined=debug".to_owned(),
+            "quip_solver_metal::combined=debug".to_owned(),
         ),
         (
             "QUIP_METAL_MSA_FOUR_COLOR".to_owned(),
@@ -331,7 +335,7 @@ async fn production_channel_study() {
         .await;
     session
         .send(coord_msg::Msg::Welcome(Welcome {
-            protocol_version: 1,
+            protocol_version: 2,
         }))
         .await;
     session
@@ -353,6 +357,7 @@ async fn production_channel_study() {
             nodes: (0..NODE_COUNT as u32).collect(),
             edges: Some(EdgeList { u, v }),
             allowed_h_milli: vec![0],
+            allowed_j_milli: vec![-1000, 1000],
         }))
         .await;
     session
@@ -502,6 +507,7 @@ async fn dispatch(session: &mut support::Session, job: &StudyJob, graph_edges: &
             num_reads: job.problem.num_reads,
             num_sweeps: job.problem.num_sweeps,
             anneal_time_us: 0,
+            max_proof_solutions: 32,
         }))
         .await;
     session

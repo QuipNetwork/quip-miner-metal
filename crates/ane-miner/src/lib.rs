@@ -1,7 +1,7 @@
 //! Standalone ANE MSA Ising miner.
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-compile_error!("quip-miner-ane requires the aarch64-apple-darwin target");
+compile_error!("quip-solver-ane requires the aarch64-apple-darwin target");
 
 mod graph;
 mod msa;
@@ -16,8 +16,8 @@ pub use worker::worker_main;
 /// Advertised ANE MSA identity. Node and edge caps come from the graph module
 /// so capability JSON cannot drift from the host validator.
 pub const ANE_MSA_IDENTITY: quip_solver_core::BackendIdentity = quip_solver_core::BackendIdentity {
-    backend: "ane",
-    algorithm: "msa",
+    backend: quip_solver_core::quip_proto::v1::Backend::Ane,
+    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Msa,
     max_nodes: crate::graph::MAX_NODES as u32,
     max_edges: crate::graph::MAX_EDGES as u32,
     features: &["streaming"],

@@ -364,7 +364,7 @@ mod tests {
     fn advantage2_coloring_is_proper_over_every_edge() {
         let graph = advantage2_graph();
         let colors = advantage2_colors(&graph).expect("Advantage2 topology is recognised");
-        for &(u, v) in &graph.edges {
+        for &(u, v) in graph.edges.iter() {
             assert_ne!(colors[u], colors[v], "edge ({u}, {v}) joins one colour");
         }
     }

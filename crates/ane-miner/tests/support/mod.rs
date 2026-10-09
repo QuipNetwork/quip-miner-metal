@@ -15,7 +15,7 @@ use quip_solver_core::quip_proto::v1::{
 };
 use quip_solver_core::quip_protocol::{
     scoring::energy_milli,
-    wire::{decode_i32_le, decode_spins},
+    wire::{decode_i32_le, decode_spins_packed},
 };
 use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
@@ -139,6 +139,7 @@ impl Session {
         let started = Instant::now();
         Self {
             report: DriverReport {
+                lease: None,
                 handshake_ok: false,
                 hello: None,
                 ready_received: false,
@@ -155,6 +156,7 @@ impl Session {
                 terminal: Terminal::Open,
                 timed_out_phases: Vec::new(),
                 exit_code: -1,
+                stderr: String::new(),
             },
             sent: Vec::new(),
             received: Vec::new(),
@@ -215,6 +217,7 @@ impl Session {
             deadline_ms,
             ising: Some(ising),
             provenance: None,
+            generator: None,
         }))
         .await;
         self.report.jobs_dispatched += 1;
@@ -259,8 +262,11 @@ impl Session {
         match message {
             miner_msg::Msg::Hello(hello) => {
                 assert_eq!(self.received.len(), 1, "Hello must be the first frame");
-                self.report.handshake_ok =
-                    hello.protocol_version == 1 && hello.session_token == "test-token";
+                self.report.handshake_ok = hello
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|c| c.protocol_version == 2)
+                    && hello.session_token == "test-token";
                 self.report.hello = Some(hello);
             }
             miner_msg::Msg::Ready(_) => self.report.ready_received = true,
@@ -278,6 +284,7 @@ impl Session {
             miner_msg::Msg::Fatal(fatal) => {
                 self.report.fatal = Some((fatal.exit_code as i32, fatal.reason));
             }
+            miner_msg::Msg::LeaseDone(_) => {} // leases are not exercised by these tests
             miner_msg::Msg::Result(result) => {
                 let DispatchedProblem {
                     ising,
@@ -291,8 +298,8 @@ impl Session {
                         .map(|value| f64::from(value) / 1000.0)
                         .collect::<Vec<_>>()
                 };
-                let h = decode(&ising.h_milli_le32);
-                let j = decode(&ising.j_milli_le32);
+                let h = decode(&ising.h);
+                let j = decode(&ising.j);
                 assert_eq!(result.solutions.len(), ising.num_reads as usize);
                 assert_eq!(
                     result.meta.as_ref().expect("SamplerMeta").reads,
@@ -302,7 +309,8 @@ impl Session {
                     .solutions
                     .iter()
                     .map(|solution| {
-                        let spins = decode_spins(&solution.spins_bytes).expect("valid spin bytes");
+                        let spins = decode_spins_packed(&solution.spins, h.len())
+                            .expect("valid packed spins");
                         assert_eq!(spins.len(), h.len(), "one spin per variable");
                         Some(energy_milli(&spins, &h, &j, dense_edges))
                     })

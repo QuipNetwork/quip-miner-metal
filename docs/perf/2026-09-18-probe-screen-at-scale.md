@@ -314,7 +314,7 @@ scripts/testnet/annealer/screen_deep.py report docs/perf/data/2026-09-18-screen-
 # The third field of a stage caps how many nonces it takes, so budgets of
 # different cost run for a similar time.
 QUIP_SCREEN_NONCES=7000 QUIP_SCREEN_STAGES=64x512x7000,64x1024x4000,64x4096x1100,64x14336x380 \
-  RUST_LOG=quip_miner_metal=debug \
+  RUST_LOG=quip_solver_metal=debug \
   cargo test --release --test probe_screen probe_then_solve -- --ignored --nocapture
 ```
 

@@ -9,16 +9,23 @@ use quip_solver_conformance::driver::{
 use quip_solver_core::quip_proto::v1::RejectReason;
 use std::process::Command;
 
-/// The four jobs the driver expects a `Result` for, and the only four a
-/// conformant miner may answer with one.
-const SOLVABLE_JOBS: [&[u8]; 4] = [b"job-1", b"job-2", b"job-hash", b"job-sparse"];
+/// The jobs the driver expects a `Result` for, and the only ones a
+/// conformant miner may answer with one. `job-seeded` carries warm-start
+/// states, which this miner ignores and answers cold.
+const SOLVABLE_JOBS: [&[u8]; 5] = [
+    b"job-1",
+    b"job-2",
+    b"job-hash",
+    b"job-sparse",
+    b"job-seeded",
+];
 
 /// Grade one driven session against every axis of the miner protocol.
 ///
 /// Per-axis assertions ahead of the driver's composite `is_conformant()`: a
 /// bare composite failure says "not conformant" without saying which rule
 /// broke. `expected_meta_sweeps` states this test's own expectation —
-/// [`CONFIGURED_SWEEPS`] for SA, doubled for Gibbs — and is cross-checked
+/// [`CONFIGURED_SWEEPS`] for SA and MSA, doubled for Gibbs — and is cross-checked
 /// against the driver's derivation so a miner advertising the wrong
 /// algorithm cannot make both sides agree by accident.
 fn assert_conformant(bin: &str, report: &DriverReport, expected_meta_sweeps: u32) {
@@ -96,6 +103,17 @@ fn assert_conformant(bin: &str, report: &DriverReport, expected_meta_sweeps: u32
         );
     }
 
+    // Salt leases (SPEC.md "Generated jobs"). The session advertises
+    // ISING_GENERATE, so the driver runs its lease scenario and grades it.
+    let lease = report
+        .lease
+        .as_ref()
+        .unwrap_or_else(|| panic!("{bin}: the driver ran no lease scenario"));
+    assert!(
+        report.lease_conformant(),
+        "{bin}: lease not conformant: {lease:?}"
+    );
+
     // Cancel and Ping are each acknowledged with a Status ("Control-plane
     // pushes"); live cancellation is honoured (no Result/Reject for the
     // cancelled watermark); GetCapabilities answers with the same identity
@@ -158,10 +176,10 @@ fn profile_bin(name: &str) -> String {
 
 fn ensure_built(package_bins: &[&str]) {
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "quip-miner-metal"])
+        .args(["build", "-p", "quip-solver-metal"])
         .status()
-        .expect("cargo build quip-miner-metal");
-    assert!(status.success(), "failed to build quip-miner-metal");
+        .expect("cargo build quip-solver-metal");
+    assert!(status.success(), "failed to build quip-solver-metal");
     for b in package_bins {
         assert!(
             std::path::Path::new(&profile_bin(b)).exists(),
@@ -220,7 +238,9 @@ async fn quip_metal_msa_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    // `msa` is not `gibbs`, so the resolved budget is not doubled.
+    // MSA always screens, but StreamResult has no completed-sweeps field.
+    // The session builds SamplerMeta from the requested budget even when the
+    // resident runner returns probe reads. Keep the exact metadata contract.
     assert_conformant("quip-metal-msa", &report, CONFIGURED_SWEEPS);
 }
 
@@ -243,10 +263,16 @@ fn capabilities_and_version_and_check() {
             s.contains(&format!("\"algorithm\":\"{algo}\"")),
             "{bin}: {s}"
         );
+        assert!(s.contains("\"protocolVersion\":2"), "{bin}: {s}");
+        assert!(s.contains("\"ISING_GENERATE\""), "{bin}: {s}");
 
         let out = Command::new(&path).arg("--version").output().unwrap();
         assert!(out.status.success());
-        assert!(String::from_utf8(out.stdout).unwrap().contains("protocol"));
+        let version = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            version.trim_end().ends_with("protocol 2"),
+            "{bin}: --version must end with protocol 2: {version}"
+        );
 
         // --check opens the GPU and compiles kernels.
         let status = Command::new(&path)
