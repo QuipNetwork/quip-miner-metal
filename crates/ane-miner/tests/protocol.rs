@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 mod support;
 
 use quip_solver_conformance::driver::CONFIGURED_SWEEPS;
+use quip_solver_conformance::solve::drive_solve;
 use quip_solver_core::quip_proto::v1::CoefficientEncoding;
 use quip_solver_core::quip_proto::v1::{
     coord_msg, ising_problem, Algorithm, Backend, Cancel, Configure, EdgeList, GetCapabilities,
@@ -251,6 +252,17 @@ fn solve_rejects_unsupported_inputs() {
     );
     assert_solve_error(
         r#"{"h":[0.5,0.0],"j":[1.0],"edges":[[0,1]],"num_reads":1,"num_sweeps":5,"sweeps_per_beta":2,"beta_range":[0.25,4.0],"seed":1}"#,
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Apple Silicon ANE"]
+async fn standalone_ane_passes_solve_conformance() {
+    let report = drive_solve(miner()).await;
+    assert!(
+        report.is_conformant(),
+        "quip-ane-msa: --solve not conformant:\n{}",
+        report.summary()
     );
 }
 

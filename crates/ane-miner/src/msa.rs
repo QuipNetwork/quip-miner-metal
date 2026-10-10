@@ -372,6 +372,7 @@ mod tests {
             num_reads: 128,
             num_sweeps: 65_536,
             sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: Some((0.25, 4.0)),
             seed: 0,
         };

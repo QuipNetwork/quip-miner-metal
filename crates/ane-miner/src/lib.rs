@@ -20,6 +20,7 @@ pub const ANE_MSA_IDENTITY: quip_solver_core::BackendIdentity = quip_solver_core
     algorithm: quip_solver_core::quip_proto::v1::Algorithm::Msa,
     max_nodes: crate::graph::MAX_NODES as u32,
     max_edges: crate::graph::MAX_EDGES as u32,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
     features: &["streaming"],
     adapt: quip_solver_core::adapt::AdaptBounds {
         min_sweeps: 2048,

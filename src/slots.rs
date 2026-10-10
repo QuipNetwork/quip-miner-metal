@@ -2022,6 +2022,7 @@ mod tests {
             num_reads: READS,
             num_sweeps: sweeps,
             sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: None,
             seed: 1,
         };

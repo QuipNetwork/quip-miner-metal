@@ -1049,6 +1049,7 @@ mod tests {
             sweeps_per_beta: 1,
             beta_range: None,
             seed: 123,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
         };
         let worker = WorkerProcess::spawn(
             &worker_binary(),

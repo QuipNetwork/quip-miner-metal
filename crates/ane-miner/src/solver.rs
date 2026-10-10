@@ -196,6 +196,7 @@ mod tests {
             num_reads,
             num_sweeps,
             sweeps_per_beta: 4,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: Some((0.2, 2.0)),
             seed: 0x1234_5678,
         }
@@ -597,6 +598,7 @@ mod tests {
             num_reads: 128,
             num_sweeps: 512,
             sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: None,
             seed: 123,
         };

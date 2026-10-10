@@ -6,6 +6,7 @@
 use quip_solver_conformance::driver::{
     drive_miner, DriverReport, Terminal, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER,
 };
+use quip_solver_conformance::solve::drive_solve;
 use quip_solver_core::quip_proto::v1::RejectReason;
 use std::process::Command;
 
@@ -242,6 +243,31 @@ async fn quip_metal_msa_passes_conformance() {
     // The session builds SamplerMeta from the requested budget even when the
     // resident runner returns probe reads. Keep the exact metadata contract.
     assert_conformant("quip-metal-msa", &report, CONFIGURED_SWEEPS);
+}
+
+async fn assert_solve_conformant(bin: &str) {
+    ensure_built(&[bin]);
+    let report = drive_solve(&profile_bin(bin)).await;
+    assert!(
+        report.is_conformant(),
+        "{bin}: --solve not conformant:\n{}",
+        report.summary()
+    );
+}
+
+#[tokio::test]
+async fn quip_metal_sa_passes_solve_conformance() {
+    assert_solve_conformant("quip-metal-sa").await;
+}
+
+#[tokio::test]
+async fn quip_metal_gibbs_passes_solve_conformance() {
+    assert_solve_conformant("quip-metal-gibbs").await;
+}
+
+#[tokio::test]
+async fn quip_metal_msa_passes_solve_conformance() {
+    assert_solve_conformant("quip-metal-msa").await;
 }
 
 #[test]

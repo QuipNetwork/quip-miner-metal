@@ -62,6 +62,7 @@ impl RawJob {
                 num_reads: self.num_reads,
                 num_sweeps: self.num_sweeps,
                 sweeps_per_beta: self.sweeps_per_beta,
+                schedule: quip_solver_core::BetaSchedule::Geometric,
                 beta_range: self.beta_range,
                 seed: self.seed,
             },
@@ -258,6 +259,7 @@ mod tests {
             num_reads: 2,
             num_sweeps: 3,
             sweeps_per_beta: 2,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: Some((0.25, 4.0)),
             seed: 99,
         };

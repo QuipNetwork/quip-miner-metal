@@ -585,9 +585,9 @@ dependencies = [
 
 [[package]]
 name = "quip-proto"
-version = "0.0.1"
+version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b6c09ef8df03dec54672cf6f20109a0217e772018a1515f1cf76587cb79e6df"
+checksum = "0ba0bb2f044ee9716053b85cf17ae7ee71f60a88a2c13a4517ae71932c978132"
 dependencies = [
  "prost",
  "tonic",
@@ -595,9 +595,9 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.1"
+version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "662b61607000230563ffeeea5b2c2226209ff06fd1eebe912d35753ce2dc462d"
+checksum = "02fd183f280108004811f34cb2520e448bf104fad8a1cd3d985ad474c96cdf43"
 dependencies = [
  "blake3",
  "quip-proto",
