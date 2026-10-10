@@ -9,7 +9,7 @@ description = "Regenerate each fetched qblock's Ising problem from its nonce"
 [workspace]
 
 [dependencies]
-quip-protocol = "=0.0.1"
+quip-protocol = "=0.0.3"
 blake2 = "0.10.6"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }

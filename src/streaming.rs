@@ -771,6 +771,7 @@ mod tests {
             num_reads,
             num_sweeps,
             sweeps_per_beta,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: None,
             seed: 0,
         }

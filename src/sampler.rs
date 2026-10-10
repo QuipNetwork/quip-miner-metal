@@ -2191,6 +2191,7 @@ mod tests {
             num_reads: 32,
             num_sweeps: 4,
             sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: Some((0.1, 1.0)),
             seed: 7,
         };
@@ -2221,6 +2222,7 @@ mod tests {
             num_reads: 32,
             num_sweeps: 128,
             sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: Some((0.1, 1.0)),
             seed: 7,
         };
@@ -2247,6 +2249,7 @@ mod tests {
             num_reads: 32,
             num_sweeps: 4,
             sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: Some((0.1, 1.0)),
             seed: 7,
         };
@@ -2325,6 +2328,7 @@ mod tests {
             num_reads: 64,
             num_sweeps: 128,
             sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: Some((0.1, 4.0)),
             seed: 7,
         };
@@ -2412,6 +2416,7 @@ mod tests {
             num_reads: 64,
             num_sweeps: 32,
             sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             // Keep thermal variation so distinct words need not converge.
             beta_range: Some((0.1, 0.5)),
             seed: 3,

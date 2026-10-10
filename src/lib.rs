@@ -164,6 +164,7 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     // `const` context, so the narrowing cast is checked at compile time.
     max_nodes: crate::sampler::SA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
     // A real `sample_stream` override and the IOKit governor — the two
     // capability names `BackendIdentity::features` documents.
     features: &["streaming", "governor"],
@@ -189,6 +190,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
     max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
     // Same capability set as `METAL_SA_IDENTITY`: streaming + governor.
     features: &["streaming", "governor"],
     adapt: METAL_ADAPT,
@@ -212,6 +214,7 @@ pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     // Union capacity. Routing still enforces each engine's own limits.
     max_nodes: quip_solver_ane::ANE_MSA_IDENTITY.max_nodes,
     max_edges: DEFAULT_MAX_EDGES,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
     features: &["streaming", "governor"],
     adapt: METAL_MSA_ADAPT,
 };
